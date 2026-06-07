@@ -90,29 +90,29 @@ pub fn search(args: &[String]) -> Result<()> {
             "episodic" => {
                 let mems = repo.search_episodic(&query, &project_id, limit)?;
                 mems.iter().map(|m| serde_json::json!({
-                    "id": m.id, "type": "episodic", "summary": m.summary,
-                    "importance": m.importance, "files": m.files_touched, "created_at": m.created_at,
+                    "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
+                    "importance": m.memory.importance, "files": m.memory.files_touched, "created_at": m.memory.created_at,
                 })).collect()
             }
             "decision" => {
                 let mems = repo.search_decisions(&query, &project_id, limit)?;
                 mems.iter().map(|m| serde_json::json!({
-                    "id": m.id, "type": "decision", "title": m.title,
-                    "rationale": m.rationale, "created_at": m.created_at,
+                    "id": m.memory.id, "type": "decision", "title": m.memory.title,
+                    "rationale": m.memory.rationale, "created_at": m.memory.created_at,
                 })).collect()
             }
             "failure" => {
                 let mems = repo.search_failures(&query, &project_id, limit)?;
                 mems.iter().map(|m| serde_json::json!({
-                    "id": m.id, "type": "failure", "incident": m.incident,
-                    "severity": m.severity, "fix": m.fix, "created_at": m.created_at,
+                    "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
+                    "severity": m.memory.severity, "fix": m.memory.fix, "created_at": m.memory.created_at,
                 })).collect()
             }
             "procedural" => {
                 let mems = repo.search_procedural(&query, &project_id, limit)?;
                 mems.iter().map(|m| serde_json::json!({
-                    "id": m.id, "type": "procedural", "workflow": m.workflow_name,
-                    "steps": m.steps, "created_at": m.created_at,
+                    "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
+                    "steps": m.memory.steps, "created_at": m.memory.created_at,
                 })).collect()
             }
             _ => anyhow::bail!("Unknown memory type: {mt}. Use: episodic, decision, failure, procedural"),
@@ -123,22 +123,22 @@ pub fn search(args: &[String]) -> Result<()> {
 
         if let Ok(mems) = repo.search_episodic(&query, &project_id, limit) {
             for m in &mems {
-                all.push(serde_json::json!({"id": m.id, "type": "episodic", "summary": m.summary, "importance": m.importance, "created_at": m.created_at}));
+                all.push(serde_json::json!({"id": m.memory.id, "type": "episodic", "summary": m.memory.summary, "importance": m.memory.importance, "created_at": m.memory.created_at}));
             }
         }
         if let Ok(mems) = repo.search_decisions(&query, &project_id, limit) {
             for m in &mems {
-                all.push(serde_json::json!({"id": m.id, "type": "decision", "title": m.title, "created_at": m.created_at}));
+                all.push(serde_json::json!({"id": m.memory.id, "type": "decision", "title": m.memory.title, "created_at": m.memory.created_at}));
             }
         }
         if let Ok(mems) = repo.search_failures(&query, &project_id, limit) {
             for m in &mems {
-                all.push(serde_json::json!({"id": m.id, "type": "failure", "incident": m.incident, "severity": m.severity, "created_at": m.created_at}));
+                all.push(serde_json::json!({"id": m.memory.id, "type": "failure", "incident": m.memory.incident, "severity": m.memory.severity, "created_at": m.memory.created_at}));
             }
         }
         if let Ok(mems) = repo.search_procedural(&query, &project_id, limit) {
             for m in &mems {
-                all.push(serde_json::json!({"id": m.id, "type": "procedural", "workflow": m.workflow_name, "created_at": m.created_at}));
+                all.push(serde_json::json!({"id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name, "created_at": m.memory.created_at}));
             }
         }
         all.truncate(limit);
@@ -322,8 +322,12 @@ pub fn recent_failures(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    let query = service.as_deref().unwrap_or("*");
-    let results = repo.search_failures(query, &project_id, limit)?;
+    let query = service.as_deref().unwrap_or("");
+    let results = if query.is_empty() {
+        repo.list_recent_failures(&project_id, limit)?
+    } else {
+        repo.search_failures(query, &project_id, limit)?.into_iter().map(|s| s.memory).collect()
+    };
 
     let failures: Vec<serde_json::Value> = results.iter().map(|f| {
         serde_json::json!({
@@ -348,8 +352,12 @@ pub fn decisions(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    let query = topic.as_deref().unwrap_or("*");
-    let results = repo.search_decisions(query, &project_id, limit)?;
+    let query = topic.as_deref().unwrap_or("");
+    let results = if query.is_empty() {
+        repo.list_recent_decisions(&project_id, limit)?
+    } else {
+        repo.search_decisions(query, &project_id, limit)?.into_iter().map(|s| s.memory).collect()
+    };
 
     let decisions: Vec<serde_json::Value> = results.iter().map(|d| {
         serde_json::json!({

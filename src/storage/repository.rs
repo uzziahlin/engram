@@ -1,7 +1,15 @@
 use crate::models::*;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
+
+/// Wrapper for a memory with its FTS5 BM25 relevance score.
+#[derive(Debug, Clone)]
+pub struct ScoredMemory<T> {
+    pub memory: T,
+    pub bm25_score: f64,
+}
 
 /// Repository for all memory CRUD operations with FTS5 dual-write.
 ///
@@ -98,6 +106,7 @@ impl MemoryRepository {
                 summary,
                 content,
                 files_touched,
+                tags,
                 tokenize='porter unicode61'
             );
 
@@ -107,6 +116,7 @@ impl MemoryRepository {
                 context,
                 rationale,
                 tradeoffs,
+                tags,
                 tokenize='porter unicode61'
             );
 
@@ -116,6 +126,7 @@ impl MemoryRepository {
                 root_cause,
                 fix,
                 prevention,
+                tags,
                 tokenize='porter unicode61'
             );
 
@@ -124,6 +135,7 @@ impl MemoryRepository {
                 workflow_name,
                 steps,
                 related_tools,
+                tags,
                 tokenize='porter unicode61'
             );",
         )?;
@@ -162,21 +174,198 @@ impl MemoryRepository {
             CREATE INDEX IF NOT EXISTS idx_graph_to ON graph_relations(to_entity);
             CREATE INDEX IF NOT EXISTS idx_episodic_project_time ON episodic_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_decision_project_time ON decision_memories(project_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_failure_project_time ON failure_memories(project_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_procedural_project_time ON procedural_memories(project_id, created_at DESC);",
+            CREATE INDEX IF NOT EXISTS idx_procedural_project_time ON procedural_memories(project_id, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_unique_relation ON graph_relations(from_entity, to_entity, relation_type);",
         )?;
 
         tx.commit()?;
         Ok(())
     }
 
-    // ─── Episodic Memory CRUD ──────────────────────────────────────
+    /// Preprocess text for FTS5 by inserting spaces between consecutive CJK characters.
+    /// FTS5 unicode61 tokenizer treats consecutive CJK characters as a single token,
+    /// which prevents substring matching. By inserting spaces, each CJK character
+    /// becomes its own token, enabling character-level matching.
+    /// Used for both indexing (FTS5 INSERT) and querying (FTS5 MATCH).
+    fn preprocess_cjk(text: &str) -> String {
+        let has_cjk = text.chars().any(is_cjk_character);
+        if !has_cjk {
+            return text.to_string();
+        }
 
-    pub fn create_episodic(&self, mem: &EpisodicMemory) -> Result<()> {
+        let mut result = String::with_capacity(text.len() * 2);
+        let mut prev_was_cjk = false;
+
+        for ch in text.chars() {
+            if is_cjk_character(ch) {
+                if prev_was_cjk {
+                    result.push(' ');
+                }
+                result.push(ch);
+                prev_was_cjk = true;
+            } else {
+                result.push(ch);
+                prev_was_cjk = false;
+            }
+        }
+
+        result
+    }
+
+    /// Sanitize a user query for safe use in FTS5 MATCH expressions.
+    /// Splits the query into tokens, wraps each in double quotes (to escape
+    /// FTS5 operators like AND/OR/NOT), and joins them with ` OR` so that
+    /// each token is matched independently instead of as an exact phrase.
+    /// Must be called AFTER preprocess_cjk for CJK support.
+    fn sanitize_fts_query(query: &str) -> String {
+        let processed = Self::preprocess_cjk(query);
+        let tokens: Vec<&str> = processed.split_whitespace().collect();
+        if tokens.is_empty() {
+            return "\"\"".to_string();
+        }
+        tokens
+            .into_iter()
+            .map(|t| {
+                let escaped = t.replace('"', "\"\"");
+                format!("\"{}\"", escaped)
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    /// Migrate FTS5 tables to include tags column.
+    /// Drops and recreates all FTS5 virtual tables, then reindexes from main tables.
+    /// Safe to call idempotently on fresh or existing databases.
+    pub fn migrate_fts5_add_tags(&self) -> Result<()> {
+        // Check if migration is needed by probing episodic_memories_fts for tags column
+        let needs_migration = self.conn.prepare("SELECT tags FROM episodic_memories_fts LIMIT 0").is_err();
+        if !needs_migration {
+            return Ok(());
+        }
+
+        tracing::info!("Migrating FTS5 tables to include tags column...");
         let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute_batch("
+            DROP TABLE IF EXISTS episodic_memories_fts;
+            DROP TABLE IF EXISTS decision_memories_fts;
+            DROP TABLE IF EXISTS failure_memories_fts;
+            DROP TABLE IF EXISTS procedural_memories_fts;
+        ")?;
+
+        tx.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memories_fts USING fts5(
+                memory_id UNINDEXED, summary, content, files_touched, tags,
+                tokenize='porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS decision_memories_fts USING fts5(
+                memory_id UNINDEXED, title, context, rationale, tradeoffs, tags,
+                tokenize='porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS failure_memories_fts USING fts5(
+                memory_id UNINDEXED, incident, root_cause, fix, prevention, tags,
+                tokenize='porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS procedural_memories_fts USING fts5(
+                memory_id UNINDEXED, workflow_name, steps, related_tools, tags,
+                tokenize='porter unicode61'
+            );",
+        )?;
+
+        tx.execute_batch(
+            "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
+             SELECT id, summary, content, files_touched, tags FROM episodic_memories;
+             INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags)
+             SELECT id, title, context, rationale, tradeoffs, tags FROM decision_memories;
+             INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags)
+             SELECT id, incident, root_cause, fix, prevention, tags FROM failure_memories;
+             INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags)
+             SELECT id, workflow_name, steps, related_tools, tags FROM procedural_memories;",
+        )?;
+
+        tx.commit()?;
+        tracing::info!("FTS5 migration complete — tags column added.");
+        Ok(())
+    }
+
+    // ─── Entity Linking Helper ────────────────────────────────────
+
+    /// Ensure entities and relations exist for a memory's linked items (files/tools).
+    /// Upserts a Memory entity for the record itself, then creates File/Tool entities
+    /// and links them via the specified relation type. All within the caller's transaction.
+    fn ensure_linked_entities(
+        tx: &rusqlite::Transaction,
+        project_id: &str,
+        memory_id: &str,
+        entity_type: &str,
+        names: &[String],
+        relation_type: &str,
+        now: i64,
+    ) -> Result<()> {
+        // Upsert a Memory entity for the record itself
         tx.execute(
-            "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO entities (id, project_id, entity_type, name, metadata, created_at, updated_at)
+             VALUES (?1, ?2, 'Memory', ?3, '{}', ?4, ?4)
+             ON CONFLICT(project_id, entity_type, name) DO UPDATE SET updated_at = excluded.updated_at",
+            params![memory_id, project_id, memory_id, now],
+        )?;
+
+        for name in names {
+            // Try insert; if exists, the ON CONFLICT silently skips
+            let eid = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO entities (id, project_id, entity_type, name, metadata, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?5)
+                 ON CONFLICT(project_id, entity_type, name) DO NOTHING",
+                params![eid, project_id, entity_type, name, now],
+            )?;
+            // Get the actual entity id (either the new one or the existing one)
+            let actual_id: String = tx.query_row(
+                "SELECT id FROM entities WHERE project_id = ?1 AND entity_type = ?2 AND name = ?3",
+                params![project_id, entity_type, name],
+                |row| row.get(0),
+            )?;
+            // Insert relation with dedup via unique index
+            tx.execute(
+                "INSERT INTO graph_relations (project_id, from_entity, to_entity, relation_type, weight, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 1.0, ?5)
+                 ON CONFLICT(from_entity, to_entity, relation_type) DO NOTHING",
+                params![project_id, memory_id, actual_id, relation_type, now],
+            )?;
+        }
+        Ok(())
+    }
+
+
+    // ─── Macro-generated Memory CRUD + FTS5 Search ─────────────────
+
+    impl_memory_crud! {
+        mem = mem,
+        tx = tx,
+        row = row,
+
+        struct_type = EpisodicMemory,
+        table = "episodic_memories",
+        fts_table = "episodic_memories_fts",
+
+        create_fn = create_episodic,
+        get_fn = get_episodic,
+        update_fn = update_episodic,
+        delete_fn = delete_episodic,
+        search_fn = search_episodic,
+
+        select_cols = "id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at",
+        search_cols = "m.id, m.project_id, m.session_id, m.summary, m.content, m.files_touched, m.related_commits, m.importance, m.tags, m.created_at, m.updated_at",
+
+        insert_sql = "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+
+        fts_insert_sql = "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags) VALUES (?1,?2,?3,?4,?5)",
+
+        update_sql = "UPDATE episodic_memories SET project_id=?2, session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10 WHERE id=?1",
+
+        score_col_idx = 11,
+
+        insert_params = {
             params![
                 mem.id, mem.project_id, mem.session_id,
                 mem.summary, mem.content,
@@ -185,47 +374,20 @@ impl MemoryRepository {
                 mem.importance,
                 serde_json::to_string(&mem.tags)?,
                 mem.created_at, mem.updated_at,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched)
-             VALUES (?1,?2,?3,?4)",
+            ]
+        },
+
+        fts_params = {
             params![
-                mem.id, mem.summary, mem.content,
+                mem.id,
+                Self::preprocess_cjk(&mem.summary),
+                Self::preprocess_cjk(&mem.content),
                 serde_json::to_string(&mem.files_touched)?,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
+                serde_json::to_string(&mem.tags)?,
+            ]
+        },
 
-    pub fn get_episodic(&self, id: &str) -> Result<Option<EpisodicMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at
-             FROM episodic_memories WHERE id = ?1",
-        )?;
-        let row = stmt.query_row(params![id], |row| {
-            Ok(EpisodicMemory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                session_id: row.get(2)?,
-                summary: row.get(3)?,
-                content: row.get(4)?,
-                files_touched: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                related_commits: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                importance: row.get(7)?,
-                tags: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        }).optional()?;
-        Ok(row)
-    }
-
-    pub fn update_episodic(&self, mem: &EpisodicMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE episodic_memories SET project_id=?2, session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10 WHERE id=?1",
+        update_params = {
             params![
                 mem.id, mem.project_id, mem.session_id,
                 mem.summary, mem.content,
@@ -234,133 +396,300 @@ impl MemoryRepository {
                 mem.importance,
                 serde_json::to_string(&mem.tags)?,
                 mem.updated_at,
-            ],
-        )?;
-        // FTS5: delete-then-insert
-        tx.execute("DELETE FROM episodic_memories_fts WHERE memory_id = ?1", params![mem.id])?;
-        tx.execute(
-            "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched) VALUES (?1,?2,?3,?4)",
-            params![mem.id, mem.summary, mem.content, serde_json::to_string(&mem.files_touched)?],
-        )?;
-        tx.commit()?;
-        Ok(())
+            ]
+        },
+
+        row_mapper = {
+            EpisodicMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                session_id: row.get(2)?,
+                summary: row.get(3)?,
+                content: row.get(4)?,
+                files_touched: row_get_json!(row, 5, Vec<String>),
+                related_commits: row_get_json!(row, 6, Vec<String>),
+                importance: row.get(7)?,
+                tags: row_get_json!(row, 8, Vec<String>),
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            }
+        },
+
+        entity_link = {
+            if !mem.files_touched.is_empty() {
+                Self::ensure_linked_entities(
+                    &tx, &mem.project_id, &mem.id, "File", &mem.files_touched,
+                    "Touches", mem.created_at,
+                )?;
+            }
+        },
     }
 
-    pub fn delete_episodic(&self, id: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute("DELETE FROM episodic_memories WHERE id = ?1", params![id])?;
-        if affected > 0 {
-            tx.execute("DELETE FROM episodic_memories_fts WHERE memory_id = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(affected > 0)
-    }
+    impl_memory_crud! {
+        mem = mem,
+        tx = tx,
+        row = row,
 
-    // ─── Decision Memory CRUD ──────────────────────────────────────
+        struct_type = DecisionMemory,
+        table = "decision_memories",
+        fts_table = "decision_memories_fts",
 
-    pub fn create_decision(&self, mem: &DecisionMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        create_fn = create_decision,
+        get_fn = get_decision,
+        update_fn = update_decision,
+        delete_fn = delete_decision,
+        search_fn = search_decisions,
+
+        select_cols = "id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at",
+        search_cols = "m.id, m.project_id, m.title, m.context, m.rationale, m.tradeoffs, m.related_files, m.tags, m.created_at, m.updated_at",
+
+        insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+
+        fts_insert_sql = "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags) VALUES (?1,?2,?3,?4,?5,?6)",
+
+        update_sql = "UPDATE decision_memories SET project_id=?2, title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, updated_at=?9 WHERE id=?1",
+
+        score_col_idx = 10,
+
+        insert_params = {
             params![
                 mem.id, mem.project_id, mem.title,
                 mem.context, mem.rationale, mem.tradeoffs,
                 serde_json::to_string(&mem.related_files)?,
                 serde_json::to_string(&mem.tags)?,
                 mem.created_at, mem.updated_at,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs) VALUES (?1,?2,?3,?4,?5)",
-            params![mem.id, mem.title, mem.context, mem.rationale, mem.tradeoffs],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
+            ]
+        },
 
-    pub fn get_decision(&self, id: &str) -> Result<Option<DecisionMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at
-             FROM decision_memories WHERE id = ?1",
-        )?;
-        let row = stmt.query_row(params![id], |row| {
-            Ok(DecisionMemory {
+        fts_params = {
+            params![
+                mem.id,
+                Self::preprocess_cjk(&mem.title),
+                Self::preprocess_cjk(&mem.context),
+                Self::preprocess_cjk(&mem.rationale),
+                Self::preprocess_cjk(&mem.tradeoffs),
+                serde_json::to_string(&mem.tags)?,
+            ]
+        },
+
+        update_params = {
+            params![
+                mem.id, mem.project_id, mem.title,
+                mem.context, mem.rationale, mem.tradeoffs,
+                serde_json::to_string(&mem.related_files)?,
+                serde_json::to_string(&mem.tags)?,
+                mem.updated_at,
+            ]
+        },
+
+        row_mapper = {
+            DecisionMemory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
                 title: row.get(2)?,
                 context: row.get(3)?,
                 rationale: row.get(4)?,
                 tradeoffs: row.get(5)?,
-                related_files: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+                related_files: row_get_json!(row, 6, Vec<String>),
+                tags: row_get_json!(row, 7, Vec<String>),
                 created_at: row.get(8)?,
                 updated_at: row.get(9)?,
-            })
-        }).optional()?;
-        Ok(row)
+            }
+        },
+
+        entity_link = {
+            if !mem.related_files.is_empty() {
+                Self::ensure_linked_entities(
+                    &tx, &mem.project_id, &mem.id, "File", &mem.related_files,
+                    "References", mem.created_at,
+                )?;
+            }
+        },
     }
 
-    pub fn update_decision(&self, mem: &DecisionMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE decision_memories SET project_id=?2, title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, updated_at=?9 WHERE id=?1",
-            params![
-                mem.id, mem.project_id, mem.title,
-                mem.context, mem.rationale, mem.tradeoffs,
-                serde_json::to_string(&mem.related_files)?,
-                serde_json::to_string(&mem.tags)?,
-                mem.updated_at,
-            ],
-        )?;
-        tx.execute("DELETE FROM decision_memories_fts WHERE memory_id = ?1", params![mem.id])?;
-        tx.execute(
-            "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs) VALUES (?1,?2,?3,?4,?5)",
-            params![mem.id, mem.title, mem.context, mem.rationale, mem.tradeoffs],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
+    impl_memory_crud! {
+        mem = mem,
+        tx = tx,
+        row = row,
 
-    pub fn delete_decision(&self, id: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute("DELETE FROM decision_memories WHERE id = ?1", params![id])?;
-        if affected > 0 {
-            tx.execute("DELETE FROM decision_memories_fts WHERE memory_id = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(affected > 0)
-    }
+        struct_type = FailureMemory,
+        table = "failure_memories",
+        fts_table = "failure_memories_fts",
 
-    // ─── Failure Memory CRUD ───────────────────────────────────────
+        create_fn = create_failure,
+        get_fn = get_failure,
+        update_fn = update_failure,
+        delete_fn = delete_failure,
+        search_fn = search_failures,
 
-    pub fn create_failure(&self, mem: &FailureMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO failure_memories (id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        select_cols = "id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at",
+        search_cols = "m.id, m.project_id, m.incident, m.root_cause, m.fix, m.prevention, m.severity, m.tags, m.created_at, m.updated_at",
+
+        insert_sql = "INSERT INTO failure_memories (id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+
+        fts_insert_sql = "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags) VALUES (?1,?2,?3,?4,?5,?6)",
+
+        update_sql = "UPDATE failure_memories SET project_id=?2, incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9 WHERE id=?1",
+
+        score_col_idx = 10,
+
+        insert_params = {
             params![
                 mem.id, mem.project_id, mem.incident,
                 mem.root_cause, mem.fix, mem.prevention,
                 mem.severity,
                 serde_json::to_string(&mem.tags)?,
                 mem.created_at, mem.updated_at,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention) VALUES (?1,?2,?3,?4,?5)",
-            params![mem.id, mem.incident, mem.root_cause, mem.fix, mem.prevention],
-        )?;
-        tx.commit()?;
-        Ok(())
+            ]
+        },
+
+        fts_params = {
+            params![
+                mem.id,
+                Self::preprocess_cjk(&mem.incident),
+                Self::preprocess_cjk(&mem.root_cause),
+                Self::preprocess_cjk(&mem.fix),
+                Self::preprocess_cjk(&mem.prevention),
+                serde_json::to_string(&mem.tags)?,
+            ]
+        },
+
+        update_params = {
+            params![
+                mem.id, mem.project_id, mem.incident,
+                mem.root_cause, mem.fix, mem.prevention,
+                mem.severity,
+                serde_json::to_string(&mem.tags)?,
+                mem.updated_at,
+            ]
+        },
+
+        row_mapper = {
+            FailureMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                incident: row.get(2)?,
+                root_cause: row.get(3)?,
+                fix: row.get(4)?,
+                prevention: row.get(5)?,
+                severity: row.get(6)?,
+                tags: row_get_json!(row, 7, Vec<String>),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            }
+        },
+
+        entity_link = {},
     }
 
-    pub fn get_failure(&self, id: &str) -> Result<Option<FailureMemory>> {
+    impl_memory_crud! {
+        mem = mem,
+        tx = tx,
+        row = row,
+
+        struct_type = ProceduralMemory,
+        table = "procedural_memories",
+        fts_table = "procedural_memories_fts",
+
+        create_fn = create_procedural,
+        get_fn = get_procedural,
+        update_fn = update_procedural,
+        delete_fn = delete_procedural,
+        search_fn = search_procedural,
+
+        select_cols = "id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at",
+        search_cols = "m.id, m.project_id, m.workflow_name, m.steps, m.related_tools, m.tags, m.created_at, m.updated_at",
+
+        insert_sql = "INSERT INTO procedural_memories (id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+
+        fts_insert_sql = "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags) VALUES (?1,?2,?3,?4,?5)",
+
+        update_sql = "UPDATE procedural_memories SET project_id=?2, workflow_name=?3, steps=?4, related_tools=?5, tags=?6, updated_at=?7 WHERE id=?1",
+
+        score_col_idx = 8,
+
+        insert_params = {
+            params![
+                mem.id, mem.project_id, mem.workflow_name,
+                serde_json::to_string(&mem.steps)?,
+                serde_json::to_string(&mem.related_tools)?,
+                serde_json::to_string(&mem.tags)?,
+                mem.created_at, mem.updated_at,
+            ]
+        },
+
+        fts_params = {
+            params![
+                mem.id,
+                Self::preprocess_cjk(&mem.workflow_name),
+                serde_json::to_string(&mem.steps)?,
+                serde_json::to_string(&mem.related_tools)?,
+                serde_json::to_string(&mem.tags)?,
+            ]
+        },
+
+        update_params = {
+            params![
+                mem.id, mem.project_id, mem.workflow_name,
+                serde_json::to_string(&mem.steps)?,
+                serde_json::to_string(&mem.related_tools)?,
+                serde_json::to_string(&mem.tags)?,
+                mem.updated_at,
+            ]
+        },
+
+        row_mapper = {
+            ProceduralMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                workflow_name: row.get(2)?,
+                steps: row_get_json!(row, 3, Vec<String>),
+                related_tools: row_get_json!(row, 4, Vec<String>),
+                tags: row_get_json!(row, 5, Vec<String>),
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            }
+        },
+
+        entity_link = {
+            if !mem.related_tools.is_empty() {
+                Self::ensure_linked_entities(
+                    &tx, &mem.project_id, &mem.id, "Tool", &mem.related_tools,
+                    "Uses", mem.created_at,
+                )?;
+            }
+        },
+    }
+
+    /// Check which commit hashes have already been ingested as episodic memories.
+    /// Returns a HashSet of already-ingested commit hashes for O(1) lookup.
+    pub fn get_ingested_commits(&self, project_id: &str) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT related_commits FROM episodic_memories WHERE project_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut hashes = HashSet::new();
+        for row in rows {
+            let json_str = row?;
+            let commits: Vec<String> = serde_json::from_str(&json_str).unwrap_or_default();
+            hashes.extend(commits);
+        }
+        Ok(hashes)
+    }
+
+    /// List recent failure memories for a project, ordered by creation time descending.
+    /// Uses plain SELECT without FTS5 MATCH — safe for listing without a filter.
+    pub fn list_recent_failures(&self, project_id: &str, limit: usize) -> Result<Vec<FailureMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at
-             FROM failure_memories WHERE id = ?1",
+             FROM failure_memories
+             WHERE project_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
         )?;
-        let row = stmt.query_row(params![id], |row| {
+        let rows = stmt.query_map(params![project_id, limit], |row| {
             Ok(FailureMemory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -373,149 +702,6 @@ impl MemoryRepository {
                 created_at: row.get(8)?,
                 updated_at: row.get(9)?,
             })
-        }).optional()?;
-        Ok(row)
-    }
-
-    pub fn update_failure(&self, mem: &FailureMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE failure_memories SET project_id=?2, incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9 WHERE id=?1",
-            params![
-                mem.id, mem.project_id, mem.incident,
-                mem.root_cause, mem.fix, mem.prevention,
-                mem.severity,
-                serde_json::to_string(&mem.tags)?,
-                mem.updated_at,
-            ],
-        )?;
-        tx.execute("DELETE FROM failure_memories_fts WHERE memory_id = ?1", params![mem.id])?;
-        tx.execute(
-            "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention) VALUES (?1,?2,?3,?4,?5)",
-            params![mem.id, mem.incident, mem.root_cause, mem.fix, mem.prevention],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_failure(&self, id: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute("DELETE FROM failure_memories WHERE id = ?1", params![id])?;
-        if affected > 0 {
-            tx.execute("DELETE FROM failure_memories_fts WHERE memory_id = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(affected > 0)
-    }
-
-    // ─── Procedural Memory CRUD ────────────────────────────────────
-
-    pub fn create_procedural(&self, mem: &ProceduralMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO procedural_memories (id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                mem.id, mem.project_id, mem.workflow_name,
-                serde_json::to_string(&mem.steps)?,
-                serde_json::to_string(&mem.related_tools)?,
-                serde_json::to_string(&mem.tags)?,
-                mem.created_at, mem.updated_at,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools) VALUES (?1,?2,?3,?4)",
-            params![
-                mem.id, mem.workflow_name,
-                serde_json::to_string(&mem.steps)?,
-                serde_json::to_string(&mem.related_tools)?,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn get_procedural(&self, id: &str) -> Result<Option<ProceduralMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at
-             FROM procedural_memories WHERE id = ?1",
-        )?;
-        let row = stmt.query_row(params![id], |row| {
-            Ok(ProceduralMemory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                workflow_name: row.get(2)?,
-                steps: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                related_tools: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        }).optional()?;
-        Ok(row)
-    }
-
-    pub fn update_procedural(&self, mem: &ProceduralMemory) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE procedural_memories SET project_id=?2, workflow_name=?3, steps=?4, related_tools=?5, tags=?6, updated_at=?7 WHERE id=?1",
-            params![
-                mem.id, mem.project_id, mem.workflow_name,
-                serde_json::to_string(&mem.steps)?,
-                serde_json::to_string(&mem.related_tools)?,
-                serde_json::to_string(&mem.tags)?,
-                mem.updated_at,
-            ],
-        )?;
-        tx.execute("DELETE FROM procedural_memories_fts WHERE memory_id = ?1", params![mem.id])?;
-        tx.execute(
-            "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools) VALUES (?1,?2,?3,?4)",
-            params![
-                mem.id, mem.workflow_name,
-                serde_json::to_string(&mem.steps)?,
-                serde_json::to_string(&mem.related_tools)?,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_procedural(&self, id: &str) -> Result<bool> {
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx.execute("DELETE FROM procedural_memories WHERE id = ?1", params![id])?;
-        if affected > 0 {
-            tx.execute("DELETE FROM procedural_memories_fts WHERE memory_id = ?1", params![id])?;
-        }
-        tx.commit()?;
-        Ok(affected > 0)
-    }
-
-    // ─── FTS5 Search ───────────────────────────────────────────────
-
-    /// Search episodic memories via FTS5 BM25, returning memory IDs ordered by relevance.
-    pub fn search_episodic(&self, query: &str, project_id: &str, limit: usize) -> Result<Vec<EpisodicMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.project_id, m.session_id, m.summary, m.content, m.files_touched, m.related_commits, m.importance, m.tags, m.created_at, m.updated_at
-             FROM episodic_memories_fts f
-             JOIN episodic_memories m ON f.memory_id = m.id
-             WHERE episodic_memories_fts MATCH ?1 AND m.project_id = ?2
-             ORDER BY f.rank
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![query, project_id, limit], |row| {
-            Ok(EpisodicMemory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                session_id: row.get(2)?,
-                summary: row.get(3)?,
-                content: row.get(4)?,
-                files_touched: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                related_commits: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                importance: row.get(7)?,
-                tags: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -524,17 +710,17 @@ impl MemoryRepository {
         Ok(results)
     }
 
-    /// Search decision memories via FTS5 BM25.
-    pub fn search_decisions(&self, query: &str, project_id: &str, limit: usize) -> Result<Vec<DecisionMemory>> {
+    /// List recent decision memories for a project, ordered by creation time descending.
+    /// Uses plain SELECT without FTS5 MATCH — safe for listing without a filter.
+    pub fn list_recent_decisions(&self, project_id: &str, limit: usize) -> Result<Vec<DecisionMemory>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.project_id, m.title, m.context, m.rationale, m.tradeoffs, m.related_files, m.tags, m.created_at, m.updated_at
-             FROM decision_memories_fts f
-             JOIN decision_memories m ON f.memory_id = m.id
-             WHERE decision_memories_fts MATCH ?1 AND m.project_id = ?2
-             ORDER BY f.rank
-             LIMIT ?3",
+            "SELECT id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at
+             FROM decision_memories
+             WHERE project_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, project_id, limit], |row| {
+        let rows = stmt.query_map(params![project_id, limit], |row| {
             Ok(DecisionMemory {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -546,66 +732,6 @@ impl MemoryRepository {
                 tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
                 created_at: row.get(8)?,
                 updated_at: row.get(9)?,
-            })
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    /// Search failure memories via FTS5 BM25.
-    pub fn search_failures(&self, query: &str, project_id: &str, limit: usize) -> Result<Vec<FailureMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.project_id, m.incident, m.root_cause, m.fix, m.prevention, m.severity, m.tags, m.created_at, m.updated_at
-             FROM failure_memories_fts f
-             JOIN failure_memories m ON f.memory_id = m.id
-             WHERE failure_memories_fts MATCH ?1 AND m.project_id = ?2
-             ORDER BY f.rank
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![query, project_id, limit], |row| {
-            Ok(FailureMemory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                incident: row.get(2)?,
-                root_cause: row.get(3)?,
-                fix: row.get(4)?,
-                prevention: row.get(5)?,
-                severity: row.get(6)?,
-                tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    /// Search procedural memories via FTS5 BM25.
-    pub fn search_procedural(&self, query: &str, project_id: &str, limit: usize) -> Result<Vec<ProceduralMemory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.project_id, m.workflow_name, m.steps, m.related_tools, m.tags, m.created_at, m.updated_at
-             FROM procedural_memories_fts f
-             JOIN procedural_memories m ON f.memory_id = m.id
-             WHERE procedural_memories_fts MATCH ?1 AND m.project_id = ?2
-             ORDER BY f.rank
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![query, project_id, limit], |row| {
-            Ok(ProceduralMemory {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                workflow_name: row.get(2)?,
-                steps: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                related_tools: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
             })
         })?;
         let mut results = Vec::new();
@@ -780,6 +906,19 @@ impl MemoryRepository {
     }
 }
 
+/// Check if a character is a CJK (Chinese/Japanese/Korean) ideograph.
+fn is_cjk_character(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}'     // CJK Unified Ideographs
+        | '\u{3400}'..='\u{4DBF}'   // CJK Unified Ideographs Extension A
+        | '\u{F900}'..='\u{FAFF}'   // CJK Compatibility Ideographs
+        | '\u{2F800}'..='\u{2FA1F}' // CJK Compatibility Ideographs Supplement
+        | '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}'   // Hiragana
+        | '\u{30A0}'..='\u{30FF}'   // Katakana
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,7 +972,8 @@ mod tests {
         assert_eq!(after_update.importance, 0.9);
 
         // Delete
-        assert!(repo.delete_episodic(&mem.id).unwrap());
+        assert!(repo.delete_episodic(&mem.id, "test-project").unwrap());
+        assert!(!repo.delete_episodic(&mem.id, "wrong-project").unwrap());
         assert!(repo.get_episodic(&mem.id).unwrap().is_none());
     }
 
@@ -862,7 +1002,7 @@ mod tests {
         repo.update_decision(&updated).unwrap();
         assert_eq!(repo.get_decision(&mem.id).unwrap().unwrap().title, "Use Redis for all caching");
 
-        assert!(repo.delete_decision(&mem.id).unwrap());
+        assert!(repo.delete_decision(&mem.id, "test-project").unwrap());
         assert!(repo.get_decision(&mem.id).unwrap().is_none());
     }
 
@@ -892,7 +1032,7 @@ mod tests {
         repo.update_failure(&updated).unwrap();
         assert_eq!(repo.get_failure(&mem.id).unwrap().unwrap().severity, 5);
 
-        assert!(repo.delete_failure(&mem.id).unwrap());
+        assert!(repo.delete_failure(&mem.id, "test-project").unwrap());
         assert!(repo.get_failure(&mem.id).unwrap().is_none());
     }
 
@@ -920,7 +1060,7 @@ mod tests {
         repo.update_procedural(&updated).unwrap();
         assert_eq!(repo.get_procedural(&mem.id).unwrap().unwrap().steps.len(), 4);
 
-        assert!(repo.delete_procedural(&mem.id).unwrap());
+        assert!(repo.delete_procedural(&mem.id, "test-project").unwrap());
         assert!(repo.get_procedural(&mem.id).unwrap().is_none());
     }
 
@@ -947,10 +1087,10 @@ mod tests {
         // Search should find it
         let results = repo.search_episodic("OAuth refresh", "test-project", 10).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, mem.id);
+        assert_eq!(results[0].memory.id, mem.id);
 
         // After delete, search should not find it
-        repo.delete_episodic(&mem.id).unwrap();
+        repo.delete_episodic(&mem.id, "test-project").unwrap();
         let results = repo.search_episodic("OAuth refresh", "test-project", 10).unwrap();
         assert!(results.is_empty());
     }
@@ -1014,11 +1154,11 @@ mod tests {
         // Search in project-a should only return 1 result
         let results_a = repo.search_failures("Database", "project-a", 10).unwrap();
         assert_eq!(results_a.len(), 1);
-        assert_eq!(results_a[0].project_id, "project-a");
+        assert_eq!(results_a[0].memory.project_id, "project-a");
 
         let results_b = repo.search_failures("Database", "project-b", 10).unwrap();
         assert_eq!(results_b.len(), 1);
-        assert_eq!(results_b[0].project_id, "project-b");
+        assert_eq!(results_b[0].memory.project_id, "project-b");
     }
 
     #[test]

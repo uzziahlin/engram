@@ -80,6 +80,8 @@ impl RetrievalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
+    #[serde(default = "ContextConfig::default_context_window_tokens")]
+    pub context_window_tokens: usize,
     #[serde(default = "ContextConfig::default_memory_budget_percent")]
     pub memory_budget_percent: u8,
 }
@@ -87,12 +89,16 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
+            context_window_tokens: Self::default_context_window_tokens(),
             memory_budget_percent: Self::default_memory_budget_percent(),
         }
     }
 }
 
 impl ContextConfig {
+    fn default_context_window_tokens() -> usize {
+        200_000
+    }
     fn default_memory_budget_percent() -> u8 {
         15
     }
@@ -160,10 +166,15 @@ impl Config {
             .join(".engram")
             .join("config.toml");
 
-        if config_path.exists() {
-            Self::load_from_file(&config_path)
-        } else {
-            Ok(Self::default())
-        }
+            match Self::load_from_file(&config_path) {
+                Ok(config) => Ok(config),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse config file {:?}: {}. Using defaults.",
+                        config_path, e
+                    );
+                    Ok(Self::default())
+                }
+            }
     }
 }

@@ -12,6 +12,8 @@ pub enum EntityType {
     PullRequest,
     Bug,
     Incident,
+    Memory,
+    Tool,
 }
 
 impl EntityType {
@@ -25,6 +27,8 @@ impl EntityType {
             EntityType::PullRequest => "PullRequest",
             EntityType::Bug => "Bug",
             EntityType::Incident => "Incident",
+            EntityType::Memory => "Memory",
+            EntityType::Tool => "Tool",
         }
     }
 }
@@ -42,6 +46,8 @@ impl FromStr for EntityType {
             "PullRequest" => Ok(EntityType::PullRequest),
             "Bug" => Ok(EntityType::Bug),
             "Incident" => Ok(EntityType::Incident),
+            "Memory" => Ok(EntityType::Memory),
+            "Tool" => Ok(EntityType::Tool),
             other => Err(format!("unknown entity type: {other}")),
         }
     }
@@ -56,6 +62,8 @@ pub enum RelationType {
     IntroducedBy,
     RelatedTo,
     References,
+    Touches,
+    Uses,
 }
 
 impl RelationType {
@@ -67,6 +75,8 @@ impl RelationType {
             RelationType::IntroducedBy => "IntroducedBy",
             RelationType::RelatedTo => "RelatedTo",
             RelationType::References => "References",
+            RelationType::Touches => "Touches",
+            RelationType::Uses => "Uses",
         }
     }
 }
@@ -82,6 +92,8 @@ impl FromStr for RelationType {
             "IntroducedBy" => Ok(RelationType::IntroducedBy),
             "RelatedTo" => Ok(RelationType::RelatedTo),
             "References" => Ok(RelationType::References),
+            "Touches" => Ok(RelationType::Touches),
+            "Uses" => Ok(RelationType::Uses),
             other => Err(format!("unknown relation type: {other}")),
         }
     }

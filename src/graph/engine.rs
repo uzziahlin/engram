@@ -2,15 +2,16 @@ use crate::models::*;
 use crate::storage::MemoryRepository;
 use anyhow::{Context, Result};
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Graph engine using Petgraph for in-memory entity relationships.
 ///
-/// Loaded from SQLite on startup. Synced on writes.
-/// Supports cross-project edges (project_id IS NULL).
+/// Loaded from SQLite on demand. Supports incremental multi-project loading
+/// and cross-project edges (project_id IS NULL).
 pub struct GraphEngine {
     graph: DiGraph<Entity, GraphRelation>,
     entity_index: HashMap<String, NodeIndex>,
+    loaded_projects: HashSet<String>,
 }
 
 impl Default for GraphEngine {
@@ -24,13 +25,17 @@ impl GraphEngine {
         Self {
             graph: DiGraph::new(),
             entity_index: HashMap::new(),
+            loaded_projects: HashSet::new(),
         }
     }
 
-    /// Load all entities and relations for a project from SQLite into memory.
+    /// Load entities and relations for a project from SQLite into memory.
+    /// Incremental: skips already-loaded projects, appends new data without
+    /// clearing existing graph state.
     pub fn load_from_repo(&mut self, repo: &MemoryRepository, project_id: &str) -> Result<()> {
-        self.graph.clear();
-        self.entity_index.clear();
+        if self.loaded_projects.contains(project_id) {
+            return Ok(());
+        }
 
         let entities = repo
             .load_entities_for_project(project_id)
@@ -55,6 +60,7 @@ impl GraphEngine {
             }
         }
 
+        self.loaded_projects.insert(project_id.to_string());
         Ok(())
     }
 
@@ -279,6 +285,43 @@ mod tests {
 
         engine.add_relation(make_relation("e2", "e1", RelationType::DependsOn));
         assert!(engine.is_cyclic());
+    }
+
+    #[test]
+    fn test_load_from_repo_is_incremental_and_idempotent() {
+        use crate::storage::MemoryRepository;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("graph.db");
+        let repo = MemoryRepository::new(&db_path).unwrap();
+        repo.initialize_schema().unwrap();
+
+        // Seed two projects with one entity each.
+        let mut a = make_entity("ea", "a.ts");
+        a.project_id = "proj-a".into();
+        let mut b = make_entity("eb", "b.ts");
+        b.project_id = "proj-b".into();
+        repo.create_entity(&a).unwrap();
+        repo.create_entity(&b).unwrap();
+
+        let mut engine = GraphEngine::new();
+
+        // First load — pulls proj-a only.
+        engine.load_from_repo(&repo, "proj-a").unwrap();
+        assert_eq!(engine.node_count(), 1);
+        assert!(engine.get_entity("ea").is_some());
+        assert!(engine.get_entity("eb").is_none());
+
+        // Second load of the SAME project must be a no-op (idempotent).
+        engine.load_from_repo(&repo, "proj-a").unwrap();
+        assert_eq!(engine.node_count(), 1);
+
+        // Third load of a different project appends, does NOT clear.
+        engine.load_from_repo(&repo, "proj-b").unwrap();
+        assert_eq!(engine.node_count(), 2);
+        assert!(engine.get_entity("ea").is_some());
+        assert!(engine.get_entity("eb").is_some());
     }
 
     #[test]
