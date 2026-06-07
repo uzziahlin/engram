@@ -30,6 +30,7 @@ fn run_mcp_server() -> anyhow::Result<()> {
 
     let repo = MemoryRepository::new(&config.storage.database_path)?;
     repo.initialize_schema()?;
+    repo.migrate_fts5_add_tags()?;
     tracing::info!("SQLite schema initialized");
 
     let graph = GraphEngine::new();

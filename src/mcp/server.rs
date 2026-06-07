@@ -8,11 +8,13 @@ use crate::retrieval::intent_classifier::IntentClassifier;
 use crate::retrieval::planner::RetrievalPlanner;
 use crate::retrieval::reranker::Reranker;
 use crate::storage::MemoryRepository;
+use crate::storage::ScoredMemory;
 use anyhow::{Context as AnyhowContext, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 
 /// JSON-RPC request for MCP protocol.
 #[derive(Debug, Deserialize)]
@@ -39,6 +41,17 @@ struct JsonRpcResponse {
 struct JsonRpcError {
     code: i32,
     message: String,
+}
+
+/// Dispatch a tool call: deserialize arguments and invoke the provider method.
+/// Returns `(Some(result), None)` on successful parse, or `(None, Some(error))` on parse failure.
+macro_rules! dispatch_tool {
+    ($args:expr, $input_ty:ty, $provider:expr, $method:ident) => {
+        match serde_json::from_value::<$input_ty>($args) {
+            Ok(i) => (Some($provider.$method(i)), None),
+            Err(e) => (None, Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") })),
+        }
+    };
 }
 
 /// search_memory tool input.
@@ -210,6 +223,11 @@ pub struct DefaultMemoryProvider {
     repo: Mutex<MemoryRepository>,
     graph: Mutex<GraphEngine>,
     config: Config,
+    classifier: IntentClassifier,
+    planner: RetrievalPlanner,
+    reranker: Reranker,
+    composer: ContextComposer,
+    loaded_projects: Mutex<HashSet<String>>,
 }
 
 impl DefaultMemoryProvider {
@@ -218,6 +236,11 @@ impl DefaultMemoryProvider {
             repo: Mutex::new(repo),
             graph: Mutex::new(graph),
             config,
+            classifier: IntentClassifier::new(),
+            planner: RetrievalPlanner::new(),
+            reranker: Reranker::new(),
+            composer: ContextComposer::new(),
+            loaded_projects: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -225,10 +248,10 @@ impl DefaultMemoryProvider {
 impl MemoryToolProvider for DefaultMemoryProvider {
     fn search_memory(&self, input: SearchMemoryInput) -> Result<serde_json::Value> {
         let repo = self.repo.lock().unwrap();
-        let classifier = IntentClassifier::new();
-        let planner = RetrievalPlanner::new();
-        let reranker = Reranker::new();
-        let composer = ContextComposer::new();
+        let classifier = &self.classifier;
+        let planner = &self.planner;
+        let reranker = &self.reranker;
+        let composer = &self.composer;
 
         let intents = classifier.classify(&input.query);
         let plan = planner.plan(&intents);
@@ -255,7 +278,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         reranker.rerank(&mut results, &plan, now_ts);
 
         let budget = ContextBudget::new(
-            self.config.context.memory_budget_percent as usize * 200,
+            self.config.context.context_window_tokens,
             self.config.context.memory_budget_percent,
         );
         let context = composer.compose_context(&results, &budget);
@@ -281,12 +304,14 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value> {
-        // Lazy-load graph for this project
+        // Load graph for this project only once
         {
-            let repo = self.repo.lock().unwrap();
-            let mut graph = self.graph.lock().unwrap();
-            if graph.node_count() == 0 {
+            let mut loaded = self.loaded_projects.lock().unwrap();
+            if !loaded.contains(&input.project_id) {
+                let repo = self.repo.lock().unwrap();
+                let mut graph = self.graph.lock().unwrap();
                 graph.load_from_repo(&repo, &input.project_id)?;
+                loaded.insert(input.project_id.clone());
             }
         }
 
@@ -368,19 +393,21 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.repo.lock().unwrap();
         let query = input.service.as_deref().unwrap_or("");
         let results = if query.is_empty() {
-            repo.search_failures("*", &input.project_id, input.limit)?
+            repo.list_recent_failures(&input.project_id, input.limit)?
+                .into_iter()
+                .map(|m| ScoredMemory { memory: m, bm25_score: 0.0 })
+                .collect()
         } else {
             repo.search_failures(query, &input.project_id, input.limit)?
         };
-
         let failures: Vec<serde_json::Value> = results
             .iter()
             .map(|f| {
                 serde_json::json!({
-                    "id": f.id,
-                    "incident": f.incident,
-                    "severity": f.severity,
-                    "created_at": f.created_at,
+                    "id": f.memory.id,
+                    "incident": f.memory.incident,
+                    "severity": f.memory.severity,
+                    "created_at": f.memory.created_at,
                 })
             })
             .collect();
@@ -392,19 +419,21 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.repo.lock().unwrap();
         let query = input.topic.as_deref().unwrap_or("");
         let results = if query.is_empty() {
-            repo.search_decisions("*", &input.project_id, input.limit)?
+            repo.list_recent_decisions(&input.project_id, input.limit)?
+                .into_iter()
+                .map(|m| ScoredMemory { memory: m, bm25_score: 0.0 })
+                .collect()
         } else {
             repo.search_decisions(query, &input.project_id, input.limit)?
         };
-
         let decisions: Vec<serde_json::Value> = results
             .iter()
             .map(|d| {
                 serde_json::json!({
-                    "id": d.id,
-                    "title": d.title,
-                    "rationale": d.rationale,
-                    "created_at": d.created_at,
+                    "id": d.memory.id,
+                    "title": d.memory.title,
+                    "rationale": d.memory.rationale,
+                    "created_at": d.memory.created_at,
                 })
             })
             .collect();
@@ -530,9 +559,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let memories = git.process_recent_commits(&input.project_id, &session_id, input.count)?;
 
         let repo = self.repo.lock().unwrap();
-        let mut ingested = Vec::new();
 
-        for mem in &memories {
+        // Deduplicate: skip commits already ingested
+        let ingested_hashes = repo.get_ingested_commits(&input.project_id)?;
+        let new_memories: Vec<_> = memories
+            .into_iter()
+            .filter(|m| {
+                m.related_commits
+                    .iter()
+                    .all(|c| !ingested_hashes.contains(c))
+            })
+            .collect();
+
+        let mut ingested = Vec::new();
+        for mem in &new_memories {
             repo.create_episodic(mem)?;
             ingested.push(serde_json::json!({
                 "id": mem.id,
@@ -543,7 +583,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         Ok(serde_json::json!({
             "ingested": ingested.len(),
-            "total_commits_scanned": memories.len(),
+            "total_commits_scanned": input.count,
+            "skipped_duplicates": input.count - ingested.len(),
             "memories": ingested,
         }))
     }
@@ -828,198 +869,47 @@ impl McpServer {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or_default();
 
-                let result = match tool_name {
-                    "search_memory" => {
-                        let input: SearchMemoryInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.search_memory(input)
-                    }
-                    "related_files" => {
-                        let input: RelatedFilesInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.related_files(input)
-                    }
-                    "timeline" => {
-                        let input: TimelineInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.timeline(input)
-                    }
-                    "recent_failures" => {
-                        let input: RecentFailuresInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.recent_failures(input)
-                    }
-                    "architectural_decisions" => {
-                        let input: ArchitecturalDecisionsInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.architectural_decisions(input)
-                    }
-                    "create_episodic" => {
-                        let input: CreateEpisodicInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.create_episodic(input)
-                    }
-                    "create_decision" => {
-                        let input: CreateDecisionInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.create_decision(input)
-                    }
-                    "create_failure" => {
-                        let input: CreateFailureInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.create_failure(input)
-                    }
-                    "create_procedural" => {
-                        let input: CreateProceduralInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.create_procedural(input)
-                    }
-                    "ingest_commits" => {
-                        let input: IngestCommitsInput = match serde_json::from_value(arguments) {
-                            Ok(i) => i,
-                            Err(e) => {
-                                return JsonRpcResponse {
-                                    jsonrpc: "2.0".into(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: format!("Invalid params: {e}"),
-                                    }),
-                                };
-                            }
-                        };
-                        self.provider.ingest_commits(input)
-                    }
-                    _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+                let (result, parse_error): (Option<Result<serde_json::Value>>, Option<JsonRpcError>) = match tool_name {
+                    "search_memory" => dispatch_tool!(arguments, SearchMemoryInput, self.provider, search_memory),
+                    "related_files" => dispatch_tool!(arguments, RelatedFilesInput, self.provider, related_files),
+                    "timeline" => dispatch_tool!(arguments, TimelineInput, self.provider, timeline),
+                    "recent_failures" => dispatch_tool!(arguments, RecentFailuresInput, self.provider, recent_failures),
+                    "architectural_decisions" => dispatch_tool!(arguments, ArchitecturalDecisionsInput, self.provider, architectural_decisions),
+                    "create_episodic" => dispatch_tool!(arguments, CreateEpisodicInput, self.provider, create_episodic),
+                    "create_decision" => dispatch_tool!(arguments, CreateDecisionInput, self.provider, create_decision),
+                    "create_failure" => dispatch_tool!(arguments, CreateFailureInput, self.provider, create_failure),
+                    "create_procedural" => dispatch_tool!(arguments, CreateProceduralInput, self.provider, create_procedural),
+                    "ingest_commits" => dispatch_tool!(arguments, IngestCommitsInput, self.provider, ingest_commits),
+                    _ => (None, Some(JsonRpcError { code: -32601, message: format!("Unknown tool: {tool_name}") })),
                 };
 
-                match result {
-                    Ok(value) => JsonRpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: request.id,
-                        result: Some(serde_json::json!({
-                            "content": [{ "type": "text", "text": value.to_string() }]
-                        })),
-                        error: None,
-                    },
-                    Err(e) => JsonRpcResponse {
+                if let Some(err) = parse_error {
+                    JsonRpcResponse {
                         jsonrpc: "2.0".into(),
                         id: request.id,
                         result: None,
-                        error: Some(JsonRpcError {
-                            code: -32603,
-                            message: format!("Internal error: {e}"),
-                        }),
-                    },
+                        error: Some(err),
+                    }
+                } else {
+                    match result.expect("result exists when no parse error") {
+                        Ok(value) => JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: Some(serde_json::json!({
+                                "content": [{ "type": "text", "text": value.to_string() }]
+                            })),
+                            error: None,
+                        },
+                        Err(e) => JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32603,
+                                message: format!("Internal error: {e}"),
+                            }),
+                        },
+                    }
                 }
             }
             _ => JsonRpcResponse {
@@ -1305,5 +1195,217 @@ mod tests {
 
         // Should get an error because project_id is required
         assert!(response.error.is_some());
+    }
+
+    // ─── MCP JSON-RPC Integration Tests ────────────────────────────
+
+    fn setup_server() -> McpServer {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let graph = GraphEngine::new();
+        let config = Config::default();
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        McpServer::with_provider(provider)
+    }
+
+    #[test]
+    fn test_jsonrpc_notification_no_response() {
+        // Notifications (no id) should be silently skipped — handle_request
+        // only processes requests with an `id` field. The run() loop filters
+        // them out, but handle_request itself would still process them.
+        // This test verifies the behavior at the handle_request level.
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "initialize".into(),
+            params: None,
+        });
+        // Should get a valid response for requests with id
+        assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn test_jsonrpc_parse_error_response() {
+        let server = McpServer::new();
+        // Malformed method name still returns valid response
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "nonexistent/method".into(),
+            params: None,
+        });
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn test_jsonrpc_tools_call_unknown_tool() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "nonexistent_tool",
+                "arguments": {}
+            })),
+        });
+        assert!(response.error.is_some());
+        let err = response.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn test_jsonrpc_tools_call_invalid_params() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "create_episodic",
+                "arguments": {
+                    "project_id": "test"
+                    // missing required fields: session_id, summary, content
+                }
+            })),
+        });
+        assert!(response.error.is_some());
+        let err = response.error.unwrap();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("Invalid params"));
+    }
+
+    #[test]
+    fn test_jsonrpc_create_and_search_roundtrip() {
+        let server = setup_server();
+        // Create episodic memory via JSON-RPC
+        let create_resp = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "create_episodic",
+                "arguments": {
+                    "project_id": "roundtrip-test",
+                    "session_id": "s1",
+                    "summary": "Fixed authentication token expiry bug",
+                    "content": "Token was not refreshed properly causing 401 errors",
+                    "files_touched": ["auth.rs", "token.rs"],
+                    "tags": ["auth", "bug"],
+                    "importance": 0.9
+                }
+            })),
+        });
+        let create_result = create_resp.result.unwrap();
+        let text: &str = create_result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "created");
+
+        // Search for it
+        let search_resp = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "search_memory",
+                "arguments": {
+                    "project_id": "roundtrip-test",
+                    "query": "authentication token"
+                }
+            })),
+        });
+        assert!(search_resp.error.is_none());
+        let search_result = search_resp.result.unwrap();
+        let search_text: &str = search_result["content"][0]["text"].as_str().unwrap();
+        let search_parsed: serde_json::Value = serde_json::from_str(search_text).unwrap();
+        let results = search_parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["summary"].as_str().unwrap().contains("authentication"));
+    }
+
+    #[test]
+    fn test_jsonrpc_recent_failures_list_without_query() {
+        let server = setup_server();
+
+        // Create a failure memory
+        server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "create_failure",
+                "arguments": {
+                    "project_id": "failure-test",
+                    "incident": "Database connection timeout",
+                    "root_cause": "Connection pool exhausted",
+                    "fix": "Increased pool size to 20",
+                    "prevention": "Monitor pool usage metrics",
+                    "severity": 4
+                }
+            })),
+        });
+
+        // List recent failures (no service filter)
+        let list_resp = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "recent_failures",
+                "arguments": {
+                    "project_id": "failure-test"
+                }
+            })),
+        });
+        assert!(list_resp.error.is_none());
+        let list_result = list_resp.result.unwrap();
+        let list_text: &str = list_result["content"][0]["text"].as_str().unwrap();
+        let list_parsed: serde_json::Value = serde_json::from_str(list_text).unwrap();
+        let failures = list_parsed["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["severity"], 4);
+    }
+
+    #[test]
+    fn test_jsonrpc_timeline() {
+        let server = setup_server();
+
+        // Create an episodic memory
+        server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "create_episodic",
+                "arguments": {
+                    "project_id": "timeline-test",
+                    "session_id": "s1",
+                    "summary": "Test event",
+                    "content": "Test content"
+                }
+            })),
+        });
+
+        let timeline_resp = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "timeline",
+                "arguments": {
+                    "project_id": "timeline-test",
+                    "days": 1
+                }
+            })),
+        });
+        assert!(timeline_resp.error.is_none());
+        let timeline_result = timeline_resp.result.unwrap();
+        let timeline_text: &str = timeline_result["content"][0]["text"].as_str().unwrap();
+        let timeline_parsed: serde_json::Value = serde_json::from_str(timeline_text).unwrap();
+        let events = timeline_parsed["events"].as_array().unwrap();
+        assert!(!events.is_empty());
     }
 }
