@@ -193,6 +193,7 @@ fn default_ingest_count() -> usize {
 pub struct ToolDefinition {
     name: String,
     description: String,
+    #[serde(rename = "inputSchema")]
     input_schema: serde_json::Value,
 }
 
