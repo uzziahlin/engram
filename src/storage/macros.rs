@@ -1,10 +1,16 @@
 /// Read a JSON-serialized column from a rusqlite Row, deserializing with serde.
-/// Returns the default value on parse failure.
+/// Returns the default value on parse failure and logs a warning.
 ///
 /// Usage: `row_get_json!(row, 5, Vec<String>)`
 macro_rules! row_get_json {
     ($row:expr, $idx:expr, $ty:ty) => {
-        serde_json::from_str::<$ty>(&$row.get::<_, String>($idx)?).unwrap_or_default()
+        match serde_json::from_str::<$ty>(&$row.get::<_, String>($idx)?) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("JSON parse failed at column {}: {e}", $idx);
+                <$ty>::default()
+            }
+        }
     };
 }
 

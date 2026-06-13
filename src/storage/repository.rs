@@ -42,6 +42,8 @@ impl MemoryRepository {
     pub fn initialize_schema(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        self.conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        self.conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -175,7 +177,8 @@ impl MemoryRepository {
             CREATE INDEX IF NOT EXISTS idx_episodic_project_time ON episodic_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_decision_project_time ON decision_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_procedural_project_time ON procedural_memories(project_id, created_at DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_unique_relation ON graph_relations(from_entity, to_entity, relation_type);",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_unique_relation ON graph_relations(from_entity, to_entity, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_failure_project_time ON failure_memories(project_id, created_at DESC);",
         )?;
 
         tx.commit()?;
@@ -193,7 +196,8 @@ impl MemoryRepository {
             return text.to_string();
         }
 
-        let mut result = String::with_capacity(text.len() * 2);
+        // Estimate capacity: original length + space for CJK separators (worst case ~50% extra)
+        let mut result = String::with_capacity(text.len() + text.len() / 2);
         let mut prev_was_cjk = false;
 
         for ch in text.chars() {
@@ -311,18 +315,15 @@ impl MemoryRepository {
         )?;
 
         for name in names {
-            // Try insert; if exists, the ON CONFLICT silently skips
+            // Upsert entity and retrieve its id via RETURNING — eliminates the
+            // extra SELECT that previously caused N+1 queries.
             let eid = uuid::Uuid::new_v4().to_string();
-            tx.execute(
+            let actual_id: String = tx.query_row(
                 "INSERT INTO entities (id, project_id, entity_type, name, metadata, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?5)
-                 ON CONFLICT(project_id, entity_type, name) DO NOTHING",
+                 ON CONFLICT(project_id, entity_type, name) DO UPDATE SET updated_at = excluded.updated_at
+                 RETURNING id",
                 params![eid, project_id, entity_type, name, now],
-            )?;
-            // Get the actual entity id (either the new one or the existing one)
-            let actual_id: String = tx.query_row(
-                "SELECT id FROM entities WHERE project_id = ?1 AND entity_type = ?2 AND name = ?3",
-                params![project_id, entity_type, name],
                 |row| row.get(0),
             )?;
             // Insert relation with dedup via unique index
@@ -743,6 +744,34 @@ impl MemoryRepository {
 
     // ─── Entity / Graph CRUD ───────────────────────────────────────
 
+    /// Map a row to an Entity. Centralizes the repeated row mapping logic.
+    fn row_to_entity(row: &rusqlite::Row<'_>) -> Result<Entity> {
+        let et: String = row.get(2)?;
+        Ok(Entity {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            entity_type: et.parse().map_err(|e: String| anyhow::anyhow!("invalid entity_type: {e}"))?,
+            name: row.get(3)?,
+            metadata: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+
+    /// Map a row to a GraphRelation. Centralizes the repeated row mapping logic.
+    fn row_to_relation(row: &rusqlite::Row<'_>) -> Result<GraphRelation> {
+        let rt: String = row.get(4)?;
+        Ok(GraphRelation {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            from_entity: row.get(2)?,
+            to_entity: row.get(3)?,
+            relation_type: rt.parse().map_err(|e: String| anyhow::anyhow!("invalid relation_type: {e}"))?,
+            weight: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    }
+
     pub fn create_entity(&self, entity: &Entity) -> Result<()> {
         self.conn.execute(
             "INSERT INTO entities (id, project_id, entity_type, name, metadata, created_at, updated_at)
@@ -766,33 +795,28 @@ impl MemoryRepository {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, entity_type, name, metadata, created_at, updated_at FROM entities WHERE id = ?1",
         )?;
-        let row = stmt.query_row(params![id], |row| {
-            let et: String = row.get(2)?;
-            Ok(Entity {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                entity_type: et.parse().map_err(|_: String| rusqlite::Error::InvalidColumnType(2, "entity_type".into(), rusqlite::types::Type::Text))?,
-                name: row.get(3)?,
-                metadata: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        }).optional()?;
-        Ok(row)
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_entity(row)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn remove_entity(&self, id: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
         // Delete related relations first to satisfy foreign key constraints
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
             params![id],
         )?;
-        let affected = self.conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        let affected = tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(affected > 0)
     }
 
     pub fn create_relation(&self, rel: &GraphRelation) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO graph_relations (project_id, from_entity, to_entity, relation_type, weight, created_at)
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![
@@ -804,6 +828,7 @@ impl MemoryRepository {
                 rel.created_at,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -812,21 +837,10 @@ impl MemoryRepository {
             "SELECT id, project_id, from_entity, to_entity, relation_type, weight, created_at
              FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
         )?;
-        let rows = stmt.query_map(params![entity_id], |row| {
-            let rt: String = row.get(4)?;
-            Ok(GraphRelation {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                from_entity: row.get(2)?,
-                to_entity: row.get(3)?,
-                relation_type: rt.parse().map_err(|_: String| rusqlite::Error::InvalidColumnType(4, "relation_type".into(), rusqlite::types::Type::Text))?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        })?;
+        let mut rows = stmt.query(params![entity_id])?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        while let Some(row) = rows.next()? {
+            results.push(Self::row_to_relation(row)?);
         }
         Ok(results)
     }
@@ -842,21 +856,10 @@ impl MemoryRepository {
             "SELECT id, project_id, entity_type, name, metadata, created_at, updated_at
              FROM entities WHERE project_id = ?1 OR project_id IS NULL",
         )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            let et: String = row.get(2)?;
-            Ok(Entity {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                entity_type: et.parse().map_err(|_: String| rusqlite::Error::InvalidColumnType(2, "entity_type".into(), rusqlite::types::Type::Text))?,
-                name: row.get(3)?,
-                metadata: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })?;
+        let mut rows = stmt.query(params![project_id])?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        while let Some(row) = rows.next()? {
+            results.push(Self::row_to_entity(row)?);
         }
         Ok(results)
     }
@@ -867,21 +870,10 @@ impl MemoryRepository {
             "SELECT id, project_id, from_entity, to_entity, relation_type, weight, created_at
              FROM graph_relations WHERE project_id = ?1 OR project_id IS NULL",
         )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            let rt: String = row.get(4)?;
-            Ok(GraphRelation {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                from_entity: row.get(2)?,
-                to_entity: row.get(3)?,
-                relation_type: rt.parse().map_err(|_: String| rusqlite::Error::InvalidColumnType(4, "relation_type".into(), rusqlite::types::Type::Text))?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        })?;
+        let mut rows = stmt.query(params![project_id])?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        while let Some(row) = rows.next()? {
+            results.push(Self::row_to_relation(row)?);
         }
         Ok(results)
     }

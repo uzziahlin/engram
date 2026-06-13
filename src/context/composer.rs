@@ -75,7 +75,12 @@ impl ContextComposer {
     }
 
     /// Detect the dominant content type of a string.
+    /// Empty strings default to English.
     pub fn detect_content_type(text: &str) -> ContentType {
+        if text.is_empty() {
+            return ContentType::English;
+        }
+
         let mut english = 0usize;
         let mut chinese = 0usize;
 

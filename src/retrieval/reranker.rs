@@ -19,10 +19,10 @@ impl Reranker {
     /// Rerank search results based on the retrieval plan's weights.
     ///
     /// Scoring formula:
-    ///   final_score = relevance * 0.5
+    ///   final_score = relevance * 0.4
     ///               + recency_normalized * plan.recency_weight
     ///               + relevance * plan.importance_weight
-    ///               + (graph_boost if applicable) * plan.graph_weight
+    ///               + type_boost * plan.graph_weight
     pub fn rerank(
         &self,
         results: &mut [SearchResult],
@@ -47,10 +47,20 @@ impl Reranker {
 
             let base_relevance = result.relevance_score;
 
+            // Static type-based boost reflecting memory type importance
+            let type_boost: f32 = match result.memory_type.as_str() {
+                "failure" => 0.9,
+                "decision" => 0.7,
+                "episodic" => 0.5,
+                "procedural" => 0.3,
+                _ => 0.4,
+            };
+
             // Combined score
-            let final_score = base_relevance * 0.5
+            let final_score = base_relevance * 0.4
                 + recency_normalized * plan.recency_weight
-                + base_relevance * plan.importance_weight;
+                + base_relevance * plan.importance_weight
+                + type_boost * plan.graph_weight;
 
             result.relevance_score = final_score.min(1.0);
         }
@@ -76,7 +86,6 @@ impl Reranker {
         max_input: usize,
         max_output: usize,
     ) {
-        results.truncate(max_input);
         results.truncate(max_output.min(max_input));
     }
 }

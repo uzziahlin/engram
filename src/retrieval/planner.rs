@@ -10,7 +10,7 @@ pub struct RetrievalPlan {
 }
 
 /// Memory sources available for retrieval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemorySource {
     Episodic,
     Decision,
@@ -114,7 +114,7 @@ impl RetrievalPlanner {
         }
 
         // Deduplicate sources
-        sources.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        sources.sort();
         sources.dedup();
 
         RetrievalPlan {
