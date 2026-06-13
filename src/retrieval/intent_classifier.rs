@@ -30,10 +30,10 @@ impl IntentClassifier {
 
         // Architecture keywords
         for kw in &[
-            "architect", "design", "decision", "structure", "refactor",
+            "architect", "design", "decision", "structure",
             "pattern", "module", "component", "service", "microservice",
             "why", "rationale", "tradeoff",
-            "架构", "设计", "决策", "重构", "模块",
+            "架构", "设计", "决策", "模块",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Architecture]);
         }
@@ -41,8 +41,8 @@ impl IntentClassifier {
         // Workflow keywords
         for kw in &[
             "workflow", "process", "procedure", "pipeline", "ci", "cd",
-            "deploy", "build", "test", "lint", "step",
-            "工作流", "流程", "部署", "构建",
+            "build", "test", "lint", "step",
+            "工作流", "流程", "构建",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Workflow]);
         }

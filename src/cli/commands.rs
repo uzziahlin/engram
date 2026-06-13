@@ -11,7 +11,7 @@ fn open_repo(config: &Config) -> Result<MemoryRepository> {
 }
 
 fn load_config() -> Result<Config> {
-    Ok(Config::load().unwrap_or_default())
+    Config::load()
 }
 
 fn now_ts() -> i64 {
@@ -24,10 +24,15 @@ fn print_json(value: &serde_json::Value) {
 }
 
 /// Extract a required string argument by name (--name value).
+/// Validates that the value is not another flag (starts with --).
 fn require_str(args: &[String], name: &str) -> Result<String> {
     let flag = format!("--{name}");
     let pos = args.iter().position(|a| a == &flag).context(format!("Missing required argument: --{name}"))?;
-    args.get(pos + 1).cloned().context(format!("--{name} requires a value"))
+    let value = args.get(pos + 1).cloned().context(format!("--{name} requires a value"))?;
+    if value.starts_with("--") {
+        anyhow::bail!("--{name} requires a value, but got flag '{value}'");
+    }
+    Ok(value)
 }
 
 /// Extract an optional string argument by name.
@@ -296,8 +301,19 @@ pub fn ingest(args: &[String]) -> Result<()> {
     let git = GitIntegration::new(Path::new(&repo_path))?;
     let memories = git.process_recent_commits(&project_id, &session_id, count)?;
 
+    // Deduplicate: skip commits already ingested
+    let ingested_hashes = repo.get_ingested_commits(&project_id)?;
+    let new_memories: Vec<_> = memories
+        .into_iter()
+        .filter(|m| {
+            m.related_commits
+                .iter()
+                .all(|c| !ingested_hashes.contains(c))
+        })
+        .collect();
+
     let mut ingested = Vec::new();
-    for mem in &memories {
+    for mem in &new_memories {
         repo.create_episodic(mem)?;
         ingested.push(serde_json::json!({
             "id": mem.id,
@@ -308,7 +324,7 @@ pub fn ingest(args: &[String]) -> Result<()> {
 
     print_json(&serde_json::json!({
         "ingested": ingested.len(),
-        "total_commits": memories.len(),
+        "total_commits": new_memories.len(),
         "memories": ingested,
     }));
     Ok(())

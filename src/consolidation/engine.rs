@@ -17,14 +17,16 @@ impl ConsolidationEngine {
         Self
     }
 
-    /// Compute a simple content hash for deduplication.
-    /// Uses the summary + content fields as the hash source.
+    /// Compute a deterministic content hash for deduplication.
+    /// Uses FNV-1a hash which is stable across Rust versions,
+    /// unlike `DefaultHasher` which provides no stability guarantees.
     pub fn content_hash(summary: &str, content: &str) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        summary.hash(&mut hasher);
-        content.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        for byte in summary.bytes().chain(content.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        }
+        format!("{:016x}", hash)
     }
 
     /// Deduplicate episodic memories by content hash within a project.

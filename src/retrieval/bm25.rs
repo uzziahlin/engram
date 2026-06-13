@@ -1,4 +1,5 @@
-use crate::storage::MemoryRepository;
+use crate::models::{EpisodicMemory, DecisionMemory, FailureMemory, ProceduralMemory};
+use crate::storage::{MemoryRepository, ScoredMemory};
 use anyhow::Result;
 
 /// A single search result with relevance score.
@@ -9,6 +10,37 @@ pub struct SearchResult {
     pub summary: String,
     pub relevance_score: f32,
     pub created_at: i64,
+}
+
+/// Trait for extracting searchable fields from memory types.
+trait Searchable {
+    fn search_id(&self) -> &str;
+    fn search_summary(&self) -> &str;
+    fn search_created_at(&self) -> i64;
+}
+
+impl Searchable for EpisodicMemory {
+    fn search_id(&self) -> &str { &self.id }
+    fn search_summary(&self) -> &str { &self.summary }
+    fn search_created_at(&self) -> i64 { self.created_at }
+}
+
+impl Searchable for DecisionMemory {
+    fn search_id(&self) -> &str { &self.id }
+    fn search_summary(&self) -> &str { &self.title }
+    fn search_created_at(&self) -> i64 { self.created_at }
+}
+
+impl Searchable for FailureMemory {
+    fn search_id(&self) -> &str { &self.id }
+    fn search_summary(&self) -> &str { &self.incident }
+    fn search_created_at(&self) -> i64 { self.created_at }
+}
+
+impl Searchable for ProceduralMemory {
+    fn search_id(&self) -> &str { &self.id }
+    fn search_summary(&self) -> &str { &self.workflow_name }
+    fn search_created_at(&self) -> i64 { self.created_at }
 }
 
 /// BM25 retrieval engine using SQLite FTS5.
@@ -25,12 +57,30 @@ impl BM25Retriever {
         Self
     }
 
+    /// Sigmoid normalization scaling factor.
+    /// Controls how quickly the normalization curve saturates.
+    const SIGMOID_SCALE: f64 = 5.0;
+
     /// Normalize FTS5 bm25() score to [0, 1].
     /// bm25() returns negative values; more negative = better match.
     /// We negate and apply sigmoid-like normalization.
     fn normalize_bm25(score: f64) -> f32 {
         let positive = (-score).max(0.0);
-        (1.0 - (-positive / 5.0).exp()) as f32
+        (1.0 - (-positive / Self::SIGMOID_SCALE).exp()) as f32
+    }
+
+    /// Convert scored memories of any type into SearchResults.
+    fn to_results<T: Searchable>(
+        scored_mems: Vec<ScoredMemory<T>>,
+        memory_type: &str,
+    ) -> Vec<SearchResult> {
+        scored_mems.into_iter().map(|scored| SearchResult {
+            id: scored.memory.search_id().to_string(),
+            memory_type: memory_type.into(),
+            summary: scored.memory.search_summary().to_string(),
+            relevance_score: Self::normalize_bm25(scored.bm25_score),
+            created_at: scored.memory.search_created_at(),
+        }).collect()
     }
 
     /// Search all memory types via FTS5 BM25 for a given query.
@@ -43,57 +93,18 @@ impl BM25Retriever {
     ) -> Result<Vec<SearchResult>> {
         let mut results = Vec::new();
 
-        // Search episodic memories
-        let episodic = repo.search_episodic(query, project_id, limit)?;
-        for scored in episodic {
-            let relevance = Self::normalize_bm25(scored.bm25_score);
-            results.push(SearchResult {
-                id: scored.memory.id,
-                memory_type: "episodic".into(),
-                summary: scored.memory.summary,
-                relevance_score: relevance,
-                created_at: scored.memory.created_at,
-            });
-        }
-
-        // Search decision memories
-        let decisions = repo.search_decisions(query, project_id, limit)?;
-        for scored in decisions {
-            let relevance = Self::normalize_bm25(scored.bm25_score);
-            results.push(SearchResult {
-                id: scored.memory.id,
-                memory_type: "decision".into(),
-                summary: scored.memory.title,
-                relevance_score: relevance,
-                created_at: scored.memory.created_at,
-            });
-        }
-
-        // Search failure memories
-        let failures = repo.search_failures(query, project_id, limit)?;
-        for scored in failures {
-            let relevance = Self::normalize_bm25(scored.bm25_score);
-            results.push(SearchResult {
-                id: scored.memory.id,
-                memory_type: "failure".into(),
-                summary: scored.memory.incident,
-                relevance_score: relevance,
-                created_at: scored.memory.created_at,
-            });
-        }
-
-        // Search procedural memories
-        let procedural = repo.search_procedural(query, project_id, limit)?;
-        for scored in procedural {
-            let relevance = Self::normalize_bm25(scored.bm25_score);
-            results.push(SearchResult {
-                id: scored.memory.id,
-                memory_type: "procedural".into(),
-                summary: scored.memory.workflow_name,
-                relevance_score: relevance,
-                created_at: scored.memory.created_at,
-            });
-        }
+        results.extend(Self::to_results(
+            repo.search_episodic(query, project_id, limit)?, "episodic",
+        ));
+        results.extend(Self::to_results(
+            repo.search_decisions(query, project_id, limit)?, "decision",
+        ));
+        results.extend(Self::to_results(
+            repo.search_failures(query, project_id, limit)?, "failure",
+        ));
+        results.extend(Self::to_results(
+            repo.search_procedural(query, project_id, limit)?, "procedural",
+        ));
 
         // Sort by relevance score descending
         results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
@@ -111,46 +122,18 @@ impl BM25Retriever {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         match memory_type {
-            "episodic" => {
-                let scored_mems = repo.search_episodic(query, project_id, limit)?;
-                Ok(scored_mems.into_iter().map(|scored| SearchResult {
-                    id: scored.memory.id,
-                    memory_type: "episodic".into(),
-                    summary: scored.memory.summary,
-                    relevance_score: Self::normalize_bm25(scored.bm25_score),
-                    created_at: scored.memory.created_at,
-                }).collect())
-            }
-            "decision" => {
-                let scored_mems = repo.search_decisions(query, project_id, limit)?;
-                Ok(scored_mems.into_iter().map(|scored| SearchResult {
-                    id: scored.memory.id,
-                    memory_type: "decision".into(),
-                    summary: scored.memory.title,
-                    relevance_score: Self::normalize_bm25(scored.bm25_score),
-                    created_at: scored.memory.created_at,
-                }).collect())
-            }
-            "failure" => {
-                let scored_mems = repo.search_failures(query, project_id, limit)?;
-                Ok(scored_mems.into_iter().map(|scored| SearchResult {
-                    id: scored.memory.id,
-                    memory_type: "failure".into(),
-                    summary: scored.memory.incident,
-                    relevance_score: Self::normalize_bm25(scored.bm25_score),
-                    created_at: scored.memory.created_at,
-                }).collect())
-            }
-            "procedural" => {
-                let scored_mems = repo.search_procedural(query, project_id, limit)?;
-                Ok(scored_mems.into_iter().map(|scored| SearchResult {
-                    id: scored.memory.id,
-                    memory_type: "procedural".into(),
-                    summary: scored.memory.workflow_name,
-                    relevance_score: Self::normalize_bm25(scored.bm25_score),
-                    created_at: scored.memory.created_at,
-                }).collect())
-            }
+            "episodic" => Ok(Self::to_results(
+                repo.search_episodic(query, project_id, limit)?, "episodic",
+            )),
+            "decision" => Ok(Self::to_results(
+                repo.search_decisions(query, project_id, limit)?, "decision",
+            )),
+            "failure" => Ok(Self::to_results(
+                repo.search_failures(query, project_id, limit)?, "failure",
+            )),
+            "procedural" => Ok(Self::to_results(
+                repo.search_procedural(query, project_id, limit)?, "procedural",
+            )),
             _ => Ok(Vec::new()),
         }
     }
