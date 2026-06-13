@@ -1,0 +1,108 @@
+name: Release
+
+# Build precompiled binaries on native runners and publish them to GitHub
+# Releases whenever a `v*` tag is pushed. No system openssl/libssh2 is needed:
+# gix is pure-Rust and SQLite is bundled, so each artifact is self-contained.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0) — must already exist"
+        required: true
+
+permissions:
+  contents: write # required by softprops/action-gh-release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="engram-${VERSION}-${TARGET}"
+          mkdir "$STAGE"
+          cp "target/${TARGET}/release/engram" "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          echo "asset=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.ver.outputs.version }}"
+          $TARGET = "${{ matrix.target }}"
+          $STAGE = "engram-$VERSION-$TARGET"
+          New-Item -ItemType Directory -Path $STAGE | Out-Null
+          Copy-Item "target/$TARGET/release/engram.exe" "$STAGE/"
+          Copy-Item README.md, LICENSE "$STAGE/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$STAGE" -DestinationPath "$STAGE.zip"
+          "asset=$STAGE.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Generate SHA256 checksum (unix)
+        if: matrix.archive == 'tar.gz'
+        run: shasum -a 256 "${{ env.asset }}" > "${{ env.asset }}.sha256"
+
+      - name: Generate SHA256 checksum (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "${{ env.asset }}" -Algorithm SHA256).Hash
+          "$hash  ${{ env.asset }}" | Out-File "${{ env.asset }}.sha256" -Encoding ascii
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            ${{ env.asset }}
+            ${{ env.asset }}.sha256
+          generate_release_notes: true

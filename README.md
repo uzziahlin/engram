@@ -39,22 +39,40 @@ AI coding assistants are powerful — but they forget everything between session
 
 ## 🚀 Installation
 
-### From Source
+### Quick Install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uzziahlin/engram/main/install.sh | sh
+```
+
+This downloads the prebuilt binary for your platform, installs it to `~/.engram/bin/engram`, initializes the database, and **auto-configures any MCP client it detects** (Claude Code, Cursor, Windsurf, Codex CLI). Just restart your editor afterward.
+
+**Supported platforms** (auto-detected by the installer):
+
+| OS | Architecture | Target |
+|----|--------------|--------|
+| macOS | Apple Silicon | `aarch64-apple-darwin` |
+| macOS | Intel | `x86_64-apple-darwin` |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` |
+| Windows | x86_64 (WSL / Git Bash) | `x86_64-pc-windows-msvc` |
+
+The release binary is self-contained — SQLite is bundled and the git library is pure-Rust, so there are **no system OpenSSL/libgit2 dependencies** to install.
+
+> Environment overrides: `ENGRAM_VERSION=x.y.z` to pin a version, `ENGRAM_INSTALL_DIR=<dir>` for a custom install location.
+
+### Build from Source (developers)
 
 ```bash
 git clone https://github.com/uzziahlin/engram.git
 cd engram
 cargo build --release
 
-# The binary is at target/release/engram
+# The binary is at target/release/engram (engram.exe on Windows)
 # Optionally install system-wide:
 cargo install --path .
 ```
 
-### Requirements
-
-- Rust 1.75+ (with a C compiler for SQLite bundling)
-- No external databases or services needed
+Requires Rust 1.75+ and a C compiler (only for the bundled SQLite via `rusqlite`; the git layer is pure-Rust `gix`). No external databases or services needed.
 
 ### Verify
 
@@ -69,6 +87,8 @@ engram
 ## 🔌 Integration
 
 Engram speaks the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) over stdio. Any MCP-compatible tool can connect.
+
+> 💡 The **Quick Install** script above already writes the correct MCP config for any client it detects — the manual JSON snippets below are only needed for custom setups or if a client wasn't installed at install time.
 
 ### Claude Code
 
@@ -261,7 +281,7 @@ engram create-failure --incident "FTS5 crash" --severity 4
 engram create-procedural --name "deploy" --steps "test,build,push"
 
 # Ingest git history
-engram ingest --path . --count 20
+engram ingest --project myproj --repo .
 
 # View history
 engram timeline --days 7

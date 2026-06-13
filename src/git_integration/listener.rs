@@ -1,6 +1,6 @@
 use crate::models::EpisodicMemory;
 use anyhow::{Context, Result};
-use git2::{Diff, Repository};
+use gix::bstr::ByteSlice;
 use std::path::Path;
 
 /// A commit event extracted from git history.
@@ -14,62 +14,115 @@ pub struct CommitEvent {
 
 /// Git integration for monitoring commits and auto-generating memories.
 pub struct GitIntegration {
-    repo: Repository,
+    repo: gix::Repository,
 }
 
 impl GitIntegration {
-    /// Open a git repository at the given path.
+    /// Open a git repository at the given path (searching upward for `.git`).
     pub fn new(repo_path: &Path) -> Result<Self> {
-        let repo = Repository::discover(repo_path)
-            .context("failed to discover git repository")?;
+        let repo = gix::discover(repo_path).context("failed to discover git repository")?;
         Ok(Self { repo })
     }
 
-    /// Get the N most recent commits.
+    /// Get the N most recent commits (newest first by commit time).
+    ///
+    /// Unlike libgit2's `Sort::TIME`, gix's rev-walk is not chronological, so we
+    /// collect every reachable commit, sort by commit time descending, then
+    /// truncate. `ingest` is an explicit, non-hot-path command, so walking the
+    /// full history is acceptable.
     pub fn get_recent_commits(&self, count: usize) -> Result<Vec<CommitEvent>> {
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TIME)?;
+        let head_id = self.repo.head_id().context("failed to resolve HEAD")?;
 
-        let mut commits = Vec::new();
-        for oid in revwalk.take(count) {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
+        // Phase 1: collect all reachable commit ids. The walk borrows the repo,
+        // so we finish it before touching commits individually below.
+        let mut ids = Vec::new();
+        for step in self.repo.rev_walk([head_id]).all()? {
+            ids.push(step?.id);
+        }
 
-            let mut files_changed = Vec::new();
-            if let Ok(diff) = self.get_commit_diff(&commit) {
-                for delta in diff.deltas() {
-                    if let Some(path) = delta.new_file().path() {
-                        files_changed.push(path.to_string_lossy().to_string());
-                    } else if let Some(path) = delta.old_file().path() {
-                        files_changed.push(path.to_string_lossy().to_string());
-                    }
-                }
-            }
+        // Phase 2: resolve each id's commit time and sort newest-first.
+        let mut entries: Vec<(gix::ObjectId, i64)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let time_secs = self
+                .repo
+                .find_commit(id)
+                .ok()
+                .and_then(|c| c.time().ok())
+                .map(|t| t.seconds)
+                .unwrap_or(0);
+            entries.push((id, time_secs));
+        }
+        entries.sort_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+
+        // Phase 3: build the event list for the newest `count` commits.
+        let mut commits = Vec::with_capacity(entries.len().min(count));
+        for (id, ts) in entries.into_iter().take(count) {
+            let commit = self.repo.find_commit(id)?;
+
+            // gix's message_raw() keeps the trailing newline that git appends;
+            // libgit2's Commit::message() trims it. Trim to match that behavior
+            // so summaries and stored content are byte-identical to before.
+            let message = commit
+                .message_raw()
+                .ok()
+                .map(|b| b.to_str().unwrap_or("").trim_end().to_string())
+                .unwrap_or_default();
+
+            let files_changed = self.commit_files_changed(&commit)?;
 
             commits.push(CommitEvent {
-                commit_hash: oid.to_string(),
-                message: commit.message().unwrap_or("").to_string(),
+                commit_hash: id.to_string(),
+                message,
                 files_changed,
-                timestamp: commit.time().seconds(),
+                timestamp: ts,
             });
         }
 
         Ok(commits)
     }
 
-    /// Get the diff for a specific commit.
-    fn get_commit_diff(&self, commit: &git2::Commit) -> Result<Diff<'_>> {
-        let tree = commit.tree()?;
-        let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+    /// Files touched by a commit relative to its first parent (or the empty
+    /// tree for a root commit).
+    fn commit_files_changed(&self, commit: &gix::Commit<'_>) -> Result<Vec<String>> {
+        let new_tree = self.repo.find_tree(commit.tree_id()?)?;
 
-        let diff = self.repo.diff_tree_to_tree(
-            parent_tree.as_ref(),
-            Some(&tree),
-            None,
-        )?;
+        // First parent only (mirrors the git2 implementation): parent_ids yields
+        // parent *commit* ids, so resolve each to its commit, then its tree.
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent_id) => {
+                let parent_commit = self.repo.find_commit(parent_id)?;
+                Some(self.repo.find_tree(parent_commit.tree_id()?)?)
+            }
+            None => None,
+        };
 
-        Ok(diff)
+        let changes = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+
+        // Default diff options use `Location::Path`, so every change carries
+        // its full repo-relative path. Renames (Rewrite) record both halves.
+        let mut files = Vec::new();
+        for change in changes {
+            use gix::object::tree::diff::ChangeDetached::*;
+            match change {
+                Addition { location, .. }
+                | Deletion { location, .. }
+                | Modification { location, .. } => {
+                    push_path(&mut files, &location);
+                }
+                Rewrite {
+                    source_location,
+                    location,
+                    ..
+                } => {
+                    push_path(&mut files, &source_location);
+                    push_path(&mut files, &location);
+                }
+            }
+        }
+
+        Ok(files)
     }
 
     /// Auto-generate an episodic memory from a commit event.
@@ -115,28 +168,42 @@ impl GitIntegration {
     }
 }
 
+/// Push a non-empty repo-relative path into `files`, de-duplicating.
+/// `location` is a `gix::bstr::BString` (owned bytes).
+fn push_path(files: &mut Vec<String>, location: &gix::bstr::BString) {
+    if location.is_empty() {
+        return;
+    }
+    let path = location.to_str().unwrap_or("").to_string();
+    if !path.is_empty() && !files.contains(&path) {
+        files.push(path);
+    }
+}
+
 /// Estimate importance of a commit based on message keywords.
+/// Uses max-score strategy instead of sequential override to avoid
+/// "fix: update docs" being classified as docs (0.2) instead of fix (0.7).
 fn estimate_importance(message: &str) -> f32 {
     let lower = message.to_lowercase();
-    let mut score = 0.3;
+    let mut max_score: f32 = 0.3;
 
     if lower.contains("fix") || lower.contains("bug") || lower.contains("patch") {
-        score = 0.7;
+        max_score = max_score.max(0.7);
     }
     if lower.contains("refactor") || lower.contains("rewrite") {
-        score = 0.6;
+        max_score = max_score.max(0.6);
     }
     if lower.contains("breaking") || lower.contains("migration") {
-        score = 0.9;
+        max_score = max_score.max(0.9);
     }
     if lower.contains("docs") || lower.contains("comment") {
-        score = 0.2;
+        max_score = max_score.max(0.2);
     }
     if lower.contains("test") {
-        score = 0.4;
+        max_score = max_score.max(0.4);
     }
 
-    score
+    max_score
 }
 
 /// Extract tags from a commit message based on common prefixes.
@@ -175,6 +242,7 @@ fn extract_tags(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_integration::{add_commit, make_test_repo};
 
     #[test]
     fn test_estimate_importance() {
@@ -193,28 +261,10 @@ mod tests {
 
     #[test]
     fn test_auto_generate_episodic() {
-        // Create a temp git repo for testing
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
+        make_test_repo(repo_path, "test.txt", "hello", "feat: add initial test file");
 
-        // Init repo
-        let repo = Repository::init(repo_path).unwrap();
-        let sig = git2::Signature::new("Test", "test@test.com", &git2::Time::new(0, 0)).unwrap();
-
-        // Create a file and commit
-        let file_path = repo_path.join("test.txt");
-        std::fs::write(&file_path, "hello").unwrap();
-
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new("test.txt")).unwrap();
-        index.write().unwrap();
-
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        repo.commit(Some("HEAD"), &sig, &sig, "feat: add initial test file", &tree, &[]).unwrap();
-
-        // Test GitIntegration
         let git = GitIntegration::new(repo_path).unwrap();
         let commits = git.get_recent_commits(10).unwrap();
         assert_eq!(commits.len(), 1);
@@ -225,5 +275,35 @@ mod tests {
         assert_eq!(episodic.summary, "feat: add initial test file");
         assert!(episodic.tags.contains(&"feature".to_string()));
         assert!(episodic.files_touched.contains(&"test.txt".to_string()));
+    }
+
+    #[test]
+    fn test_recent_commits_diff_against_parent() {
+        // A second commit exercises the parent-tree diff path (the single-commit
+        // test above only hits the root-commit / empty-tree case).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path();
+        make_test_repo(repo_path, "a.txt", "first", "feat: initial commit");
+        add_commit(repo_path, "a.txt", "first\nsecond", "fix: modify a.txt");
+        add_commit(repo_path, "b.txt", "new", "feat: add b.txt");
+
+        let git = GitIntegration::new(repo_path).unwrap();
+        let commits = git.get_recent_commits(10).unwrap();
+        assert_eq!(commits.len(), 3, "should walk the full history");
+
+        // Newest first by commit time; all commits share timestamp 0, so the
+        // topological order (later commits first) must be preserved.
+        assert_eq!(commits[0].message, "feat: add b.txt");
+        assert_eq!(commits[0].files_changed, vec!["b.txt"]);
+        assert_eq!(commits[1].message, "fix: modify a.txt");
+        assert_eq!(commits[1].files_changed, vec!["a.txt"]);
+        // Root commit diff is against the empty tree → its added files.
+        assert_eq!(commits[2].message, "feat: initial commit");
+        assert_eq!(commits[2].files_changed, vec!["a.txt"]);
+
+        // Truncation: only the newest commit when count = 1.
+        let one = git.get_recent_commits(1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].message, "feat: add b.txt");
     }
 }

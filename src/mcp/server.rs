@@ -41,6 +41,8 @@ struct JsonRpcResponse {
 struct JsonRpcError {
     code: i32,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
 }
 
 /// Dispatch a tool call: deserialize arguments and invoke the provider method.
@@ -49,7 +51,7 @@ macro_rules! dispatch_tool {
     ($args:expr, $input_ty:ty, $provider:expr, $method:ident) => {
         match serde_json::from_value::<$input_ty>($args) {
             Ok(i) => (Some($provider.$method(i)), None),
-            Err(e) => (None, Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}") })),
+            Err(e) => (None, Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}"), data: None })),
         }
     };
 }
@@ -244,11 +246,35 @@ impl DefaultMemoryProvider {
             loaded_projects: Mutex::new(HashSet::new()),
         }
     }
+
+    /// Lock the repository mutex, recovering from poison instead of panicking.
+    fn lock_repo(&self) -> std::sync::MutexGuard<'_, MemoryRepository> {
+        self.repo.lock().unwrap_or_else(|e| {
+            tracing::error!("repo mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+    }
+
+    /// Lock the graph mutex, recovering from poison instead of panicking.
+    fn lock_graph(&self) -> std::sync::MutexGuard<'_, GraphEngine> {
+        self.graph.lock().unwrap_or_else(|e| {
+            tracing::error!("graph mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+    }
+
+    /// Lock the loaded_projects mutex, recovering from poison instead of panicking.
+    fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.loaded_projects.lock().unwrap_or_else(|e| {
+            tracing::error!("loaded_projects mutex poisoned, recovering: {e}");
+            e.into_inner()
+        })
+    }
 }
 
 impl MemoryToolProvider for DefaultMemoryProvider {
     fn search_memory(&self, input: SearchMemoryInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let classifier = &self.classifier;
         let planner = &self.planner;
         let reranker = &self.reranker;
@@ -307,17 +333,17 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value> {
         // Load graph for this project only once
         {
-            let mut loaded = self.loaded_projects.lock().unwrap();
+            let mut loaded = self.lock_loaded();
             if !loaded.contains(&input.project_id) {
-                let repo = self.repo.lock().unwrap();
-                let mut graph = self.graph.lock().unwrap();
+                let repo = self.lock_repo();
+                let mut graph = self.lock_graph();
                 graph.load_from_repo(&repo, &input.project_id)?;
                 loaded.insert(input.project_id.clone());
             }
         }
 
-        let repo = self.repo.lock().unwrap();
-        let graph = self.graph.lock().unwrap();
+        let repo = self.lock_repo();
+        let graph = self.lock_graph();
 
         let entity_id = {
             let conn = repo.connection();
@@ -365,7 +391,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let since = chrono::Utc::now().timestamp() - (input.days * 86400);
         let conn = repo.connection();
 
@@ -391,7 +417,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let query = input.service.as_deref().unwrap_or("");
         let results = if query.is_empty() {
             repo.list_recent_failures(&input.project_id, input.limit)?
@@ -417,7 +443,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn architectural_decisions(&self, input: ArchitecturalDecisionsInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let query = input.topic.as_deref().unwrap_or("");
         let results = if query.is_empty() {
             repo.list_recent_decisions(&input.project_id, input.limit)?
@@ -445,7 +471,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     // ─── Write Tools ───────────────────────────────────────────────
 
     fn create_episodic(&self, input: CreateEpisodicInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        if !(0.0..=1.0).contains(&input.importance) {
+            anyhow::bail!("importance must be between 0.0 and 1.0, got {}", input.importance);
+        }
+        let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -473,7 +502,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn create_decision(&self, input: CreateDecisionInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -500,7 +529,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn create_failure(&self, input: CreateFailureInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        if !(1..=5).contains(&input.severity) {
+            anyhow::bail!("severity must be between 1 and 5, got {}", input.severity);
+        }
+        let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -528,7 +560,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn create_procedural(&self, input: CreateProceduralInput) -> Result<serde_json::Value> {
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -559,10 +591,11 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         let memories = git.process_recent_commits(&input.project_id, &session_id, input.count)?;
 
-        let repo = self.repo.lock().unwrap();
+        let repo = self.lock_repo();
 
         // Deduplicate: skip commits already ingested
         let ingested_hashes = repo.get_ingested_commits(&input.project_id)?;
+        let total_before_dedup = memories.len();
         let new_memories: Vec<_> = memories
             .into_iter()
             .filter(|m| {
@@ -582,10 +615,12 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             }));
         }
 
+        let skipped = total_before_dedup - new_memories.len();
+
         Ok(serde_json::json!({
             "ingested": ingested.len(),
             "total_commits_scanned": input.count,
-            "skipped_duplicates": input.count - ingested.len(),
+            "skipped_duplicates": skipped,
             "memories": ingested,
         }))
     }
@@ -695,7 +730,7 @@ impl McpServer {
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "service": { "type": "string", "description": "Filter by service name" },
-                        "limit": { "type": "integer", "description": "Max results", "default": 5 },
+                        "limit": { "type": "integer", "description": "Max results", "default": 10 },
                     },
                     "required": ["project_id"],
                 }),
@@ -708,7 +743,7 @@ impl McpServer {
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "topic": { "type": "string", "description": "Filter by topic keyword" },
-                        "limit": { "type": "integer", "description": "Max results", "default": 5 },
+                        "limit": { "type": "integer", "description": "Max results", "default": 10 },
                     },
                     "required": ["project_id"],
                 }),
@@ -812,23 +847,27 @@ impl McpServer {
             }
 
             // JSON-RPC notifications (no `id`) must not receive a response.
-            // Silently skip them per MCP spec.
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            // Silently skip them per MCP spec. Cache the id for error recovery.
+            let cached_id = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 if val.get("id").is_none() {
                     continue;
                 }
-            }
+                val.get("id").cloned()
+            } else {
+                None
+            };
 
             let request: JsonRpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
                     let response = JsonRpcResponse {
                         jsonrpc: "2.0".into(),
-                        id: None,
+                        id: cached_id,
                         result: None,
                         error: Some(JsonRpcError {
                             code: -32700,
                             message: format!("Parse error: {e}"),
+                            data: None,
                         }),
                     };
                     writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
@@ -881,7 +920,7 @@ impl McpServer {
                     "create_failure" => dispatch_tool!(arguments, CreateFailureInput, self.provider, create_failure),
                     "create_procedural" => dispatch_tool!(arguments, CreateProceduralInput, self.provider, create_procedural),
                     "ingest_commits" => dispatch_tool!(arguments, IngestCommitsInput, self.provider, ingest_commits),
-                    _ => (None, Some(JsonRpcError { code: -32601, message: format!("Unknown tool: {tool_name}") })),
+                    _ => (None, Some(JsonRpcError { code: -32601, message: format!("Unknown tool: {tool_name}"), data: None })),
                 };
 
                 if let Some(err) = parse_error {
@@ -908,6 +947,7 @@ impl McpServer {
                             error: Some(JsonRpcError {
                                 code: -32603,
                                 message: format!("Internal error: {e}"),
+                                data: None,
                             }),
                         },
                     }
@@ -920,6 +960,7 @@ impl McpServer {
                 error: Some(JsonRpcError {
                     code: -32601,
                     message: format!("Method not found: {}", request.method),
+                    data: None,
                 }),
             },
         }
@@ -1112,20 +1153,15 @@ mod tests {
 
         let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
-        // Create temp git repo
+        // Create temp git repo (via system git — see git_integration::make_test_repo)
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
-        let git_repo = git2::Repository::init(repo_path).unwrap();
-        let sig = git2::Signature::new("Test", "test@test.com", &git2::Time::new(0, 0)).unwrap();
-
-        let file_path = repo_path.join("main.rs");
-        std::fs::write(&file_path, "fn main() {}").unwrap();
-        let mut index = git_repo.index().unwrap();
-        index.add_path(std::path::Path::new("main.rs")).unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = git_repo.find_tree(tree_id).unwrap();
-        git_repo.commit(Some("HEAD"), &sig, &sig, "feat: initial commit", &tree, &[]).unwrap();
+        crate::git_integration::make_test_repo(
+            repo_path,
+            "main.rs",
+            "fn main() {}",
+            "feat: initial commit",
+        );
 
         // Ingest
         let result = provider.ingest_commits(IngestCommitsInput {

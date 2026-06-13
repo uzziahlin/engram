@@ -14,7 +14,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
 petgraph = "0.6"
-git2 = "0.19"
+# gix (pure-Rust git) replaces git2 to eliminate dynamic linking of
+# openssl/libssh2/libz — keeps the release binary self-contained and portable.
+gix = { version = "0.83", default-features = false, features = ["blob-diff", "sha1"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 anyhow = "1"
@@ -26,3 +28,10 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

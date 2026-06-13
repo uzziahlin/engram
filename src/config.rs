@@ -46,6 +46,64 @@ impl StorageConfig {
     }
 }
 
+/// Expand a leading `~` to the user's home directory.
+///
+/// Handles both `~` and `~/path` forms; any other input is returned unchanged.
+/// Does not expand `~user` (another user's home) — that is out of scope and
+/// not exposed by the `dirs` crate.
+fn expand_tilde(path: &std::path::Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_expands_home_prefix() {
+        let home = dirs::home_dir().expect("home dir should be available in test env");
+        assert_eq!(expand_tilde(std::path::Path::new("~")), home);
+        assert_eq!(expand_tilde(std::path::Path::new("~/.engram/memory.db")), home.join(".engram/memory.db"));
+    }
+
+    #[test]
+    fn expand_tilde_passes_through_absolute_and_relative_paths() {
+        assert_eq!(expand_tilde(std::path::Path::new("/var/data/memory.db")), PathBuf::from("/var/data/memory.db"));
+        assert_eq!(expand_tilde(std::path::Path::new("relative/path.db")), PathBuf::from("relative/path.db"));
+    }
+
+    #[test]
+    fn load_from_file_expands_tilde_in_database_path() {
+        let dir = std::env::temp_dir();
+        let config_path = dir.join("engram_tilde_test_config.toml");
+        std::fs::write(
+            &config_path,
+            "[storage]\ndatabase_path = \"~/.engram/memory.db\"\n",
+        )
+        .unwrap();
+        let config = Config::load_from_file(&config_path).expect("config should load");
+        let _ = std::fs::remove_file(&config_path);
+
+        let home = dirs::home_dir().expect("home dir should be available in test env");
+        assert_eq!(
+            config.storage.database_path,
+            home.join(".engram").join("memory.db"),
+            "tilde must be expanded to an absolute home path"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalConfig {
     #[serde(default = "RetrievalConfig::default_limit")]
@@ -154,7 +212,12 @@ impl Config {
     /// Load configuration from a TOML file, falling back to defaults for missing fields.
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        // User-facing config paths may use the `~` home shorthand (e.g. "~/.engram/memory.db").
+        // `~` is a shell convention, not an OS path feature — if left unexpanded, SQLite treats
+        // it as a relative path and creates a literal `~/` directory under the process cwd.
+        // Expand it at the config boundary so the rest of the system sees an absolute path.
+        config.storage.database_path = expand_tilde(&config.storage.database_path);
         Ok(config)
     }
 
@@ -166,15 +229,35 @@ impl Config {
             .join(".engram")
             .join("config.toml");
 
-            match Self::load_from_file(&config_path) {
-                Ok(config) => Ok(config),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse config file {:?}: {}. Using defaults.",
-                        config_path, e
-                    );
-                    Ok(Self::default())
-                }
-            }
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let config = Self::load_from_file(&config_path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate configuration fields are within acceptable ranges.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.context.memory_budget_percent > 50 {
+            anyhow::bail!(
+                "context.memory_budget_percent must be <= 50, got {}",
+                self.context.memory_budget_percent
+            );
+        }
+        if self.retrieval.default_limit == 0 || self.retrieval.default_limit > 1000 {
+            anyhow::bail!(
+                "retrieval.default_limit must be between 1 and 1000, got {}",
+                self.retrieval.default_limit
+            );
+        }
+        if self.graph.max_nodes == 0 {
+            anyhow::bail!(
+                "graph.max_nodes must be > 0, got {}",
+                self.graph.max_nodes
+            );
+        }
+        Ok(())
     }
 }
