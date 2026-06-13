@@ -2,6 +2,12 @@
 name = "engram"
 version = "0.1.0"
 edition = "2021"
+description = "A local-first memory system for AI coding agents — persistent engineering knowledge via MCP"
+license = "MIT"
+readme = "README.md"
+keywords = ["mcp", "memory", "ai", "coding-agent", "sqlite"]
+categories = ["development-tools", "database"]
+repository = "https://github.com/uzziahlin/engram"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

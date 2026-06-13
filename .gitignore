@@ -1,3 +1,44 @@
-/target
-.omc/
+# Build artifacts
+/target/
+**/*.rs.bk
+*.d
+*.rlib
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+
+# Debug / Profiling
+*.pdb
+*.profraw
+*.profdata
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Engram runtime data
 .engram/
+
+# OMC / Claude Code runtime
+.omc/
+.omx/
+.claude/
+
+# Environment
+.env
+.env.*

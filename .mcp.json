@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "engram": {
-      "command": "/Users/uzziah/Work/codebase/engram/target/release/engram",
-      "args": [],
-      "env": {
-        "RUST_LOG": "info"
-      }
+      "command": "engram",
+      "args": []
     }
   }
 }
