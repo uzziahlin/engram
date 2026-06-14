@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy this file to .mcp.json and adjust for your setup. After running install.sh, engram is on PATH and this works as-is. For a local build, set command to the absolute path of target/release/engram.",
+  "mcpServers": {
+    "engram": {
+      "command": "engram",
+      "args": []
+    }
+  }
+}
