@@ -39,6 +39,9 @@ Desktop.ini
 .omx/
 .claude/
 
+# Local MCP client config (machine-specific paths; copy from .mcp.json.example)
+.mcp.json
+
 # Environment
 .env
 .env.*
