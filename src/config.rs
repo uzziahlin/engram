@@ -74,13 +74,22 @@ mod tests {
     fn expand_tilde_expands_home_prefix() {
         let home = dirs::home_dir().expect("home dir should be available in test env");
         assert_eq!(expand_tilde(std::path::Path::new("~")), home);
-        assert_eq!(expand_tilde(std::path::Path::new("~/.engram/memory.db")), home.join(".engram/memory.db"));
+        assert_eq!(
+            expand_tilde(std::path::Path::new("~/.engram/memory.db")),
+            home.join(".engram/memory.db")
+        );
     }
 
     #[test]
     fn expand_tilde_passes_through_absolute_and_relative_paths() {
-        assert_eq!(expand_tilde(std::path::Path::new("/var/data/memory.db")), PathBuf::from("/var/data/memory.db"));
-        assert_eq!(expand_tilde(std::path::Path::new("relative/path.db")), PathBuf::from("relative/path.db"));
+        assert_eq!(
+            expand_tilde(std::path::Path::new("/var/data/memory.db")),
+            PathBuf::from("/var/data/memory.db")
+        );
+        assert_eq!(
+            expand_tilde(std::path::Path::new("relative/path.db")),
+            PathBuf::from("relative/path.db")
+        );
     }
 
     #[test]
@@ -253,10 +262,7 @@ impl Config {
             );
         }
         if self.graph.max_nodes == 0 {
-            anyhow::bail!(
-                "graph.max_nodes must be > 0, got {}",
-                self.graph.max_nodes
-            );
+            anyhow::bail!("graph.max_nodes must be > 0, got {}", self.graph.max_nodes);
         }
         Ok(())
     }

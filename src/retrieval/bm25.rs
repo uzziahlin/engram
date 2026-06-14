@@ -1,4 +1,4 @@
-use crate::models::{EpisodicMemory, DecisionMemory, FailureMemory, ProceduralMemory};
+use crate::models::{DecisionMemory, EpisodicMemory, FailureMemory, ProceduralMemory};
 use crate::storage::{MemoryRepository, ScoredMemory};
 use anyhow::Result;
 
@@ -20,27 +20,51 @@ trait Searchable {
 }
 
 impl Searchable for EpisodicMemory {
-    fn search_id(&self) -> &str { &self.id }
-    fn search_summary(&self) -> &str { &self.summary }
-    fn search_created_at(&self) -> i64 { self.created_at }
+    fn search_id(&self) -> &str {
+        &self.id
+    }
+    fn search_summary(&self) -> &str {
+        &self.summary
+    }
+    fn search_created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 impl Searchable for DecisionMemory {
-    fn search_id(&self) -> &str { &self.id }
-    fn search_summary(&self) -> &str { &self.title }
-    fn search_created_at(&self) -> i64 { self.created_at }
+    fn search_id(&self) -> &str {
+        &self.id
+    }
+    fn search_summary(&self) -> &str {
+        &self.title
+    }
+    fn search_created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 impl Searchable for FailureMemory {
-    fn search_id(&self) -> &str { &self.id }
-    fn search_summary(&self) -> &str { &self.incident }
-    fn search_created_at(&self) -> i64 { self.created_at }
+    fn search_id(&self) -> &str {
+        &self.id
+    }
+    fn search_summary(&self) -> &str {
+        &self.incident
+    }
+    fn search_created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 impl Searchable for ProceduralMemory {
-    fn search_id(&self) -> &str { &self.id }
-    fn search_summary(&self) -> &str { &self.workflow_name }
-    fn search_created_at(&self) -> i64 { self.created_at }
+    fn search_id(&self) -> &str {
+        &self.id
+    }
+    fn search_summary(&self) -> &str {
+        &self.workflow_name
+    }
+    fn search_created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 /// BM25 retrieval engine using SQLite FTS5.
@@ -74,13 +98,16 @@ impl BM25Retriever {
         scored_mems: Vec<ScoredMemory<T>>,
         memory_type: &str,
     ) -> Vec<SearchResult> {
-        scored_mems.into_iter().map(|scored| SearchResult {
-            id: scored.memory.search_id().to_string(),
-            memory_type: memory_type.into(),
-            summary: scored.memory.search_summary().to_string(),
-            relevance_score: Self::normalize_bm25(scored.bm25_score),
-            created_at: scored.memory.search_created_at(),
-        }).collect()
+        scored_mems
+            .into_iter()
+            .map(|scored| SearchResult {
+                id: scored.memory.search_id().to_string(),
+                memory_type: memory_type.into(),
+                summary: scored.memory.search_summary().to_string(),
+                relevance_score: Self::normalize_bm25(scored.bm25_score),
+                created_at: scored.memory.search_created_at(),
+            })
+            .collect()
     }
 
     /// Search all memory types via FTS5 BM25 for a given query.
@@ -94,20 +121,28 @@ impl BM25Retriever {
         let mut results = Vec::new();
 
         results.extend(Self::to_results(
-            repo.search_episodic(query, project_id, limit)?, "episodic",
+            repo.search_episodic(query, project_id, limit)?,
+            "episodic",
         ));
         results.extend(Self::to_results(
-            repo.search_decisions(query, project_id, limit)?, "decision",
+            repo.search_decisions(query, project_id, limit)?,
+            "decision",
         ));
         results.extend(Self::to_results(
-            repo.search_failures(query, project_id, limit)?, "failure",
+            repo.search_failures(query, project_id, limit)?,
+            "failure",
         ));
         results.extend(Self::to_results(
-            repo.search_procedural(query, project_id, limit)?, "procedural",
+            repo.search_procedural(query, project_id, limit)?,
+            "procedural",
         ));
 
         // Sort by relevance score descending
-        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         Ok(results)
@@ -123,16 +158,20 @@ impl BM25Retriever {
     ) -> Result<Vec<SearchResult>> {
         match memory_type {
             "episodic" => Ok(Self::to_results(
-                repo.search_episodic(query, project_id, limit)?, "episodic",
+                repo.search_episodic(query, project_id, limit)?,
+                "episodic",
             )),
             "decision" => Ok(Self::to_results(
-                repo.search_decisions(query, project_id, limit)?, "decision",
+                repo.search_decisions(query, project_id, limit)?,
+                "decision",
             )),
             "failure" => Ok(Self::to_results(
-                repo.search_failures(query, project_id, limit)?, "failure",
+                repo.search_failures(query, project_id, limit)?,
+                "failure",
             )),
             "procedural" => Ok(Self::to_results(
-                repo.search_procedural(query, project_id, limit)?, "procedural",
+                repo.search_procedural(query, project_id, limit)?,
+                "procedural",
             )),
             _ => Ok(Vec::new()),
         }

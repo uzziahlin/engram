@@ -64,10 +64,9 @@ impl ContextComposer {
             }
         }
 
-        let tokens = (english_chars as f64 / 4.0
-            + chinese_chars as f64 / 2.0
-            + other_chars as f64 / 3.0)
-            .ceil() as usize;
+        let tokens =
+            (english_chars as f64 / 4.0 + chinese_chars as f64 / 2.0 + other_chars as f64 / 3.0)
+                .ceil() as usize;
 
         // 20% safety margin
         let with_margin = (tokens as f64 * 1.2).ceil() as usize;
@@ -103,11 +102,7 @@ impl ContextComposer {
 
     /// Compose context from search results within a token budget.
     /// Priority: failures > decisions > recent episodic > procedural.
-    pub fn compose_context(
-        &self,
-        results: &[SearchResult],
-        budget: &ContextBudget,
-    ) -> String {
+    pub fn compose_context(&self, results: &[SearchResult], budget: &ContextBudget) -> String {
         let mut context_parts = Vec::new();
         let mut tokens_used = 0;
         let token_limit = budget.reserved_for_memory;
@@ -147,7 +142,10 @@ impl ContextComposer {
         if context_parts.is_empty() {
             String::new()
         } else {
-            format!("=== Memory Context ===\n{}\n=== End Memory ===", context_parts.join("\n"))
+            format!(
+                "=== Memory Context ===\n{}\n=== End Memory ===",
+                context_parts.join("\n")
+            )
         }
     }
 }
@@ -204,14 +202,20 @@ mod tests {
     fn test_estimate_tokens_english() {
         let tokens = ContextComposer::estimate_tokens("Hello world test");
         // 16 chars / 4 chars per token = 4, with 20% margin = 5
-        assert!((tokens as f64 - 5.0).abs() < 2.0, "expected ~5, got {tokens}");
+        assert!(
+            (tokens as f64 - 5.0).abs() < 2.0,
+            "expected ~5, got {tokens}"
+        );
     }
 
     #[test]
     fn test_estimate_tokens_chinese() {
         let tokens = ContextComposer::estimate_tokens("你好世界测试");
         // 6 chars / 2 chars per token = 3, with 20% margin = 4
-        assert!((tokens as f64 - 4.0).abs() < 2.0, "expected ~4, got {tokens}");
+        assert!(
+            (tokens as f64 - 4.0).abs() < 2.0,
+            "expected ~4, got {tokens}"
+        );
     }
 
     #[test]
@@ -219,13 +223,22 @@ mod tests {
         let tokens = ContextComposer::estimate_tokens("Hello 你好 world 世界");
         // 12 ascii + 4 chinese + 3 spaces = 19 total
         // 12/4 + 4/2 + 3/3 = 3+2+1 = 6, with 20% margin = 8
-        assert!(tokens > 0 && tokens < 15, "expected reasonable estimate, got {tokens}");
+        assert!(
+            tokens > 0 && tokens < 15,
+            "expected reasonable estimate, got {tokens}"
+        );
     }
 
     #[test]
     fn test_detect_content_type() {
-        assert_eq!(ContextComposer::detect_content_type("Hello world"), ContentType::English);
-        assert_eq!(ContextComposer::detect_content_type("你好世界测试代码"), ContentType::Chinese);
+        assert_eq!(
+            ContextComposer::detect_content_type("Hello world"),
+            ContentType::English
+        );
+        assert_eq!(
+            ContextComposer::detect_content_type("你好世界测试代码"),
+            ContentType::Chinese
+        );
     }
 
     #[test]
@@ -236,7 +249,13 @@ mod tests {
         let results: Vec<SearchResult> = (0..20)
             .map(|i| SearchResult {
                 id: format!("id-{i}"),
-                memory_type: if i < 5 { "failure".into() } else if i < 10 { "decision".into() } else { "episodic".into() },
+                memory_type: if i < 5 {
+                    "failure".into()
+                } else if i < 10 {
+                    "decision".into()
+                } else {
+                    "episodic".into()
+                },
                 summary: format!("Test result number {i}"),
                 relevance_score: 0.5 + (i as f32 * 0.02),
                 created_at: 1716940800 + i as i64 * 1000,

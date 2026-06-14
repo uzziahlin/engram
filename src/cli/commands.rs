@@ -27,8 +27,14 @@ fn print_json(value: &serde_json::Value) {
 /// Validates that the value is not another flag (starts with --).
 fn require_str(args: &[String], name: &str) -> Result<String> {
     let flag = format!("--{name}");
-    let pos = args.iter().position(|a| a == &flag).context(format!("Missing required argument: --{name}"))?;
-    let value = args.get(pos + 1).cloned().context(format!("--{name} requires a value"))?;
+    let pos = args
+        .iter()
+        .position(|a| a == &flag)
+        .context(format!("Missing required argument: --{name}"))?;
+    let value = args
+        .get(pos + 1)
+        .cloned()
+        .context(format!("--{name} requires a value"))?;
     if value.starts_with("--") {
         anyhow::bail!("--{name} requires a value, but got flag '{value}'");
     }
@@ -60,7 +66,12 @@ fn repeated_args(args: &[String], name: &str) -> Vec<String> {
 /// Comma-separated list argument (--files a.rs,b.rs).
 fn comma_list(args: &[String], name: &str) -> Vec<String> {
     optional_str(args, name)
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -77,7 +88,10 @@ pub fn init(_args: &[String]) -> Result<()> {
     let repo = open_repo(&config)?;
     repo.initialize_schema()?;
 
-    println!("Initialized engram database at {:?}", config.storage.database_path);
+    println!(
+        "Initialized engram database at {:?}",
+        config.storage.database_path
+    );
     Ok(())
 }
 
@@ -101,10 +115,14 @@ pub fn search(args: &[String]) -> Result<()> {
             }
             "decision" => {
                 let mems = repo.search_decisions(&query, &project_id, limit)?;
-                mems.iter().map(|m| serde_json::json!({
-                    "id": m.memory.id, "type": "decision", "title": m.memory.title,
-                    "rationale": m.memory.rationale, "created_at": m.memory.created_at,
-                })).collect()
+                mems.iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "id": m.memory.id, "type": "decision", "title": m.memory.title,
+                            "rationale": m.memory.rationale, "created_at": m.memory.created_at,
+                        })
+                    })
+                    .collect()
             }
             "failure" => {
                 let mems = repo.search_failures(&query, &project_id, limit)?;
@@ -120,7 +138,9 @@ pub fn search(args: &[String]) -> Result<()> {
                     "steps": m.memory.steps, "created_at": m.memory.created_at,
                 })).collect()
             }
-            _ => anyhow::bail!("Unknown memory type: {mt}. Use: episodic, decision, failure, procedural"),
+            _ => anyhow::bail!(
+                "Unknown memory type: {mt}. Use: episodic, decision, failure, procedural"
+            ),
         }
     } else {
         // Search all types
@@ -254,7 +274,9 @@ pub fn create_failure(args: &[String]) -> Result<()> {
 
     repo.create_failure(&memory)?;
 
-    print_json(&serde_json::json!({"id": id, "status": "created", "severity": severity, "created_at": now}));
+    print_json(
+        &serde_json::json!({"id": id, "status": "created", "severity": severity, "created_at": now}),
+    );
     Ok(())
 }
 
@@ -330,6 +352,36 @@ pub fn ingest(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn collect(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let repo_path = require_str(args, "repo")?;
+    let dimensions = optional_str(args, "dimensions");
+    let max_commits = optional_num(args, "max-commits").unwrap_or(200.0) as usize;
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    // `collect` is a bootstrap entry point — ensure schema so it works on a
+    // fresh database without requiring a prior `engram init`.
+    repo.initialize_schema()?;
+
+    let dims = crate::collectors::Dimension::parse_list(dimensions.as_deref());
+    if dims.is_empty() {
+        anyhow::bail!("no valid dimensions parsed; valid: git, decisions, failures, workflow");
+    }
+
+    // Mirror the MCP tool: reuse commit-hash dedup so re-running collect stays idempotent.
+    let ingested = repo.get_ingested_commits(&project_id)?;
+    let opts = crate::collectors::CollectOptions {
+        max_commits,
+        ingested_commit_hashes: ingested,
+        ..Default::default()
+    };
+
+    let sources = crate::collectors::collect(&project_id, Path::new(&repo_path), &dims, &opts)?;
+    print_json(&serde_json::to_value(&sources)?);
+    Ok(())
+}
+
 pub fn recent_failures(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let service = optional_str(args, "service");
@@ -342,19 +394,25 @@ pub fn recent_failures(args: &[String]) -> Result<()> {
     let results = if query.is_empty() {
         repo.list_recent_failures(&project_id, limit)?
     } else {
-        repo.search_failures(query, &project_id, limit)?.into_iter().map(|s| s.memory).collect()
+        repo.search_failures(query, &project_id, limit)?
+            .into_iter()
+            .map(|s| s.memory)
+            .collect()
     };
 
-    let failures: Vec<serde_json::Value> = results.iter().map(|f| {
-        serde_json::json!({
-            "id": f.id,
-            "incident": f.incident,
-            "root_cause": f.root_cause,
-            "fix": f.fix,
-            "severity": f.severity,
-            "created_at": f.created_at,
+    let failures: Vec<serde_json::Value> = results
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "incident": f.incident,
+                "root_cause": f.root_cause,
+                "fix": f.fix,
+                "severity": f.severity,
+                "created_at": f.created_at,
+            })
         })
-    }).collect();
+        .collect();
 
     print_json(&serde_json::json!({"failures": failures, "total": failures.len()}));
     Ok(())
@@ -372,19 +430,25 @@ pub fn decisions(args: &[String]) -> Result<()> {
     let results = if query.is_empty() {
         repo.list_recent_decisions(&project_id, limit)?
     } else {
-        repo.search_decisions(query, &project_id, limit)?.into_iter().map(|s| s.memory).collect()
+        repo.search_decisions(query, &project_id, limit)?
+            .into_iter()
+            .map(|s| s.memory)
+            .collect()
     };
 
-    let decisions: Vec<serde_json::Value> = results.iter().map(|d| {
-        serde_json::json!({
-            "id": d.id,
-            "title": d.title,
-            "context": d.context,
-            "rationale": d.rationale,
-            "tradeoffs": d.tradeoffs,
-            "created_at": d.created_at,
+    let decisions: Vec<serde_json::Value> = results
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "title": d.title,
+                "context": d.context,
+                "rationale": d.rationale,
+                "tradeoffs": d.tradeoffs,
+                "created_at": d.created_at,
+            })
         })
-    }).collect();
+        .collect();
 
     print_json(&serde_json::json!({"decisions": decisions, "total": decisions.len()}));
     Ok(())

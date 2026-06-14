@@ -1,13 +1,13 @@
+pub mod decision;
 pub mod entity;
 pub mod episodic;
-pub mod decision;
 pub mod failure;
-pub mod procedural;
 pub mod intent;
+pub mod procedural;
 
+pub use decision::*;
 pub use entity::*;
 pub use episodic::*;
-pub use decision::*;
 pub use failure::*;
-pub use procedural::*;
 pub use intent::*;
+pub use procedural::*;

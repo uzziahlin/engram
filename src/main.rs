@@ -5,10 +5,10 @@ use engram::storage::MemoryRepository;
 use std::sync::Arc;
 
 fn main() -> anyhow::Result<()> {
-     // Initialize tracing — write to stderr so MCP JSON-RPC on stdout is not corrupted
-     tracing_subscriber::fmt()
-         .with_writer(std::io::stderr)
-         .with_env_filter(
+    // Initialize tracing — write to stderr so MCP JSON-RPC on stdout is not corrupted
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
@@ -27,7 +27,10 @@ fn main() -> anyhow::Result<()> {
 
 fn run_mcp_server() -> anyhow::Result<()> {
     let config = Config::load().unwrap_or_default();
-    tracing::info!("Configuration loaded from {:?}", config.storage.database_path);
+    tracing::info!(
+        "Configuration loaded from {:?}",
+        config.storage.database_path
+    );
 
     let repo = MemoryRepository::new(&config.storage.database_path)?;
     repo.initialize_schema()?;
