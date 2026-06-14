@@ -23,12 +23,7 @@ impl Reranker {
     ///               + recency_normalized * plan.recency_weight
     ///               + relevance * plan.importance_weight
     ///               + type_boost * plan.graph_weight
-    pub fn rerank(
-        &self,
-        results: &mut [SearchResult],
-        plan: &RetrievalPlan,
-        _now_timestamp: i64,
-    ) {
+    pub fn rerank(&self, results: &mut [SearchResult], plan: &RetrievalPlan, _now_timestamp: i64) {
         if results.is_empty() {
             return;
         }

@@ -1,5 +1,6 @@
 pub mod listener;
 
+pub use listener::CommitEvent;
 pub use listener::GitIntegration;
 
 /// Configured `git` invocation against `repo_path` with a fixed identity and
@@ -27,7 +28,12 @@ fn git(repo_path: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 /// Create a fresh repository at `repo_path` with one committed file.
 #[cfg(test)]
-pub(crate) fn make_test_repo(repo_path: &std::path::Path, filename: &str, content: &str, message: &str) {
+pub(crate) fn make_test_repo(
+    repo_path: &std::path::Path,
+    filename: &str,
+    content: &str,
+    message: &str,
+) {
     assert!(
         git(repo_path, &["init", "-q"]).status.success(),
         "git init failed; is git installed?"
@@ -38,7 +44,12 @@ pub(crate) fn make_test_repo(repo_path: &std::path::Path, filename: &str, conten
 /// Stage `filename` (written with `content`) and commit it. For the second and
 /// later commits this exercises the parent-tree diff path in `get_recent_commits`.
 #[cfg(test)]
-pub(crate) fn add_commit(repo_path: &std::path::Path, filename: &str, content: &str, message: &str) {
+pub(crate) fn add_commit(
+    repo_path: &std::path::Path,
+    filename: &str,
+    content: &str,
+    message: &str,
+) {
     std::fs::write(repo_path.join(filename), content).unwrap();
     assert!(
         git(repo_path, &["add", filename]).status.success(),

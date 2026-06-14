@@ -1,3 +1,4 @@
+use crate::collectors;
 use crate::config::Config;
 use crate::context::composer::{ContextBudget, ContextComposer};
 use crate::git_integration::GitIntegration;
@@ -12,9 +13,9 @@ use crate::storage::ScoredMemory;
 use anyhow::{Context as AnyhowContext, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
 
 /// JSON-RPC request for MCP protocol.
 #[derive(Debug, Deserialize)]
@@ -51,7 +52,14 @@ macro_rules! dispatch_tool {
     ($args:expr, $input_ty:ty, $provider:expr, $method:ident) => {
         match serde_json::from_value::<$input_ty>($args) {
             Ok(i) => (Some($provider.$method(i)), None),
-            Err(e) => (None, Some(JsonRpcError { code: -32602, message: format!("Invalid params: {e}"), data: None })),
+            Err(e) => (
+                None,
+                Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("Invalid params: {e}"),
+                    data: None,
+                }),
+            ),
         }
     };
 }
@@ -190,6 +198,23 @@ fn default_ingest_count() -> usize {
     20
 }
 
+/// collect_sources tool input — gather bootstrap evidence from an existing project.
+#[derive(Debug, Deserialize)]
+pub struct CollectSourcesInput {
+    pub project_id: String,
+    pub repo_path: String,
+    /// Comma-separated dimension list ("git,decisions"). None/empty → all.
+    #[serde(default)]
+    pub dimensions: Option<String>,
+    /// How many recent commits to walk for the git dimension.
+    #[serde(default = "default_collect_commits")]
+    pub max_commits: usize,
+}
+
+fn default_collect_commits() -> usize {
+    200
+}
+
 /// MCP Tool definition.
 #[derive(Debug, Serialize)]
 pub struct ToolDefinition {
@@ -210,7 +235,10 @@ pub trait MemoryToolProvider: Send + Sync {
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value>;
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value>;
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value>;
-    fn architectural_decisions(&self, input: ArchitecturalDecisionsInput) -> Result<serde_json::Value>;
+    fn architectural_decisions(
+        &self,
+        input: ArchitecturalDecisionsInput,
+    ) -> Result<serde_json::Value>;
 
     // Write tools
     fn create_episodic(&self, input: CreateEpisodicInput) -> Result<serde_json::Value>;
@@ -218,6 +246,7 @@ pub trait MemoryToolProvider: Send + Sync {
     fn create_failure(&self, input: CreateFailureInput) -> Result<serde_json::Value>;
     fn create_procedural(&self, input: CreateProceduralInput) -> Result<serde_json::Value>;
     fn ingest_commits(&self, input: IngestCommitsInput) -> Result<serde_json::Value>;
+    fn collect_sources(&self, input: CollectSourcesInput) -> Result<serde_json::Value>;
 }
 
 /// Default implementation of MemoryToolProvider backed by SQLite.
@@ -285,20 +314,9 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let now_ts = chrono::Utc::now().timestamp();
 
         let mut results = if let Some(ref mt) = input.memory_type {
-            BM25Retriever::search_by_type(
-                &repo,
-                &input.query,
-                &input.project_id,
-                mt,
-                input.limit,
-            )?
+            BM25Retriever::search_by_type(&repo, &input.query, &input.project_id, mt, input.limit)?
         } else {
-            BM25Retriever::search_all(
-                &repo,
-                &input.query,
-                &input.project_id,
-                input.limit,
-            )?
+            BM25Retriever::search_all(&repo, &input.query, &input.project_id, input.limit)?
         };
 
         reranker.deduplicate(&mut results);
@@ -347,26 +365,27 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         let entity_id = {
             let conn = repo.connection();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM entities WHERE name = ?1 AND project_id = ?2 LIMIT 1",
-            )?;
-            stmt.query_row(
-                rusqlite::params![input.file, input.project_id],
-                |row| row.get::<_, String>(0),
-            )
+            let mut stmt = conn
+                .prepare("SELECT id FROM entities WHERE name = ?1 AND project_id = ?2 LIMIT 1")?;
+            stmt.query_row(rusqlite::params![input.file, input.project_id], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()?
         };
 
         let relations = if let Some(eid) = &entity_id {
-            graph.get_relations(eid)
+            graph
+                .get_relations(eid)
                 .iter()
                 .map(|rel| {
                     let target = if rel.from_entity == *eid {
-                        graph.get_entity(&rel.to_entity)
+                        graph
+                            .get_entity(&rel.to_entity)
                             .map(|e| e.name.clone())
                             .unwrap_or_default()
                     } else {
-                        graph.get_entity(&rel.from_entity)
+                        graph
+                            .get_entity(&rel.from_entity)
                             .map(|e| e.name.clone())
                             .unwrap_or_default()
                     };
@@ -422,7 +441,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let results = if query.is_empty() {
             repo.list_recent_failures(&input.project_id, input.limit)?
                 .into_iter()
-                .map(|m| ScoredMemory { memory: m, bm25_score: 0.0 })
+                .map(|m| ScoredMemory {
+                    memory: m,
+                    bm25_score: 0.0,
+                })
                 .collect()
         } else {
             repo.search_failures(query, &input.project_id, input.limit)?
@@ -442,13 +464,19 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         Ok(serde_json::json!({ "failures": failures }))
     }
 
-    fn architectural_decisions(&self, input: ArchitecturalDecisionsInput) -> Result<serde_json::Value> {
+    fn architectural_decisions(
+        &self,
+        input: ArchitecturalDecisionsInput,
+    ) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
         let query = input.topic.as_deref().unwrap_or("");
         let results = if query.is_empty() {
             repo.list_recent_decisions(&input.project_id, input.limit)?
                 .into_iter()
-                .map(|m| ScoredMemory { memory: m, bm25_score: 0.0 })
+                .map(|m| ScoredMemory {
+                    memory: m,
+                    bm25_score: 0.0,
+                })
                 .collect()
         } else {
             repo.search_decisions(query, &input.project_id, input.limit)?
@@ -472,7 +500,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn create_episodic(&self, input: CreateEpisodicInput) -> Result<serde_json::Value> {
         if !(0.0..=1.0).contains(&input.importance) {
-            anyhow::bail!("importance must be between 0.0 and 1.0, got {}", input.importance);
+            anyhow::bail!(
+                "importance must be between 0.0 and 1.0, got {}",
+                input.importance
+            );
         }
         let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
@@ -624,6 +655,57 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             "memories": ingested,
         }))
     }
+
+    fn collect_sources(&self, input: CollectSourcesInput) -> Result<serde_json::Value> {
+        let dimensions = collectors::Dimension::parse_list(input.dimensions.as_deref());
+        if dimensions.is_empty() {
+            anyhow::bail!(
+                "no valid dimensions parsed from {:?}; valid: git, decisions, failures, workflow",
+                input.dimensions
+            );
+        }
+
+        // Reuse the commit-hash dedup so re-collection stays idempotent: commits
+        // already stored as episodic memories are skipped by the git collector.
+        let ingested_hashes = {
+            let repo = self.lock_repo();
+            repo.get_ingested_commits(&input.project_id)?
+        };
+
+        let opts = collectors::CollectOptions {
+            max_commits: input.max_commits,
+            ingested_commit_hashes: ingested_hashes,
+            ..Default::default()
+        };
+
+        let sources = collectors::collect(
+            &input.project_id,
+            std::path::Path::new(&input.repo_path),
+            &dimensions,
+            &opts,
+        )?;
+
+        // Serialize directly so the agent receives the full structured bundle.
+        Ok(serde_json::to_value(&sources)?)
+    }
+}
+
+/// The bootstrap prompt template, kept in sync with `docs/bootstrap.md` so
+/// humans and agents read the same guidance (single source of truth).
+const BOOTSTRAP_PROMPT_TEMPLATE: &str = include_str!("../../docs/bootstrap.md");
+
+/// Prompt templates this server exposes via `prompts/list` + `prompts/get`.
+/// Keeping the registry here lets `initialize` advertise the capability and
+/// `prompts/list` enumerate from one place.
+const BOOTSTRAP_PROMPT_NAME: &str = "engram.bootstrap";
+
+/// Render the bootstrap prompt with the caller's arguments substituted in.
+/// Unknown arguments fall back to placeholders so the agent still sees guidance.
+fn render_bootstrap_prompt(project_id: &str, repo_path: &str, dimensions: &str) -> String {
+    BOOTSTRAP_PROMPT_TEMPLATE
+        .replace("{{PROJECT_ID}}", project_id)
+        .replace("{{REPO_PATH}}", repo_path)
+        .replace("{{DIMENSIONS}}", dimensions)
 }
 
 /// MCP Server running on stdio transport.
@@ -653,7 +735,10 @@ impl McpServer {
             fn recent_failures(&self, _: RecentFailuresInput) -> Result<serde_json::Value> {
                 Ok(serde_json::json!({"failures": []}))
             }
-            fn architectural_decisions(&self, _: ArchitecturalDecisionsInput) -> Result<serde_json::Value> {
+            fn architectural_decisions(
+                &self,
+                _: ArchitecturalDecisionsInput,
+            ) -> Result<serde_json::Value> {
                 Ok(serde_json::json!({"decisions": []}))
             }
             fn create_episodic(&self, _: CreateEpisodicInput) -> Result<serde_json::Value> {
@@ -670,6 +755,9 @@ impl McpServer {
             }
             fn ingest_commits(&self, _: IngestCommitsInput) -> Result<serde_json::Value> {
                 Ok(serde_json::json!({"ingested": 0}))
+            }
+            fn collect_sources(&self, _: CollectSourcesInput) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"summary": {"total_items": 0}}))
             }
         }
         Self {
@@ -830,6 +918,20 @@ impl McpServer {
                     "required": ["project_id", "repo_path"],
                 }),
             },
+            ToolDefinition {
+                name: "collect_sources".into(),
+                description: "Gather structured evidence (git themes, docs, decisions, failures, workflows) from an existing project for memory bootstrap. Returns raw material only — does not write memories. Pair with the `engram.bootstrap` prompt.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "repo_path": { "type": "string", "description": "Path to the project root (git optional)" },
+                        "dimensions": { "type": "string", "description": "Comma-separated: git,decisions,failures,workflow (default: all)" },
+                        "max_commits": { "type": "integer", "description": "Max commits to walk for the git dimension (default 200)" },
+                    },
+                    "required": ["project_id", "repo_path"],
+                }),
+            },
         ]
     }
 
@@ -891,7 +993,7 @@ impl McpServer {
                 id: request.id,
                 result: Some(serde_json::json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
+                    "capabilities": { "tools": {}, "prompts": {} },
                     "serverInfo": { "name": "engram", "version": "0.1.0" },
                 })),
                 error: None,
@@ -904,23 +1006,131 @@ impl McpServer {
                 })),
                 error: None,
             },
+            "prompts/list" => JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(serde_json::json!({
+                    "prompts": [{
+                        "name": BOOTSTRAP_PROMPT_NAME,
+                        "description": "Initialize engram memory for an existing project: collect evidence via collect_sources, then distill it into structured memories with quality bars.",
+                        "arguments": [
+                            { "name": "project_id", "description": "Project identifier (required)", "required": true },
+                            { "name": "repo_path", "description": "Path to the project root (required)", "required": true },
+                            { "name": "dimensions", "description": "Comma-separated: git,decisions,failures,workflow (default: all)", "required": false },
+                        ],
+                    }],
+                })),
+                error: None,
+            },
+            "prompts/get" => {
+                let params = request.params.unwrap_or_default();
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name != BOOTSTRAP_PROMPT_NAME {
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32601,
+                            message: format!("Unknown prompt: {name}"),
+                            data: None,
+                        }),
+                    }
+                } else {
+                    let args = params.get("arguments").cloned().unwrap_or_default();
+                    let project_id = args
+                        .get("project_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<project_id>");
+                    let repo_path = args
+                        .get("repo_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<repo_path>");
+                    let dimensions = args
+                        .get("dimensions")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("git, decisions, failures, workflow");
+                    let rendered = render_bootstrap_prompt(project_id, repo_path, dimensions);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "description": "Initialize engram memory for an existing project",
+                            "messages": [{
+                                "role": "user",
+                                "content": { "type": "text", "text": rendered }
+                            }],
+                        })),
+                        error: None,
+                    }
+                }
+            }
             "tools/call" => {
                 let params = request.params.unwrap_or_default();
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or_default();
 
-                let (result, parse_error): (Option<Result<serde_json::Value>>, Option<JsonRpcError>) = match tool_name {
-                    "search_memory" => dispatch_tool!(arguments, SearchMemoryInput, self.provider, search_memory),
-                    "related_files" => dispatch_tool!(arguments, RelatedFilesInput, self.provider, related_files),
+                let (result, parse_error): (
+                    Option<Result<serde_json::Value>>,
+                    Option<JsonRpcError>,
+                ) = match tool_name {
+                    "search_memory" => {
+                        dispatch_tool!(arguments, SearchMemoryInput, self.provider, search_memory)
+                    }
+                    "related_files" => {
+                        dispatch_tool!(arguments, RelatedFilesInput, self.provider, related_files)
+                    }
                     "timeline" => dispatch_tool!(arguments, TimelineInput, self.provider, timeline),
-                    "recent_failures" => dispatch_tool!(arguments, RecentFailuresInput, self.provider, recent_failures),
-                    "architectural_decisions" => dispatch_tool!(arguments, ArchitecturalDecisionsInput, self.provider, architectural_decisions),
-                    "create_episodic" => dispatch_tool!(arguments, CreateEpisodicInput, self.provider, create_episodic),
-                    "create_decision" => dispatch_tool!(arguments, CreateDecisionInput, self.provider, create_decision),
-                    "create_failure" => dispatch_tool!(arguments, CreateFailureInput, self.provider, create_failure),
-                    "create_procedural" => dispatch_tool!(arguments, CreateProceduralInput, self.provider, create_procedural),
-                    "ingest_commits" => dispatch_tool!(arguments, IngestCommitsInput, self.provider, ingest_commits),
-                    _ => (None, Some(JsonRpcError { code: -32601, message: format!("Unknown tool: {tool_name}"), data: None })),
+                    "recent_failures" => dispatch_tool!(
+                        arguments,
+                        RecentFailuresInput,
+                        self.provider,
+                        recent_failures
+                    ),
+                    "architectural_decisions" => dispatch_tool!(
+                        arguments,
+                        ArchitecturalDecisionsInput,
+                        self.provider,
+                        architectural_decisions
+                    ),
+                    "create_episodic" => dispatch_tool!(
+                        arguments,
+                        CreateEpisodicInput,
+                        self.provider,
+                        create_episodic
+                    ),
+                    "create_decision" => dispatch_tool!(
+                        arguments,
+                        CreateDecisionInput,
+                        self.provider,
+                        create_decision
+                    ),
+                    "create_failure" => {
+                        dispatch_tool!(arguments, CreateFailureInput, self.provider, create_failure)
+                    }
+                    "create_procedural" => dispatch_tool!(
+                        arguments,
+                        CreateProceduralInput,
+                        self.provider,
+                        create_procedural
+                    ),
+                    "ingest_commits" => {
+                        dispatch_tool!(arguments, IngestCommitsInput, self.provider, ingest_commits)
+                    }
+                    "collect_sources" => dispatch_tool!(
+                        arguments,
+                        CollectSourcesInput,
+                        self.provider,
+                        collect_sources
+                    ),
+                    _ => (
+                        None,
+                        Some(JsonRpcError {
+                            code: -32601,
+                            message: format!("Unknown tool: {tool_name}"),
+                            data: None,
+                        }),
+                    ),
                 };
 
                 if let Some(err) = parse_error {
@@ -974,7 +1184,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = McpServer::list_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"search_memory"));
@@ -987,13 +1197,16 @@ mod tests {
         assert!(names.contains(&"create_failure"));
         assert!(names.contains(&"create_procedural"));
         assert!(names.contains(&"ingest_commits"));
+        assert!(names.contains(&"collect_sources"));
     }
 
     #[test]
     fn test_tool_schemas_require_project_id() {
         let tools = McpServer::list_tools();
         for tool in &tools {
-            let required = tool.input_schema.get("required")
+            let required = tool
+                .input_schema
+                .get("required")
                 .and_then(|r| r.as_array())
                 .unwrap();
             let has_project_id = required.iter().any(|v| v.as_str() == Some("project_id"));
@@ -1030,7 +1243,7 @@ mod tests {
         assert!(response.result.is_some());
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -1043,27 +1256,31 @@ mod tests {
         let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
         // Create episodic memory
-        let result = provider.create_episodic(CreateEpisodicInput {
-            project_id: "test-project".into(),
-            session_id: "session-1".into(),
-            summary: "Fixed OAuth refresh loop".into(),
-            content: "The refresh token was looping due to stale cache".into(),
-            files_touched: vec!["auth.ts".into()],
-            related_commits: vec!["abc123".into()],
-            importance: 0.8,
-            tags: vec!["auth".into(), "oauth".into()],
-        }).unwrap();
+        let result = provider
+            .create_episodic(CreateEpisodicInput {
+                project_id: "test-project".into(),
+                session_id: "session-1".into(),
+                summary: "Fixed OAuth refresh loop".into(),
+                content: "The refresh token was looping due to stale cache".into(),
+                files_touched: vec!["auth.ts".into()],
+                related_commits: vec!["abc123".into()],
+                importance: 0.8,
+                tags: vec!["auth".into(), "oauth".into()],
+            })
+            .unwrap();
 
         assert_eq!(result["status"], "created");
         let id = result["id"].as_str().unwrap();
 
         // Verify it can be searched
-        let search_result = provider.search_memory(SearchMemoryInput {
-            project_id: "test-project".into(),
-            query: "OAuth refresh".into(),
-            memory_type: None,
-            limit: 10,
-        }).unwrap();
+        let search_result = provider
+            .search_memory(SearchMemoryInput {
+                project_id: "test-project".into(),
+                query: "OAuth refresh".into(),
+                memory_type: None,
+                limit: 10,
+            })
+            .unwrap();
 
         let results = search_result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
@@ -1079,25 +1296,29 @@ mod tests {
 
         let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
-        let result = provider.create_decision(CreateDecisionInput {
-            project_id: "test-project".into(),
-            title: "Use Redis for session caching".into(),
-            context: "Auth service needs sub-ms latency".into(),
-            rationale: "Redis provides sub-millisecond reads".into(),
-            tradeoffs: "Added infrastructure complexity".into(),
-            related_files: vec!["auth.ts".into()],
-            tags: vec!["architecture".into()],
-        }).unwrap();
+        let result = provider
+            .create_decision(CreateDecisionInput {
+                project_id: "test-project".into(),
+                title: "Use Redis for session caching".into(),
+                context: "Auth service needs sub-ms latency".into(),
+                rationale: "Redis provides sub-millisecond reads".into(),
+                tradeoffs: "Added infrastructure complexity".into(),
+                related_files: vec!["auth.ts".into()],
+                tags: vec!["architecture".into()],
+            })
+            .unwrap();
 
         assert_eq!(result["status"], "created");
 
         // Verify via search
-        let search = provider.search_memory(SearchMemoryInput {
-            project_id: "test-project".into(),
-            query: "Redis".into(),
-            memory_type: Some("decision".into()),
-            limit: 5,
-        }).unwrap();
+        let search = provider
+            .search_memory(SearchMemoryInput {
+                project_id: "test-project".into(),
+                query: "Redis".into(),
+                memory_type: Some("decision".into()),
+                limit: 5,
+            })
+            .unwrap();
         assert_eq!(search["results"].as_array().unwrap().len(), 1);
     }
 
@@ -1110,15 +1331,17 @@ mod tests {
 
         let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
-        let result = provider.create_failure(CreateFailureInput {
-            project_id: "test-project".into(),
-            incident: "Auth token expiry mismatch".into(),
-            root_cause: "Clock skew between services".into(),
-            fix: "Added clock tolerance window".into(),
-            prevention: "Monitor clock sync".into(),
-            severity: 4,
-            tags: vec!["auth".into()],
-        }).unwrap();
+        let result = provider
+            .create_failure(CreateFailureInput {
+                project_id: "test-project".into(),
+                incident: "Auth token expiry mismatch".into(),
+                root_cause: "Clock skew between services".into(),
+                fix: "Added clock tolerance window".into(),
+                prevention: "Monitor clock sync".into(),
+                severity: 4,
+                tags: vec!["auth".into()],
+            })
+            .unwrap();
 
         assert_eq!(result["status"], "created");
         assert_eq!(result["severity"], 4);
@@ -1133,13 +1356,19 @@ mod tests {
 
         let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
-        let result = provider.create_procedural(CreateProceduralInput {
-            project_id: "test-project".into(),
-            workflow_name: "deployment".into(),
-            steps: vec!["run tests".into(), "build docker".into(), "push to registry".into()],
-            related_tools: vec!["docker".into()],
-            tags: vec!["deploy".into()],
-        }).unwrap();
+        let result = provider
+            .create_procedural(CreateProceduralInput {
+                project_id: "test-project".into(),
+                workflow_name: "deployment".into(),
+                steps: vec![
+                    "run tests".into(),
+                    "build docker".into(),
+                    "push to registry".into(),
+                ],
+                related_tools: vec!["docker".into()],
+                tags: vec!["deploy".into()],
+            })
+            .unwrap();
 
         assert_eq!(result["status"], "created");
     }
@@ -1164,12 +1393,14 @@ mod tests {
         );
 
         // Ingest
-        let result = provider.ingest_commits(IngestCommitsInput {
-            project_id: "test-project".into(),
-            repo_path: repo_path.to_string_lossy().to_string(),
-            count: 10,
-            session_id: Some("test-session".into()),
-        }).unwrap();
+        let result = provider
+            .ingest_commits(IngestCommitsInput {
+                project_id: "test-project".into(),
+                repo_path: repo_path.to_string_lossy().to_string(),
+                count: 10,
+                session_id: Some("test-session".into()),
+            })
+            .unwrap();
 
         assert_eq!(result["ingested"], 1);
     }
@@ -1360,7 +1591,10 @@ mod tests {
         let search_parsed: serde_json::Value = serde_json::from_str(search_text).unwrap();
         let results = search_parsed["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0]["summary"].as_str().unwrap().contains("authentication"));
+        assert!(results[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("authentication"));
     }
 
     #[test]
@@ -1444,5 +1678,136 @@ mod tests {
         let timeline_parsed: serde_json::Value = serde_json::from_str(timeline_text).unwrap();
         let events = timeline_parsed["events"].as_array().unwrap();
         assert!(!events.is_empty());
+    }
+
+    // ─── collect_sources + prompts Integration Tests ────────────────
+
+    #[test]
+    fn test_initialize_advertises_prompts_capability() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "initialize".into(),
+            params: None,
+        });
+        let caps = &response.result.unwrap()["capabilities"];
+        assert!(
+            caps.get("prompts").is_some(),
+            "prompts capability advertised"
+        );
+        assert!(caps.get("tools").is_some());
+    }
+
+    #[test]
+    fn test_prompts_list_returns_bootstrap() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "prompts/list".into(),
+            params: None,
+        });
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        let prompts = result["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["name"], "engram.bootstrap");
+        let args = prompts[0]["arguments"].as_array().unwrap();
+        assert!(args
+            .iter()
+            .any(|a| a["name"] == "project_id" && a["required"] == true));
+    }
+
+    #[test]
+    fn test_prompts_get_renders_template() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "prompts/get".into(),
+            params: Some(serde_json::json!({
+                "name": "engram.bootstrap",
+                "arguments": {
+                    "project_id": "myproj",
+                    "repo_path": "/tmp/x",
+                    "dimensions": "git"
+                }
+            })),
+        });
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("myproj"));
+        assert!(text.contains("/tmp/x"));
+        assert!(!text.contains("{{PROJECT_ID}}"), "placeholder substituted");
+        assert!(text.contains("Iron rules"), "guidance body present");
+    }
+
+    #[test]
+    fn test_prompts_get_unknown_prompt_errors() {
+        let server = McpServer::new();
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "prompts/get".into(),
+            params: Some(serde_json::json!({ "name": "bogus" })),
+        });
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn test_collect_sources_with_provider() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let graph = GraphEngine::new();
+        let config = Config::default();
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git_integration::make_test_repo(path, "main.rs", "fn main() {}", "feat: initial");
+        std::fs::write(path.join("README.md"), "# Project\n").unwrap();
+        std::fs::write(path.join("Cargo.toml"), "[dependencies]\nserde = \"1\"\n").unwrap();
+
+        let result = provider
+            .collect_sources(CollectSourcesInput {
+                project_id: "test".into(),
+                repo_path: path.to_string_lossy().into_owned(),
+                dimensions: Some("git,decisions".into()),
+                max_commits: 50,
+            })
+            .unwrap();
+
+        assert!(
+            result["summary"]["total_items"].as_u64().unwrap() > 0,
+            "found some material: {result}"
+        );
+        assert!(result["git"].is_object());
+        assert!(result["decisions"].is_object());
+        // Unrequested dimensions are omitted (skip_serializing_if Option::is_none).
+        assert!(result.get("failures").is_none());
+        assert!(result.get("workflow").is_none());
+    }
+
+    #[test]
+    fn test_collect_sources_rejects_empty_dimensions() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let graph = GraphEngine::new();
+        let config = Config::default();
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = provider
+            .collect_sources(CollectSourcesInput {
+                project_id: "test".into(),
+                repo_path: dir.path().to_string_lossy().into_owned(),
+                dimensions: Some("bogus,also-bogus".into()),
+                max_commits: 50,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("no valid dimensions"));
     }
 }

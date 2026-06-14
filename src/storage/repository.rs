@@ -23,18 +23,15 @@ impl MemoryRepository {
     /// Open (or create) the database at the given path.
     pub fn new(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("failed to create database directory")?;
+            std::fs::create_dir_all(parent).context("failed to create database directory")?;
         }
-        let conn = Connection::open(db_path)
-            .context("failed to open SQLite database")?;
+        let conn = Connection::open(db_path).context("failed to open SQLite database")?;
         Ok(Self { conn })
     }
 
     /// Open an in-memory database (for testing).
     pub fn new_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .context("failed to open in-memory database")?;
+        let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         Ok(Self { conn })
     }
 
@@ -242,7 +239,10 @@ impl MemoryRepository {
     /// Safe to call idempotently on fresh or existing databases.
     pub fn migrate_fts5_add_tags(&self) -> Result<()> {
         // Check if migration is needed by probing episodic_memories_fts for tags column
-        let needs_migration = self.conn.prepare("SELECT tags FROM episodic_memories_fts LIMIT 0").is_err();
+        let needs_migration = self
+            .conn
+            .prepare("SELECT tags FROM episodic_memories_fts LIMIT 0")
+            .is_err();
         if !needs_migration {
             return Ok(());
         }
@@ -250,12 +250,14 @@ impl MemoryRepository {
         tracing::info!("Migrating FTS5 tables to include tags column...");
         let tx = self.conn.unchecked_transaction()?;
 
-        tx.execute_batch("
+        tx.execute_batch(
+            "
             DROP TABLE IF EXISTS episodic_memories_fts;
             DROP TABLE IF EXISTS decision_memories_fts;
             DROP TABLE IF EXISTS failure_memories_fts;
             DROP TABLE IF EXISTS procedural_memories_fts;
-        ")?;
+        ",
+        )?;
 
         tx.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memories_fts USING fts5(
@@ -336,7 +338,6 @@ impl MemoryRepository {
         }
         Ok(())
     }
-
 
     // ─── Macro-generated Memory CRUD + FTS5 Search ─────────────────
 
@@ -665,12 +666,10 @@ impl MemoryRepository {
     /// Check which commit hashes have already been ingested as episodic memories.
     /// Returns a HashSet of already-ingested commit hashes for O(1) lookup.
     pub fn get_ingested_commits(&self, project_id: &str) -> Result<HashSet<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT related_commits FROM episodic_memories WHERE project_id = ?1"
-        )?;
-        let rows = stmt.query_map(params![project_id], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT related_commits FROM episodic_memories WHERE project_id = ?1")?;
+        let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         let mut hashes = HashSet::new();
         for row in rows {
             let json_str = row?;
@@ -682,7 +681,11 @@ impl MemoryRepository {
 
     /// List recent failure memories for a project, ordered by creation time descending.
     /// Uses plain SELECT without FTS5 MATCH — safe for listing without a filter.
-    pub fn list_recent_failures(&self, project_id: &str, limit: usize) -> Result<Vec<FailureMemory>> {
+    pub fn list_recent_failures(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FailureMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at
              FROM failure_memories
@@ -713,7 +716,11 @@ impl MemoryRepository {
 
     /// List recent decision memories for a project, ordered by creation time descending.
     /// Uses plain SELECT without FTS5 MATCH — safe for listing without a filter.
-    pub fn list_recent_decisions(&self, project_id: &str, limit: usize) -> Result<Vec<DecisionMemory>> {
+    pub fn list_recent_decisions(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at
              FROM decision_memories
@@ -750,7 +757,9 @@ impl MemoryRepository {
         Ok(Entity {
             id: row.get(0)?,
             project_id: row.get(1)?,
-            entity_type: et.parse().map_err(|e: String| anyhow::anyhow!("invalid entity_type: {e}"))?,
+            entity_type: et
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("invalid entity_type: {e}"))?,
             name: row.get(3)?,
             metadata: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
             created_at: row.get(5)?,
@@ -766,7 +775,9 @@ impl MemoryRepository {
             project_id: row.get(1)?,
             from_entity: row.get(2)?,
             to_entity: row.get(3)?,
-            relation_type: rt.parse().map_err(|e: String| anyhow::anyhow!("invalid relation_type: {e}"))?,
+            relation_type: rt
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("invalid relation_type: {e}"))?,
             weight: row.get(5)?,
             created_at: row.get(6)?,
         })
@@ -846,7 +857,9 @@ impl MemoryRepository {
     }
 
     pub fn remove_relation(&self, id: i64) -> Result<bool> {
-        let affected = self.conn.execute("DELETE FROM graph_relations WHERE id = ?1", params![id])?;
+        let affected = self
+            .conn
+            .execute("DELETE FROM graph_relations WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
 
@@ -992,7 +1005,10 @@ mod tests {
         let mut updated = retrieved;
         updated.title = "Use Redis for all caching".into();
         repo.update_decision(&updated).unwrap();
-        assert_eq!(repo.get_decision(&mem.id).unwrap().unwrap().title, "Use Redis for all caching");
+        assert_eq!(
+            repo.get_decision(&mem.id).unwrap().unwrap().title,
+            "Use Redis for all caching"
+        );
 
         assert!(repo.delete_decision(&mem.id, "test-project").unwrap());
         assert!(repo.get_decision(&mem.id).unwrap().is_none());
@@ -1035,7 +1051,11 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             project_id: "test-project".into(),
             workflow_name: "deployment".into(),
-            steps: vec!["run tests".into(), "build docker".into(), "push to registry".into()],
+            steps: vec![
+                "run tests".into(),
+                "build docker".into(),
+                "push to registry".into(),
+            ],
             related_tools: vec!["docker".into(), "kubernetes".into()],
             tags: vec!["deploy".into()],
             created_at: now(),
@@ -1050,7 +1070,10 @@ mod tests {
         let mut updated = retrieved;
         updated.steps.push("verify deployment".into());
         repo.update_procedural(&updated).unwrap();
-        assert_eq!(repo.get_procedural(&mem.id).unwrap().unwrap().steps.len(), 4);
+        assert_eq!(
+            repo.get_procedural(&mem.id).unwrap().unwrap().steps.len(),
+            4
+        );
 
         assert!(repo.delete_procedural(&mem.id, "test-project").unwrap());
         assert!(repo.get_procedural(&mem.id).unwrap().is_none());
@@ -1077,13 +1100,17 @@ mod tests {
         repo.create_episodic(&mem).unwrap();
 
         // Search should find it
-        let results = repo.search_episodic("OAuth refresh", "test-project", 10).unwrap();
+        let results = repo
+            .search_episodic("OAuth refresh", "test-project", 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.id, mem.id);
 
         // After delete, search should not find it
         repo.delete_episodic(&mem.id, "test-project").unwrap();
-        let results = repo.search_episodic("OAuth refresh", "test-project", 10).unwrap();
+        let results = repo
+            .search_episodic("OAuth refresh", "test-project", 10)
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1105,7 +1132,9 @@ mod tests {
         repo.create_decision(&mem).unwrap();
 
         // Search should find it
-        let results = repo.search_decisions("Postgres", "test-project", 10).unwrap();
+        let results = repo
+            .search_decisions("Postgres", "test-project", 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
 
         // Update title
@@ -1114,7 +1143,9 @@ mod tests {
         repo.update_decision(&updated).unwrap();
 
         // Old term should not match
-        let old_results = repo.search_decisions("Postgres", "test-project", 10).unwrap();
+        let old_results = repo
+            .search_decisions("Postgres", "test-project", 10)
+            .unwrap();
         assert!(old_results.is_empty());
 
         // New term should match

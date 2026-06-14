@@ -205,6 +205,15 @@ All tools require a `project_id` parameter for multi-project isolation.
 | `create_failure` | Record an incident with root cause analysis | `incident`, `root_cause`, `fix`, `prevention`, `severity` |
 | `create_procedural` | Record a workflow or convention | `workflow_name`, `steps`, `related_tools` |
 | `ingest_commits` | Auto-generate episodic memories from git history | `repo_path`, `count`, `project_id` |
+| `collect_sources` | Gather structured evidence from a project for bootstrap (no writes) | `repo_path`, `dimensions`, `max_commits`, `project_id` |
+
+### Prompts
+
+Engram also exposes MCP **prompts** (server-side templates any MCP client can fetch):
+
+| Prompt | Description | Arguments |
+|-------|-------------|-----------|
+| `engram.bootstrap` | Seed memory for an existing project: gather evidence via `collect_sources`, then distill it into structured memories with quality bars | `project_id`, `repo_path`, `dimensions` |
 
 ---
 
@@ -291,6 +300,34 @@ engram decisions
 
 ---
 
+## 🔄 Bootstrapping an Existing Project
+
+When you adopt Engram on a project that already has history, the `engram.bootstrap` prompt + `collect_sources` tool seed memory from what's already there — git history, docs, past decisions, CI, fixes — instead of starting from zero.
+
+**How it works:** Engram only *gathers evidence* (it stays local and LLM-free). Your agent reads that evidence and writes the actual memories, following the quality bars in the bootstrap prompt. The result is high-signal, traceable memories — not a noisy dump.
+
+1. Have your MCP client fetch the `engram.bootstrap` prompt (the same guidance is in `docs/bootstrap.md`).
+2. The prompt instructs the agent to call `collect_sources`, distill the evidence into the four memory types, and tag everything `bootstrap` for later review/cleanup.
+
+What `collect_sources` gathers per dimension:
+
+| Dimension | Carriers scanned | Target memory |
+|-----------|------------------|---------------|
+| `git` | commit themes (clustered by type/scope), migration & breaking signals | episodic |
+| `decisions` | docs (README/ADR/CLAUDE.md), `// WHY:` / `//!` annotations, dependency manifests | decision |
+| `failures` | `fix:` / `hotfix:` commits, CHANGELOG "Fixed" sections | failure |
+| `workflow` | CI pipelines, Makefile/justfile/scripts, lint & convention config | procedural |
+
+```bash
+# CLI equivalent
+engram collect --project myproj --repo .                          # all dimensions
+engram collect --project myproj --repo . --dimensions git,decisions
+```
+
+Re-running is idempotent — commits already stored as episodic memories are skipped.
+
+---
+
 ## 🗺️ Roadmap
 
 - [x] SQLite + FTS5 storage with 4 memory types
@@ -298,6 +335,7 @@ engram decisions
 - [x] BM25 retrieval with intent classification
 - [x] Relationship graph engine
 - [x] Git integration (auto-ingest commits)
+- [x] Project bootstrap (collect_sources + prompts)
 - [x] CLI interface
 - [ ] Memory consolidation (merge/deduplicate over time)
 - [ ] Reflection engine (self-improving retrieval)

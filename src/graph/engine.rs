@@ -72,9 +72,7 @@ impl GraphEngine {
 
     /// Get an entity by ID.
     pub fn get_entity(&self, id: &str) -> Option<&Entity> {
-        self.entity_index
-            .get(id)
-            .map(|&idx| &self.graph[idx])
+        self.entity_index.get(id).map(|&idx| &self.graph[idx])
     }
 
     /// Remove an entity and its edges from the graph.
@@ -110,7 +108,10 @@ impl GraphEngine {
                 relations.push(edge_idx.weight());
             }
             // Incoming edges
-            for edge_idx in self.graph.edges_directed(idx, petgraph::Direction::Incoming) {
+            for edge_idx in self
+                .graph
+                .edges_directed(idx, petgraph::Direction::Incoming)
+            {
                 relations.push(edge_idx.weight());
             }
             relations

@@ -21,55 +21,123 @@ impl IntentClassifier {
 
         // Debugging keywords
         for kw in &[
-            "bug", "debug", "fix", "error", "crash", "traceback", "exception",
-            "stack trace", "segfault", "panic", "assertion", "breakpoint",
-            "调试", "修复", "错误", "崩溃", "异常",
+            "bug",
+            "debug",
+            "fix",
+            "error",
+            "crash",
+            "traceback",
+            "exception",
+            "stack trace",
+            "segfault",
+            "panic",
+            "assertion",
+            "breakpoint",
+            "调试",
+            "修复",
+            "错误",
+            "崩溃",
+            "异常",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Debugging]);
         }
 
         // Architecture keywords
         for kw in &[
-            "architect", "design", "decision", "structure",
-            "pattern", "module", "component", "service", "microservice",
-            "why", "rationale", "tradeoff",
-            "架构", "设计", "决策", "模块",
+            "architect",
+            "design",
+            "decision",
+            "structure",
+            "pattern",
+            "module",
+            "component",
+            "service",
+            "microservice",
+            "why",
+            "rationale",
+            "tradeoff",
+            "架构",
+            "设计",
+            "决策",
+            "模块",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Architecture]);
         }
 
         // Workflow keywords
         for kw in &[
-            "workflow", "process", "procedure", "pipeline", "ci", "cd",
-            "build", "test", "lint", "step",
-            "工作流", "流程", "构建",
+            "workflow",
+            "process",
+            "procedure",
+            "pipeline",
+            "ci",
+            "cd",
+            "build",
+            "test",
+            "lint",
+            "step",
+            "工作流",
+            "流程",
+            "构建",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Workflow]);
         }
 
         // Refactor keywords
         for kw in &[
-            "refactor", "rewrite", "restructure", "clean up", "simplify",
-            "consolidate", "merge", "split", "extract",
-            "重写", "简化", "提取",
+            "refactor",
+            "rewrite",
+            "restructure",
+            "clean up",
+            "simplify",
+            "consolidate",
+            "merge",
+            "split",
+            "extract",
+            "重写",
+            "简化",
+            "提取",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Refactor]);
         }
 
         // Deployment keywords
         for kw in &[
-            "deploy", "release", "rollout", "production", "staging",
-            "rollback", "migration", "upgrade", "config change",
-            "发布", "上线", "回滚", "迁移",
+            "deploy",
+            "release",
+            "rollout",
+            "production",
+            "staging",
+            "rollback",
+            "migration",
+            "upgrade",
+            "config change",
+            "发布",
+            "上线",
+            "回滚",
+            "迁移",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Deployment]);
         }
 
         // Incident keywords
         for kw in &[
-            "outage", "incident", "sev1", "sev2", "sev3", "p0", "p1", "p2",
-            "downtime", "alert", "page", "post-mortem", "postmortem",
-            "故障", "停机", "告警",
+            "outage",
+            "incident",
+            "sev1",
+            "sev2",
+            "sev3",
+            "p0",
+            "p1",
+            "p2",
+            "downtime",
+            "alert",
+            "page",
+            "post-mortem",
+            "postmortem",
+            "故障",
+            "停机",
+            "告警",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Incident]);
         }

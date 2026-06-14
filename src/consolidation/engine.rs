@@ -114,6 +114,10 @@ mod tests {
 
     #[test]
     fn test_jaccard_identical() {
-        assert!(ConsolidationEngine::jaccard_similarity("same text", "same text", 0.99));
+        assert!(ConsolidationEngine::jaccard_similarity(
+            "same text",
+            "same text",
+            0.99
+        ));
     }
 }

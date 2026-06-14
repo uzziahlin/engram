@@ -137,6 +137,11 @@ impl GitIntegration {
     ) -> EpisodicMemory {
         let now = chrono::Utc::now().timestamp();
 
+        // Tag the provenance so ingest-produced memories are distinguishable
+        // from bootstrap / manual ones (see docs/bootstrap.md convention).
+        let mut tags = extract_tags(&event.message);
+        tags.push("source:ingest".into());
+
         EpisodicMemory {
             id: uuid::Uuid::new_v4().to_string(),
             project_id: project_id.to_string(),
@@ -146,7 +151,7 @@ impl GitIntegration {
             files_touched: event.files_changed.clone(),
             related_commits: vec![event.commit_hash.clone()],
             importance: estimate_importance(&event.message),
-            tags: extract_tags(&event.message),
+            tags,
             created_at: now,
             updated_at: now,
         }
@@ -263,7 +268,12 @@ mod tests {
     fn test_auto_generate_episodic() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
-        make_test_repo(repo_path, "test.txt", "hello", "feat: add initial test file");
+        make_test_repo(
+            repo_path,
+            "test.txt",
+            "hello",
+            "feat: add initial test file",
+        );
 
         let git = GitIntegration::new(repo_path).unwrap();
         let commits = git.get_recent_commits(10).unwrap();
