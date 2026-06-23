@@ -9,6 +9,7 @@ pub struct SearchResult {
     pub memory_type: String,
     pub summary: String,
     pub relevance_score: f32,
+    pub importance: f32,
     pub created_at: i64,
 }
 
@@ -17,6 +18,7 @@ trait Searchable {
     fn search_id(&self) -> &str;
     fn search_summary(&self) -> &str;
     fn search_created_at(&self) -> i64;
+    fn search_importance(&self) -> f32;
 }
 
 impl Searchable for EpisodicMemory {
@@ -28,6 +30,9 @@ impl Searchable for EpisodicMemory {
     }
     fn search_created_at(&self) -> i64 {
         self.created_at
+    }
+    fn search_importance(&self) -> f32 {
+        self.importance.clamp(0.0, 1.0)
     }
 }
 
@@ -41,6 +46,9 @@ impl Searchable for DecisionMemory {
     fn search_created_at(&self) -> i64 {
         self.created_at
     }
+    fn search_importance(&self) -> f32 {
+        0.5
+    }
 }
 
 impl Searchable for FailureMemory {
@@ -53,6 +61,9 @@ impl Searchable for FailureMemory {
     fn search_created_at(&self) -> i64 {
         self.created_at
     }
+    fn search_importance(&self) -> f32 {
+        (self.severity as f32 / 5.0).clamp(0.0, 1.0)
+    }
 }
 
 impl Searchable for ProceduralMemory {
@@ -64,6 +75,9 @@ impl Searchable for ProceduralMemory {
     }
     fn search_created_at(&self) -> i64 {
         self.created_at
+    }
+    fn search_importance(&self) -> f32 {
+        0.5
     }
 }
 
@@ -105,6 +119,7 @@ impl BM25Retriever {
                 memory_type: memory_type.into(),
                 summary: scored.memory.search_summary().to_string(),
                 relevance_score: Self::normalize_bm25(scored.bm25_score),
+                importance: scored.memory.search_importance(),
                 created_at: scored.memory.search_created_at(),
             })
             .collect()
@@ -175,5 +190,90 @@ impl BM25Retriever {
             )),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Materialize `SearchResult`s for explicit `(memory_type, id)` pairs by
+    /// loading them from the repo. Used to bring vector-only hits into the
+    /// fused candidate set. `relevance_score` is 0.0 (these were not BM25 hits);
+    /// the reranker recomputes the final score. Importance is normalized the
+    /// same way as the BM25 path (via `Searchable`).
+    pub fn fetch_by_ids(
+        repo: &MemoryRepository,
+        ids: &[(String, String)],
+    ) -> Result<Vec<SearchResult>> {
+        let mut out = Vec::new();
+        for (memory_type, id) in ids {
+            let mut sr = match memory_type.as_str() {
+                "episodic" => repo.get_episodic(id)?.map(|m| {
+                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "episodic")
+                }),
+                "decision" => repo.get_decision(id)?.map(|m| {
+                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "decision")
+                }),
+                "failure" => repo.get_failure(id)?.map(|m| {
+                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "failure")
+                }),
+                "procedural" => repo.get_procedural(id)?.map(|m| {
+                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "procedural")
+                }),
+                _ => None,
+            };
+            if let Some(v) = sr.as_mut() {
+                out.append(v);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{EpisodicMemory, FailureMemory, DecisionMemory, ProceduralMemory};
+    use crate::storage::ScoredMemory;
+
+    fn episodic(importance: f32) -> EpisodicMemory {
+        EpisodicMemory {
+            id: "e1".into(), project_id: "p".into(), session_id: "s".into(),
+            summary: "sum".into(), content: "c".into(), files_touched: vec![],
+            related_commits: vec![], importance, tags: vec![], created_at: 0, updated_at: 0,
+        }
+    }
+    fn failure(severity: u8) -> FailureMemory {
+        FailureMemory {
+            id: "f1".into(), project_id: "p".into(), incident: "boom".into(),
+            root_cause: "rc".into(), fix: "fx".into(), prevention: "pv".into(),
+            severity, tags: vec![], created_at: 0, updated_at: 0,
+        }
+    }
+    fn decision() -> DecisionMemory {
+        DecisionMemory {
+            id: "d1".into(), project_id: "p".into(), title: "t".into(), context: "ctx".into(),
+            rationale: "r".into(), tradeoffs: "to".into(), related_files: vec![], tags: vec![],
+            created_at: 0, updated_at: 0,
+        }
+    }
+    fn procedural() -> ProceduralMemory {
+        ProceduralMemory {
+            id: "pr1".into(), project_id: "p".into(), workflow_name: "wf".into(),
+            steps: vec![], related_tools: vec![], tags: vec![], created_at: 0, updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn importance_maps_per_type() {
+        // episodic: passthrough
+        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: episodic(0.8), bm25_score: -1.0 }], "episodic");
+        assert!((r[0].importance - 0.8).abs() < 1e-6);
+        // failure: severity / 5
+        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: failure(5), bm25_score: -1.0 }], "failure");
+        assert!((r[0].importance - 1.0).abs() < 1e-6);
+        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: failure(1), bm25_score: -1.0 }], "failure");
+        assert!((r[0].importance - 0.2).abs() < 1e-6);
+        // decision / procedural: neutral 0.5
+        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: decision(), bm25_score: -1.0 }], "decision");
+        assert!((r[0].importance - 0.5).abs() < 1e-6);
+        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: procedural(), bm25_score: -1.0 }], "procedural");
+        assert!((r[0].importance - 0.5).abs() < 1e-6);
     }
 }

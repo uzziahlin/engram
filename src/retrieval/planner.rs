@@ -6,7 +6,7 @@ pub struct RetrievalPlan {
     pub sources: Vec<MemorySource>,
     pub recency_weight: f32,
     pub importance_weight: f32,
-    pub graph_weight: f32,
+    pub type_weight: f32,
 }
 
 /// Memory sources available for retrieval.
@@ -37,7 +37,7 @@ impl RetrievalPlanner {
         let mut sources = Vec::new();
         let mut recency_weight = 0.2;
         let mut importance_weight = 0.4;
-        let mut graph_weight = 0.4;
+        let mut type_weight = 0.4;
 
         for intent in intents {
             match intent {
@@ -49,7 +49,7 @@ impl RetrievalPlanner {
                         sources.push(MemorySource::Episodic);
                     }
                     importance_weight = 0.6;
-                    graph_weight = 0.8;
+                    type_weight = 0.8;
                 }
                 MemoryIntent::Architecture => {
                     if !sources.contains(&MemorySource::Decision) {
@@ -59,7 +59,7 @@ impl RetrievalPlanner {
                         sources.push(MemorySource::Episodic);
                     }
                     importance_weight = 0.6;
-                    graph_weight = 0.8;
+                    type_weight = 0.8;
                 }
                 MemoryIntent::Workflow => {
                     if !sources.contains(&MemorySource::Procedural) {
@@ -77,7 +77,7 @@ impl RetrievalPlanner {
                     if !sources.contains(&MemorySource::Episodic) {
                         sources.push(MemorySource::Episodic);
                     }
-                    graph_weight = 0.6;
+                    type_weight = 0.6;
                 }
                 MemoryIntent::Deployment => {
                     if !sources.contains(&MemorySource::Procedural) {
@@ -99,7 +99,7 @@ impl RetrievalPlanner {
                         sources.push(MemorySource::Episodic);
                     }
                     importance_weight = 0.7;
-                    graph_weight = 0.9;
+                    type_weight = 0.9;
                 }
                 MemoryIntent::General => {
                     // General queries search all sources
@@ -121,7 +121,7 @@ impl RetrievalPlanner {
             sources,
             recency_weight,
             importance_weight,
-            graph_weight,
+            type_weight,
         }
     }
 }
@@ -158,6 +158,6 @@ mod tests {
         let planner = RetrievalPlanner::new();
         let plan = planner.plan(&[MemoryIntent::Debugging, MemoryIntent::Incident]);
         assert!(plan.sources.contains(&MemorySource::Failure));
-        assert!(plan.graph_weight > 0.7);
+        assert!(plan.type_weight > 0.7);
     }
 }

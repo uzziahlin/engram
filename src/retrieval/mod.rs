@@ -1,5 +1,9 @@
 pub mod bm25;
+pub mod fusion;
 pub mod intent_classifier;
+pub mod vector;
+#[cfg(feature = "semantic")]
+pub mod embedding;
 pub mod planner;
 pub mod reranker;
 
