@@ -302,7 +302,7 @@ Data is stored in `~/.engram/memory.db` by default.
 └──────────────────────────┬──────────────────────────────────┘
                            │ JSON-RPC
 ┌──────────────────────────▼──────────────────────────────────┐
-│                      MCP Server (10 tools)                   │
+│                      MCP Server (17 tools)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   MemoryToolProvider trait                    │
 ├─────────────┬─────────────────┬─────────────────────────────┤
@@ -323,9 +323,10 @@ Data is stored in `~/.engram/memory.db` by default.
 - **Dual-write pipeline** — main tables + FTS5 virtual tables in the same SQLite transaction
 - **Project isolation** — all memories scoped by `project_id`, supporting multi-project workflows
 - **BM25 via FTS5** — built into SQLite, no external search engine needed
+- **CJK-aware search** — Chinese/Japanese/Korean queries get character-level segmentation (spaces inserted between CJK runes), and FTS5 reserved words in a query are escaped so terms like `UNIQUE` or `AND` match as text rather than column filters. The intent classifier recognizes Chinese keywords too (e.g. 调试/修复, 架构/决策).
 - **Ranking signals** — `search_memory` reranks BM25 results by recency (exponential half-life decay against the real clock), per-record `importance`, and a memory-type prior (`type_weight`). The relationship graph powers `related_files` only; it does **not** participate in search ranking.
 - **Connection pool + concurrency** — the repository uses an r2d2 pool over WAL-mode SQLite (multi-reader, single-writer via `busy_timeout`); concurrent reads no longer serialize. MCP request handling dispatches to a bounded worker pool (`[mcp] worker_threads`, default 1 = FIFO sequential — safe for stdio clients that pipeline dependent requests; raise only for independent workloads).
-- **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
+- **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. Vectors are stored as BLOBs in SQLite and scored by brute-force cosine over the active set (no separate vector index), so semantic search suits thousands — not millions — of memories per project. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
 
 ---
 
@@ -368,6 +369,10 @@ engram list-archived --project myproj
 engram consolidate --project myproj          # report exact duplicates (dry-run)
 engram consolidate --project myproj --near   # also report near-duplicates (fuzzy)
 engram consolidate --project myproj --apply  # archive duplicates
+
+# Re-index embeddings (requires the `semantic` feature)
+engram reindex --project myproj              # re-embed all active memories
+engram reindex --project myproj --dry-run    # preview without writing
 ```
 
 ---
@@ -423,4 +428,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and PR
 
 ## License
 
-[MIT](LICENSE) © 2025 Uzziah
+[MIT](LICENSE) © 2025-2026 Uzziah
