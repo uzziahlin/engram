@@ -9,6 +9,21 @@ keywords = ["mcp", "memory", "ai", "coding-agent", "sqlite"]
 categories = ["development-tools", "database"]
 repository = "https://github.com/uzziahlin/engram"
 
+
+[features]
+default = []
+# Semantic/embedding retrieval — OFF by default to keep the release binary
+# self-contained and offline-friendly. Spike (see
+# docs/superpowers/plans/2026-06-22-semantic-search-spike.md) locks the
+# concrete impl before this feature gains dependencies.
+semantic = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +40,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 dirs = "5"
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.24"
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", optional = true }
+tokenizers = { version = "0.23.1", optional = true }
+hf-hub = { version = "0.5.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
