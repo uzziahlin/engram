@@ -251,7 +251,12 @@ mod tests {
         ];
         reranker.rerank(&mut results, &plan, now, half_life);
         for r in &results {
-            assert!(r.relevance_score < 0.1, "old memory {} wrongly fresh: {}", r.id, r.relevance_score);
+            assert!(
+                r.relevance_score < 0.1,
+                "old memory {} wrongly fresh: {}",
+                r.id,
+                r.relevance_score
+            );
         }
     }
 }

@@ -647,9 +647,7 @@ pub fn update(args: &[String]) -> Result<()> {
                         patch.insert(k.to_string(), serde_json::json!(v));
                     }
                     None => {
-                        anyhow::bail!(
-                            "--set expects key=value, got '{kv}' (missing '=')"
-                        );
+                        anyhow::bail!("--set expects key=value, got '{kv}' (missing '=')");
                     }
                 }
             }
@@ -761,9 +759,19 @@ pub fn consolidate(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
     let engine = crate::consolidation::ConsolidationEngine::new();
-    let plans = engine.consolidate(&repo, &project_id, &kinds, include_near_dup, 0.85, apply, now_ts())?;
+    let plans = engine.consolidate(
+        &repo,
+        &project_id,
+        &kinds,
+        include_near_dup,
+        0.85,
+        apply,
+        now_ts(),
+    )?;
     let total_archived: usize = plans.iter().map(|p| p.archived).sum();
-    print_json(&serde_json::json!({"applied": apply, "plans": plans, "total_archived": total_archived}));
+    print_json(
+        &serde_json::json!({"applied": apply, "plans": plans, "total_archived": total_archived}),
+    );
     Ok(())
 }
 
@@ -841,7 +849,7 @@ mod tests {
         let outcome = import_into_claude_md(dir.path()).unwrap();
         assert_eq!(outcome, ImportOutcome::Appended);
         let content = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(content.lines().any(|l| l == "rules"));      // stayed its own line
+        assert!(content.lines().any(|l| l == "rules")); // stayed its own line
         assert!(content.lines().any(|l| l == "@ENGRAM.md")); // not glued onto "rules"
     }
 
@@ -857,8 +865,10 @@ mod tests {
 
     fn no_import_args(dir: &std::path::Path) -> Vec<String> {
         vec![
-            "--dir".to_string(), dir.to_str().unwrap().to_string(),
-            "--project".to_string(), "demo".to_string(),
+            "--dir".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--project".to_string(),
+            "demo".to_string(),
             "--no-import".to_string(),
         ]
     }

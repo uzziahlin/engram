@@ -34,7 +34,11 @@ pub fn top_k_cosine(query: &[f32], candidates: &[(String, Vec<f32>)], k: usize) 
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(x.0.cmp(&y.0))
     });
-    scored.into_iter().take(k).map(|(_, id, _)| id.clone()).collect()
+    scored
+        .into_iter()
+        .take(k)
+        .map(|(_, id, _)| id.clone())
+        .collect()
 }
 
 #[cfg(test)]

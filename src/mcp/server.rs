@@ -413,19 +413,31 @@ impl DefaultMemoryProvider {
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".engram/models")
-                .join(config.semantic.model_id.rsplit('/').next().unwrap_or("model"))
+                .join(
+                    config
+                        .semantic
+                        .model_id
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("model"),
+                )
         });
         // Only auto-fetch when no explicit path was given (air-gapped users
         // provide model_path and we never touch the network).
         if config.semantic.model_path.is_none() {
             if let Err(e) = ensure_model(&config.semantic.model_id, &dir) {
-                tracing::warn!("semantic enabled but model fetch failed ({e}); disabling semantic search");
+                tracing::warn!(
+                    "semantic enabled but model fetch failed ({e}); disabling semantic search"
+                );
                 return None;
             }
         }
         match CandleBertEmbedder::from_local(&dir, &config.semantic.model_id) {
             Ok(e) => {
-                tracing::info!("semantic search enabled: model {}", config.semantic.model_id);
+                tracing::info!(
+                    "semantic search enabled: model {}",
+                    config.semantic.model_id
+                );
                 Some(Box::new(e))
             }
             Err(e) => {
@@ -442,10 +454,14 @@ impl DefaultMemoryProvider {
         if let Some(e) = self.embedder.as_ref() {
             match e.embed(&[text]) {
                 Ok(v) if !v.is_empty() => {
-                    if let Err(err) = self
-                        .repo
-                        .upsert_embedding(id, memory_type, project_id, &v[0], e.model_id(), e.dim())
-                    {
+                    if let Err(err) = self.repo.upsert_embedding(
+                        id,
+                        memory_type,
+                        project_id,
+                        &v[0],
+                        e.model_id(),
+                        e.dim(),
+                    ) {
                         tracing::warn!("upsert_embedding failed for {id}: {err}");
                     }
                 }
@@ -541,16 +557,52 @@ impl DefaultMemoryProvider {
             ..Default::default()
         };
         for m in self.repo.list_active_episodic(project)? {
-            self.reindex_one(&mut report, &already, "episodic", &m.id, &m.project_id, m.embedding_text(), force, dry_run);
+            self.reindex_one(
+                &mut report,
+                &already,
+                "episodic",
+                &m.id,
+                &m.project_id,
+                m.embedding_text(),
+                force,
+                dry_run,
+            );
         }
         for m in self.repo.list_active_decision(project)? {
-            self.reindex_one(&mut report, &already, "decision", &m.id, &m.project_id, m.embedding_text(), force, dry_run);
+            self.reindex_one(
+                &mut report,
+                &already,
+                "decision",
+                &m.id,
+                &m.project_id,
+                m.embedding_text(),
+                force,
+                dry_run,
+            );
         }
         for m in self.repo.list_active_failure(project)? {
-            self.reindex_one(&mut report, &already, "failure", &m.id, &m.project_id, m.embedding_text(), force, dry_run);
+            self.reindex_one(
+                &mut report,
+                &already,
+                "failure",
+                &m.id,
+                &m.project_id,
+                m.embedding_text(),
+                force,
+                dry_run,
+            );
         }
         for m in self.repo.list_active_procedural(project)? {
-            self.reindex_one(&mut report, &already, "procedural", &m.id, &m.project_id, m.embedding_text(), force, dry_run);
+            self.reindex_one(
+                &mut report,
+                &already,
+                "procedural",
+                &m.id,
+                &m.project_id,
+                m.embedding_text(),
+                force,
+                dry_run,
+            );
         }
         tracing::info!(
             "reindex: total={} embedded={} skipped={} failed={} dry_run={}",
@@ -591,7 +643,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                 if let Ok(mut qv) = e.embed(&[input.query.as_str()]) {
                     if !qv.is_empty() {
                         let qvec = qv.remove(0);
-                        let loaded = repo.load_active_embeddings(&input.project_id, e.model_id())?;
+                        let loaded =
+                            repo.load_active_embeddings(&input.project_id, e.model_id())?;
                         let type_of: std::collections::HashMap<String, String> = loaded
                             .iter()
                             .map(|(id, ty, _)| (id.clone(), ty.clone()))
@@ -618,7 +671,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                         for sr in BM25Retriever::fetch_by_ids(repo, &missing)? {
                             by_id.entry(sr.id.clone()).or_insert(sr);
                         }
-                        results = fused.into_iter().filter_map(|id| by_id.remove(&id)).collect();
+                        results = fused
+                            .into_iter()
+                            .filter_map(|id| by_id.remove(&id))
+                            .collect();
                     }
                 }
             }
@@ -1088,13 +1144,16 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         for kind in kinds {
             if input.apply {
-                let ids = repo.archive_batch(kind, &input.project_id, &input.tags, input.before, now)?;
+                let ids =
+                    repo.archive_batch(kind, &input.project_id, &input.tags, input.before, now)?;
                 for id in ids {
                     matched.push(serde_json::json!({ "id": id, "memory_type": kind.as_str() }));
                 }
             } else {
                 // dry-run: list candidates without mutating.
-                for row in repo.list_active_candidates(kind, &input.project_id, &input.tags, input.before)? {
+                for row in
+                    repo.list_active_candidates(kind, &input.project_id, &input.tags, input.before)?
+                {
                     matched.push(serde_json::json!({ "id": row, "memory_type": kind.as_str() }));
                 }
             }
@@ -1274,7 +1333,10 @@ impl McpServer {
     }
 
     pub fn with_provider(provider: Arc<dyn MemoryToolProvider>) -> Self {
-        Self::with_provider_and_workers(provider, crate::config::McpConfig::default().worker_threads)
+        Self::with_provider_and_workers(
+            provider,
+            crate::config::McpConfig::default().worker_threads,
+        )
     }
 
     /// Build a server with a specific worker-thread count for the request loop.
@@ -1870,10 +1932,7 @@ mod tests {
         let query = "login keeps failing and re-authenticating";
 
         // Build a provider with the given semantic flag and seed both memories.
-        fn seed(
-            enabled: bool,
-            mems: &[(&str, &str)],
-        ) -> DefaultMemoryProvider {
+        fn seed(enabled: bool, mems: &[(&str, &str)]) -> DefaultMemoryProvider {
             let repo = MemoryRepository::new_in_memory().unwrap();
             repo.initialize_schema().unwrap();
             let mut config = Config::default();
@@ -1896,10 +1955,7 @@ mod tests {
             provider
         }
 
-        let mems = [
-            (summary, content),
-            (distractor_summary, distractor_content),
-        ];
+        let mems = [(summary, content), (distractor_summary, distractor_content)];
         let recalled = |v: &serde_json::Value| -> bool {
             v["results"]
                 .as_array()
@@ -2160,10 +2216,19 @@ mod tests {
         let results = out["results"].as_array().unwrap();
         assert!(!results.is_empty(), "should have at least one result");
         let first = &results[0];
-        assert!(first.get("importance").is_some(), "result must expose importance");
+        assert!(
+            first.get("importance").is_some(),
+            "result must expose importance"
+        );
         // episodic importance=0.8 should map through (passthrough, clamped)
-        let imp = first["importance"].as_f64().expect("importance must be a number");
-        assert!((imp - 0.8).abs() < 1e-6, "importance should be 0.8, got {}", imp);
+        let imp = first["importance"]
+            .as_f64()
+            .expect("importance must be a number");
+        assert!(
+            (imp - 0.8).abs() < 1e-6,
+            "importance should be 0.8, got {}",
+            imp
+        );
     }
 
     #[test]
@@ -2743,7 +2808,7 @@ mod tests {
     #[test]
     fn test_forget_and_restore_memory_tools() {
         let provider = make_provider(); // 既有测试若无此 helper，见下方 3e
-        // 先写一条 episodic。
+                                        // 先写一条 episodic。
         let created = provider
             .create_episodic(CreateEpisodicInput {
                 project_id: "p".into(),
@@ -2822,7 +2887,11 @@ mod tests {
         assert_eq!(dry["applied"], serde_json::json!(false));
         assert_eq!(
             provider
-                .list_archived(ListArchivedInput { project_id: "p".into(), memory_type: Some("episodic".into()), limit: 10 })
+                .list_archived(ListArchivedInput {
+                    project_id: "p".into(),
+                    memory_type: Some("episodic".into()),
+                    limit: 10
+                })
                 .unwrap()["archived"]
                 .as_array()
                 .unwrap()
@@ -2842,7 +2911,11 @@ mod tests {
             .unwrap();
         assert_eq!(applied["applied"], serde_json::json!(true));
         let listed = provider
-            .list_archived(ListArchivedInput { project_id: "p".into(), memory_type: Some("episodic".into()), limit: 10 })
+            .list_archived(ListArchivedInput {
+                project_id: "p".into(),
+                memory_type: Some("episodic".into()),
+                limit: 10,
+            })
             .unwrap();
         assert_eq!(listed["archived"].as_array().unwrap().len(), 2);
     }
@@ -2883,8 +2956,16 @@ mod tests {
         assert_eq!(groups, 1);
         assert_eq!(
             provider
-                .search_memory(SearchMemoryInput { project_id: "p".into(), query: "dup".into(), memory_type: Some("episodic".into()), limit: 10 })
-                .unwrap()["results"].as_array().unwrap().len(),
+                .search_memory(SearchMemoryInput {
+                    project_id: "p".into(),
+                    query: "dup".into(),
+                    memory_type: Some("episodic".into()),
+                    limit: 10
+                })
+                .unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .len(),
             2
         );
     }

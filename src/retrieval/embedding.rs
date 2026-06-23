@@ -125,10 +125,14 @@ mod tests {
             .unwrap()
             .join(".engram/models/all-MiniLM-L6-v2");
         ensure_model("sentence-transformers/all-MiniLM-L6-v2", &dir).unwrap();
-        let e = CandleBertEmbedder::from_local(&dir, "sentence-transformers/all-MiniLM-L6-v2").unwrap();
+        let e =
+            CandleBertEmbedder::from_local(&dir, "sentence-transformers/all-MiniLM-L6-v2").unwrap();
         let v = e.embed(&["hello world"]).unwrap();
         assert_eq!(v[0].len(), e.dim());
         let norm: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-3, "must be L2-normalized, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "must be L2-normalized, got {norm}"
+        );
     }
 }

@@ -205,16 +205,40 @@ impl BM25Retriever {
         for (memory_type, id) in ids {
             let mut sr = match memory_type.as_str() {
                 "episodic" => repo.get_episodic(id)?.map(|m| {
-                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "episodic")
+                    Self::to_results(
+                        vec![ScoredMemory {
+                            memory: m,
+                            bm25_score: 0.0,
+                        }],
+                        "episodic",
+                    )
                 }),
                 "decision" => repo.get_decision(id)?.map(|m| {
-                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "decision")
+                    Self::to_results(
+                        vec![ScoredMemory {
+                            memory: m,
+                            bm25_score: 0.0,
+                        }],
+                        "decision",
+                    )
                 }),
                 "failure" => repo.get_failure(id)?.map(|m| {
-                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "failure")
+                    Self::to_results(
+                        vec![ScoredMemory {
+                            memory: m,
+                            bm25_score: 0.0,
+                        }],
+                        "failure",
+                    )
                 }),
                 "procedural" => repo.get_procedural(id)?.map(|m| {
-                    Self::to_results(vec![ScoredMemory { memory: m, bm25_score: 0.0 }], "procedural")
+                    Self::to_results(
+                        vec![ScoredMemory {
+                            memory: m,
+                            bm25_score: 0.0,
+                        }],
+                        "procedural",
+                    )
                 }),
                 _ => None,
             };
@@ -229,51 +253,109 @@ impl BM25Retriever {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{EpisodicMemory, FailureMemory, DecisionMemory, ProceduralMemory};
+    use crate::models::{DecisionMemory, EpisodicMemory, FailureMemory, ProceduralMemory};
     use crate::storage::ScoredMemory;
 
     fn episodic(importance: f32) -> EpisodicMemory {
         EpisodicMemory {
-            id: "e1".into(), project_id: "p".into(), session_id: "s".into(),
-            summary: "sum".into(), content: "c".into(), files_touched: vec![],
-            related_commits: vec![], importance, tags: vec![], created_at: 0, updated_at: 0,
+            id: "e1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "sum".into(),
+            content: "c".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
         }
     }
     fn failure(severity: u8) -> FailureMemory {
         FailureMemory {
-            id: "f1".into(), project_id: "p".into(), incident: "boom".into(),
-            root_cause: "rc".into(), fix: "fx".into(), prevention: "pv".into(),
-            severity, tags: vec![], created_at: 0, updated_at: 0,
+            id: "f1".into(),
+            project_id: "p".into(),
+            incident: "boom".into(),
+            root_cause: "rc".into(),
+            fix: "fx".into(),
+            prevention: "pv".into(),
+            severity,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
         }
     }
     fn decision() -> DecisionMemory {
         DecisionMemory {
-            id: "d1".into(), project_id: "p".into(), title: "t".into(), context: "ctx".into(),
-            rationale: "r".into(), tradeoffs: "to".into(), related_files: vec![], tags: vec![],
-            created_at: 0, updated_at: 0,
+            id: "d1".into(),
+            project_id: "p".into(),
+            title: "t".into(),
+            context: "ctx".into(),
+            rationale: "r".into(),
+            tradeoffs: "to".into(),
+            related_files: vec![],
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
         }
     }
     fn procedural() -> ProceduralMemory {
         ProceduralMemory {
-            id: "pr1".into(), project_id: "p".into(), workflow_name: "wf".into(),
-            steps: vec![], related_tools: vec![], tags: vec![], created_at: 0, updated_at: 0,
+            id: "pr1".into(),
+            project_id: "p".into(),
+            workflow_name: "wf".into(),
+            steps: vec![],
+            related_tools: vec![],
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
     #[test]
     fn importance_maps_per_type() {
         // episodic: passthrough
-        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: episodic(0.8), bm25_score: -1.0 }], "episodic");
+        let r = BM25Retriever::to_results(
+            vec![ScoredMemory {
+                memory: episodic(0.8),
+                bm25_score: -1.0,
+            }],
+            "episodic",
+        );
         assert!((r[0].importance - 0.8).abs() < 1e-6);
         // failure: severity / 5
-        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: failure(5), bm25_score: -1.0 }], "failure");
+        let r = BM25Retriever::to_results(
+            vec![ScoredMemory {
+                memory: failure(5),
+                bm25_score: -1.0,
+            }],
+            "failure",
+        );
         assert!((r[0].importance - 1.0).abs() < 1e-6);
-        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: failure(1), bm25_score: -1.0 }], "failure");
+        let r = BM25Retriever::to_results(
+            vec![ScoredMemory {
+                memory: failure(1),
+                bm25_score: -1.0,
+            }],
+            "failure",
+        );
         assert!((r[0].importance - 0.2).abs() < 1e-6);
         // decision / procedural: neutral 0.5
-        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: decision(), bm25_score: -1.0 }], "decision");
+        let r = BM25Retriever::to_results(
+            vec![ScoredMemory {
+                memory: decision(),
+                bm25_score: -1.0,
+            }],
+            "decision",
+        );
         assert!((r[0].importance - 0.5).abs() < 1e-6);
-        let r = BM25Retriever::to_results(vec![ScoredMemory { memory: procedural(), bm25_score: -1.0 }], "procedural");
+        let r = BM25Retriever::to_results(
+            vec![ScoredMemory {
+                memory: procedural(),
+                bm25_score: -1.0,
+            }],
+            "procedural",
+        );
         assert!((r[0].importance - 0.5).abs() < 1e-6);
     }
 }

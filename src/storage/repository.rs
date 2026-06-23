@@ -872,7 +872,11 @@ impl MemoryRepository {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         let mut matched = Vec::new();
         for row in rows {
@@ -956,8 +960,8 @@ impl MemoryRepository {
     /// Returns a HashSet of already-ingested commit hashes for O(1) lookup.
     pub fn get_ingested_commits(&self, project_id: &str) -> Result<HashSet<String>> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare("SELECT related_commits FROM episodic_memories WHERE project_id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT related_commits FROM episodic_memories WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         let mut hashes = HashSet::new();
         for row in rows {
@@ -1313,8 +1317,8 @@ impl MemoryRepository {
                 }
             }
             None => {
-                let mut stmt = conn
-                    .prepare("SELECT memory_id FROM memory_embeddings WHERE model_id = ?1")?;
+                let mut stmt =
+                    conn.prepare("SELECT memory_id FROM memory_embeddings WHERE model_id = ?1")?;
                 let rows = stmt.query_map(params![model_id], |r| r.get::<_, String>(0))?;
                 for r in rows {
                     set.insert(r?);
@@ -1732,7 +1736,10 @@ mod tests {
             "procedural_memories",
         ] {
             let sql = format!("SELECT archived_at FROM {t} LIMIT 0");
-            assert!(repo.connection().unwrap().prepare(&sql).is_ok(), "missing archived_at on {t}");
+            assert!(
+                repo.connection().unwrap().prepare(&sql).is_ok(),
+                "missing archived_at on {t}"
+            );
         }
     }
 
@@ -1765,11 +1772,17 @@ mod tests {
         repo.create_episodic(&mem).unwrap();
 
         // 归档命中。
-        assert!(repo.archive(MemoryKind::Episodic, &mem.id, "p1", now()).unwrap());
+        assert!(repo
+            .archive(MemoryKind::Episodic, &mem.id, "p1", now())
+            .unwrap());
         // 重复归档不命中。
-        assert!(!repo.archive(MemoryKind::Episodic, &mem.id, "p1", now()).unwrap());
+        assert!(!repo
+            .archive(MemoryKind::Episodic, &mem.id, "p1", now())
+            .unwrap());
         // 跨 project 不能恢复。
-        assert!(!repo.restore(MemoryKind::Episodic, &mem.id, "other").unwrap());
+        assert!(!repo
+            .restore(MemoryKind::Episodic, &mem.id, "other")
+            .unwrap());
         // 正确恢复命中。
         assert!(repo.restore(MemoryKind::Episodic, &mem.id, "p1").unwrap());
         // 已活跃再恢复不命中。
@@ -1778,7 +1791,10 @@ mod tests {
 
     #[test]
     fn test_memory_kind_from_type_str() {
-        assert_eq!(MemoryKind::from_type_str("failure").unwrap(), MemoryKind::Failure);
+        assert_eq!(
+            MemoryKind::from_type_str("failure").unwrap(),
+            MemoryKind::Failure
+        );
         assert!(MemoryKind::from_type_str("bogus").is_err());
     }
 
@@ -1862,7 +1878,13 @@ mod tests {
 
         // 按标签归档：只归档带 bootstrap 的 a、c。
         let ids = repo
-            .archive_batch(MemoryKind::Episodic, "p", &["bootstrap".to_string()], None, now())
+            .archive_batch(
+                MemoryKind::Episodic,
+                "p",
+                &["bootstrap".to_string()],
+                None,
+                now(),
+            )
             .unwrap();
         assert_eq!(ids.len(), 2);
         assert!(repo.get_episodic(&b.id).unwrap().is_some());
@@ -1895,7 +1917,10 @@ mod tests {
             updated_at: n,
         };
         repo.create_episodic(&mem).unwrap();
-        assert!(repo.list_archived(MemoryKind::Episodic, "p", 10).unwrap().is_empty());
+        assert!(repo
+            .list_archived(MemoryKind::Episodic, "p", 10)
+            .unwrap()
+            .is_empty());
         repo.archive(MemoryKind::Episodic, &mem.id, "p", n).unwrap();
         let rows = repo.list_archived(MemoryKind::Episodic, "p", 10).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1988,7 +2013,10 @@ mod tests {
         assert_eq!(repo.load_active_embeddings("p", "minilm").unwrap().len(), 1);
 
         repo.delete_embedding("m1").unwrap();
-        assert!(repo.load_active_embeddings("p", "minilm").unwrap().is_empty());
+        assert!(repo
+            .load_active_embeddings("p", "minilm")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2002,14 +2030,19 @@ mod tests {
 
         repo.archive(MemoryKind::Episodic, "m1", "p", 999).unwrap();
         assert!(
-            repo.load_active_embeddings("p", "minilm").unwrap().is_empty(),
+            repo.load_active_embeddings("p", "minilm")
+                .unwrap()
+                .is_empty(),
             "archived memory's embedding must be excluded from active set"
         );
 
         // different model_id is not matched
         repo.upsert_embedding("m1", "episodic", "p", &[0.1, 0.2, 0.3], "minilm", 3)
             .unwrap();
-        assert!(repo.load_active_embeddings("p", "other-model").unwrap().is_empty());
+        assert!(repo
+            .load_active_embeddings("p", "other-model")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2031,7 +2064,8 @@ mod tests {
         repo.create_episodic(&mk("a", "p1")).unwrap();
         repo.create_episodic(&mk("b", "p1")).unwrap();
         repo.create_episodic(&mk("c", "p2")).unwrap();
-        repo.archive(MemoryKind::Episodic, "b", "p1", now()).unwrap();
+        repo.archive(MemoryKind::Episodic, "b", "p1", now())
+            .unwrap();
 
         let all = repo.list_active_episodic(None).unwrap();
         assert_eq!(all.len(), 2, "active across projects (a,c); b archived");

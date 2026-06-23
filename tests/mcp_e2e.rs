@@ -68,7 +68,9 @@ fn unknown_tool_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
     let out = run_mcp(
         tmp.path(),
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}"#],
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}"#,
+        ],
     );
     assert!(
         out.contains("error") || out.contains("Unknown"),

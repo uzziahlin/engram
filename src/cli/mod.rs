@@ -70,7 +70,14 @@ mod tests {
 
     #[test]
     fn usage_lists_lifecycle_commands() {
-        for c in ["forget", "restore", "update", "forget-batch", "list-archived", "consolidate"] {
+        for c in [
+            "forget",
+            "restore",
+            "update",
+            "forget-batch",
+            "list-archived",
+            "consolidate",
+        ] {
             assert!(USAGE.contains(c), "USAGE missing {c}");
         }
     }

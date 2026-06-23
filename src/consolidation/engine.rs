@@ -78,7 +78,10 @@ impl ConsolidationEngine {
         // Exact duplicates by content hash.
         let mut by_hash: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, (_, text)) in recs.iter().enumerate() {
-            by_hash.entry(Self::content_hash(text, "")).or_default().push(i);
+            by_hash
+                .entry(Self::content_hash(text, ""))
+                .or_default()
+                .push(i);
         }
         for idxs in by_hash.values() {
             if idxs.len() > 1 {
@@ -145,7 +148,8 @@ impl ConsolidationEngine {
     ) -> Result<Vec<ConsolidationPlan>> {
         let mut plans = Vec::new();
         for &kind in kinds {
-            let mut plan = self.plan_for_kind(repo, project_id, kind, include_near_dup, threshold)?;
+            let mut plan =
+                self.plan_for_kind(repo, project_id, kind, include_near_dup, threshold)?;
             if apply {
                 let mut archived = 0;
                 for group in &plan.groups {
@@ -239,9 +243,17 @@ mod tests {
         let group = &plans[0].groups[0];
         // keeper 仍活跃，且必须是最早创建的那条（ts=100，而非 ts=200）。
         let keeper = repo.get_episodic(&group.keeper_id).unwrap().unwrap();
-        assert_eq!(keeper.created_at, 100, "keeper must be the earliest (ts=100)");
+        assert_eq!(
+            keeper.created_at, 100,
+            "keeper must be the earliest (ts=100)"
+        );
         assert_eq!(repo.search_episodic("same", "p", 10).unwrap().len(), 1);
-        assert_eq!(repo.list_archived(MemoryKind::Episodic, "p", 10).unwrap().len(), 1);
+        assert_eq!(
+            repo.list_archived(MemoryKind::Episodic, "p", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
