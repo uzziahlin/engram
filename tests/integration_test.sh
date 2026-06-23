@@ -6,6 +6,8 @@ set -euo pipefail
 
 ENGRAM="target/release/engram"
 DB_PATH="$HOME/.engram/memory.db"
+# Repo root for ingest_commits tests — derived, not hardcoded, so the suite is portable.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 PASS=0
 FAIL=0
 SKIP=0
@@ -186,14 +188,15 @@ subsection "1.2 tools/list 工具列表"
 REQ_LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 RESP=$(mcp_call "$REQ_LIST")
 TOOL_COUNT=$(echo "$RESP" | jq '.result.tools | length')
-if [ "$TOOL_COUNT" = "14" ]; then
-    assert_pass "1.2a 返回 14 个工具"
+# 工具集: 10 基础 + 1 collect_sources + 6 lifecycle = 17
+if [ "$TOOL_COUNT" = "17" ]; then
+    assert_pass "1.2a 返回 17 个工具"
 else
-    assert_fail "1.2a 返回 14 个工具 (actual=$TOOL_COUNT)"
+    assert_fail "1.2a 返回 17 个工具 (actual=$TOOL_COUNT)"
 fi
 
-# 验证所有工具名称
-EXPECTED_TOOLS=(search_memory related_files timeline recent_failures architectural_decisions create_episodic create_decision create_failure create_procedural ingest_commits delete_episodic delete_decision delete_failure delete_procedural)
+# 验证所有工具名称（delete_xxx 已替换为 forget_memory/restore_memory 等生命周期工具）
+EXPECTED_TOOLS=(search_memory related_files timeline recent_failures architectural_decisions create_episodic create_decision create_failure create_procedural ingest_commits collect_sources forget_memory restore_memory update_memory forget_batch list_archived consolidate_memories)
 ACTUAL_TOOLS=$(echo "$RESP" | jq -r '.result.tools[].name')
 for t in "${EXPECTED_TOOLS[@]}"; do
     if echo "$ACTUAL_TOOLS" | grep -qxF "$t"; then
@@ -203,10 +206,12 @@ for t in "${EXPECTED_TOOLS[@]}"; do
     fi
 done
 
-# 验证每个工具的 required 包含 project_id
-for i in $(seq 0 13); do
+# 验证每个工具的 inputSchema.required 包含 project_id
+# 注意: MCP 响应字段为 inputSchema（驼峰），不是 input_schema
+TOOL_LAST_IDX=$((TOOL_COUNT - 1))
+for i in $(seq 0 $TOOL_LAST_IDX); do
     TOOL_NAME=$(echo "$RESP" | jq -r ".result.tools[$i].name")
-    HAS_PID=$(echo "$RESP" | jq -r ".result.tools[$i].input_schema.required | index(\"project_id\") != null")
+    HAS_PID=$(echo "$RESP" | jq -r ".result.tools[$i].inputSchema.required | index(\"project_id\") != null")
     if [ "$HAS_PID" = "true" ]; then
         assert_pass "1.2c $TOOL_NAME requires project_id"
     else
@@ -231,7 +236,8 @@ assert_contains "1.5b error.message contains 'missing field'" "$RESP" ".error.me
 
 subsection "1.6 未知工具"
 RESP=$(mcp_call '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}')
-assert_eq       "1.6a error.code == -32603"    "$RESP" ".error.code" "-32603"
+# Unknown tool returns -32601 (Method not found) not -32603
+assert_eq       "1.6a error.code == -32601"    "$RESP" ".error.code" "-32601"
 assert_contains "1.6b error.message contains 'Unknown tool'" "$RESP" ".error.message" "Unknown tool"
 
 subsection "1.7 Notification 静默跳过"
@@ -323,7 +329,7 @@ assert_eq "2.4B 空步骤列表创建成功" "$TEXT" ".status" '"created"'
 
 subsection "2.5 ingest_commits"
 # 用例 A - 从真实仓库摄取
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"ingest_commits","arguments":{"project_id":"test-project","repo_path":".","count":5}}}')
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"ingest_commits","arguments":{"project_id":"test-project","repo_path":"'"$REPO_ROOT"'","count":5}}}')
 TEXT=$(extract_text "$RESP")
 INGESTED=$(echo "$TEXT" | jq -r '.ingested')
 if [ "$INGESTED" -ge 1 ] 2>/dev/null; then
@@ -536,58 +542,82 @@ TEXT=$(extract_text "$RESP")
 assert_gt "3.5B 带 topic 过滤返回匹配 decision" "$TEXT" ".decisions | length" "0"
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. 删除工具测试
+# 4. 生命周期工具测试（forget / restore）
 # ═══════════════════════════════════════════════════════════════════════
-section "4. 删除工具测试"
+section "4. 生命周期工具测试（forget / restore）"
 
-subsection "4.1 delete_episodic"
+subsection "4.1 forget_memory (episodic)"
 clean_db
 
-# 创建再删除
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"del-test","session_id":"s1","summary":"待删除的记录","content":"content"}}}')
+# 创建再归档（软删除）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"del-test","session_id":"s1","summary":"待归档的记录","content":"content"}}}')
 TEXT=$(extract_text "$RESP")
 DEL_ID=$(echo "$TEXT" | jq -r '.id')
 
-RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_episodic\",\"arguments\":{\"project_id\":\"del-test\",\"id\":\"$DEL_ID\"}}}")
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"episodic\",\"id\":\"$DEL_ID\"}}}")
 TEXT=$(extract_text "$RESP")
-assert_eq "4.1A-a 正常删除 status == deleted" "$TEXT" ".status" '"deleted"'
+assert_eq "4.1A-a forget_memory status == archived" "$TEXT" ".status" '"archived"'
 
-# 验证搜索不再找到
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"del-test","query":"待删除的记录"}}}')
+# 验证搜索不再找到（归档后排除）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"del-test","query":"待归档的记录"}}}')
 TEXT=$(extract_text "$RESP")
-assert_num_eq "4.1A-b 删除后搜索 total == 0" "$TEXT" ".total" "0"
+assert_num_eq "4.1A-b 归档后搜索 total == 0" "$TEXT" ".total" "0"
 
-# 删除不存在的记录
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{"name":"delete_episodic","arguments":{"project_id":"del-test","id":"nonexistent-uuid"}}}')
+# forget 不存在的记录（返回 not_found_or_already_archived）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{"name":"forget_memory","arguments":{"project_id":"del-test","memory_type":"episodic","id":"nonexistent-uuid"}}}')
 TEXT=$(extract_text "$RESP")
-assert_eq "4.1B 删除不存在 status == not_found" "$TEXT" ".status" '"not_found"'
+assert_eq "4.1B 归档不存在记录 status == not_found_or_already_archived" "$TEXT" ".status" '"not_found_or_already_archived"'
 
-subsection "4.2 delete_decision"
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{"name":"create_decision","arguments":{"project_id":"del-test","title":"待删除决策","context":"c","rationale":"r","tradeoffs":"t"}}}')
+subsection "4.2 forget_memory (decision)"
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{"name":"create_decision","arguments":{"project_id":"del-test","title":"待归档决策","context":"c","rationale":"r","tradeoffs":"t"}}}')
 TEXT=$(extract_text "$RESP")
 DEL_ID=$(echo "$TEXT" | jq -r '.id')
 
-RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_decision\",\"arguments\":{\"project_id\":\"del-test\",\"id\":\"$DEL_ID\"}}}")
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"decision\",\"id\":\"$DEL_ID\"}}}")
 TEXT=$(extract_text "$RESP")
-assert_eq "4.2 delete_decision status == deleted" "$TEXT" ".status" '"deleted"'
+assert_eq "4.2 forget_memory decision status == archived" "$TEXT" ".status" '"archived"'
 
-subsection "4.3 delete_failure"
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":76,"method":"tools/call","params":{"name":"create_failure","arguments":{"project_id":"del-test","incident":"待删除故障","root_cause":"r","fix":"f","prevention":"p","severity":3}}}')
+subsection "4.3 forget_memory (failure)"
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":76,"method":"tools/call","params":{"name":"create_failure","arguments":{"project_id":"del-test","incident":"待归档故障","root_cause":"r","fix":"f","prevention":"p","severity":3}}}')
 TEXT=$(extract_text "$RESP")
 DEL_ID=$(echo "$TEXT" | jq -r '.id')
 
-RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_failure\",\"arguments\":{\"project_id\":\"del-test\",\"id\":\"$DEL_ID\"}}}")
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"failure\",\"id\":\"$DEL_ID\"}}}")
 TEXT=$(extract_text "$RESP")
-assert_eq "4.3 delete_failure status == deleted" "$TEXT" ".status" '"deleted"'
+assert_eq "4.3 forget_memory failure status == archived" "$TEXT" ".status" '"archived"'
 
-subsection "4.4 delete_procedural"
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"create_procedural","arguments":{"project_id":"del-test","workflow_name":"待删除流程","steps":["step1"]}}}')
+subsection "4.4 forget_memory (procedural)"
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"create_procedural","arguments":{"project_id":"del-test","workflow_name":"待归档流程","steps":["step1"]}}}')
 TEXT=$(extract_text "$RESP")
 DEL_ID=$(echo "$TEXT" | jq -r '.id')
 
-RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":79,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_procedural\",\"arguments\":{\"project_id\":\"del-test\",\"id\":\"$DEL_ID\"}}}")
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":79,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"procedural\",\"id\":\"$DEL_ID\"}}}")
 TEXT=$(extract_text "$RESP")
-assert_eq "4.4 delete_procedural status == deleted" "$TEXT" ".status" '"deleted"'
+assert_eq "4.4 forget_memory procedural status == archived" "$TEXT" ".status" '"archived"'
+
+subsection "4.5 restore_memory"
+# 创建→归档→恢复
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"del-test","session_id":"s2","summary":"待恢复的记录","content":"restore me"}}}')
+TEXT=$(extract_text "$RESP")
+RESTORE_ID=$(echo "$TEXT" | jq -r '.id')
+
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"episodic\",\"id\":\"$RESTORE_ID\"}}}")
+TEXT=$(extract_text "$RESP")
+assert_eq "4.5-a forget 成功" "$TEXT" ".status" '"archived"'
+
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"restore_memory\",\"arguments\":{\"project_id\":\"del-test\",\"memory_type\":\"episodic\",\"id\":\"$RESTORE_ID\"}}}")
+TEXT=$(extract_text "$RESP")
+assert_eq "4.5-b restore_memory status == restored" "$TEXT" ".status" '"restored"'
+
+# 验证恢复后搜索可以找到
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":83,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"del-test","query":"待恢复的记录"}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "4.5-c 恢复后搜索 total >= 1" "$TEXT" ".total" "0"
+
+subsection "4.6 list_archived"
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":84,"method":"tools/call","params":{"name":"list_archived","arguments":{"project_id":"del-test","memory_type":"episodic"}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "4.6 list_archived 返回归档列表" "$TEXT" ".archived | length" "0"
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. 端到端链路测试
@@ -606,13 +636,13 @@ RESP=$(mcp_call '{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name"
 TEXT=$(extract_text "$RESP")
 assert_gt "5.1-b 搜索找到记录" "$TEXT" ".total" "0"
 
-RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_episodic\",\"arguments\":{\"project_id\":\"e2e-test\",\"id\":\"$E2E_ID\"}}}")
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"e2e-test\",\"memory_type\":\"episodic\",\"id\":\"$E2E_ID\"}}}")
 TEXT=$(extract_text "$RESP")
-assert_eq "5.1-c 删除成功" "$TEXT" ".status" '"deleted"'
+assert_eq "5.1-c forget 归档成功" "$TEXT" ".status" '"archived"'
 
 RESP=$(mcp_call '{"jsonrpc":"2.0","id":83,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"e2e-test","query":"E2E-UNIQUE-XYZ"}}}')
 TEXT=$(extract_text "$RESP")
-assert_num_eq "5.1-d 删除后搜索 total == 0" "$TEXT" ".total" "0"
+assert_num_eq "5.1-d 归档后搜索 total == 0" "$TEXT" ".total" "0"
 
 subsection "5.2 写入→related_files 图关系验证"
 RESP=$(mcp_call '{"jsonrpc":"2.0","id":84,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"e2e-test","session_id":"e2e","summary":"图关系测试","content":"content","files_touched":["src/graph_test.rs"]}}}')
@@ -643,11 +673,11 @@ assert_gt "5.3-b 能通过 tag 搜索到 decision" "$TEXT" ".total" "0"
 subsection "5.4 ingest_commits→搜索 验证"
 clean_db
 
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"ingest_commits","arguments":{"project_id":"e2e-test","repo_path":".","count":5}}}')
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"ingest_commits","arguments":{"project_id":"e2e-test","repo_path":"'"$REPO_ROOT"'","count":5}}}')
 TEXT=$(extract_text "$RESP")
 assert_gt "5.4-a ingest 成功" "$TEXT" ".ingested" "0"
 
-RESP=$(mcp_call '{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"e2e-test","query":"engram"}}}')
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"e2e-test","query":"feat"}}}')
 TEXT=$(extract_text "$RESP")
 assert_gt "5.4-b 搜索 ingest 内容成功" "$TEXT" ".total" "0"
 
@@ -780,6 +810,83 @@ RESP1=$(mcp_call '{"jsonrpc":"2.0","id":124,"method":"initialize","params":{"pro
 RESP2=$(mcp_call '{"jsonrpc":"2.0","id":125,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')
 assert_eq "6.6-a 第一次启动正常" "$RESP1" '.result.serverInfo.name' '"engram"'
 assert_eq "6.6-b 第二次启动正常 (幂等)" "$RESP2" '.result.serverInfo.name' '"engram"'
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. 端到端生命周期测试：create → forget → list-archived → restore
+# ═══════════════════════════════════════════════════════════════════════
+section "7. 端到端生命周期测试（forget/restore 完整链路）"
+
+subsection "7.1 episodic 遗忘/恢复完整链路"
+clean_db
+
+# Step 1: 创建 episodic 记忆
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"lifecycle-test","session_id":"lc-sess","summary":"ephemeral note LIFECYCLE-UNIQUE-ABC","content":"to be forgotten and restored","tags":["lifecycle"]}}}')
+TEXT=$(extract_text "$RESP")
+assert_eq "7.1-a 创建成功" "$TEXT" ".status" '"created"'
+LC_ID=$(echo "$TEXT" | jq -r '.id')
+
+# Step 2: 确认搜索可以找到
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"lifecycle-test","query":"LIFECYCLE-UNIQUE-ABC"}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "7.1-b 创建后可搜索" "$TEXT" ".total" "0"
+
+# Step 3: forget（归档/软删除）
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"tools/call\",\"params\":{\"name\":\"forget_memory\",\"arguments\":{\"project_id\":\"lifecycle-test\",\"memory_type\":\"episodic\",\"id\":\"$LC_ID\"}}}")
+TEXT=$(extract_text "$RESP")
+assert_eq "7.1-c forget 归档成功" "$TEXT" ".status" '"archived"'
+
+# Step 4: 确认 search 中消失
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"lifecycle-test","query":"LIFECYCLE-UNIQUE-ABC"}}}')
+TEXT=$(extract_text "$RESP")
+assert_num_eq "7.1-d 归档后搜索不到 (total == 0)" "$TEXT" ".total" "0"
+
+# Step 5: 确认出现在 list_archived 中（响应字段为 .archived 数组）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":204,"method":"tools/call","params":{"name":"list_archived","arguments":{"project_id":"lifecycle-test","memory_type":"episodic"}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "7.1-e 归档列表包含该记录" "$TEXT" ".archived | length" "0"
+LC_ARCHIVED_ID=$(echo "$TEXT" | jq -r ".archived[] | select(.id == \"$LC_ID\") | .id")
+if [ "$LC_ARCHIVED_ID" = "$LC_ID" ]; then
+    assert_pass "7.1-f 归档列表中能按 id 找到该记录"
+else
+    assert_fail "7.1-f 归档列表中找不到目标 id (expected=$LC_ID)"
+fi
+
+# Step 6: restore 恢复
+RESP=$(mcp_call "{\"jsonrpc\":\"2.0\",\"id\":205,\"method\":\"tools/call\",\"params\":{\"name\":\"restore_memory\",\"arguments\":{\"project_id\":\"lifecycle-test\",\"memory_type\":\"episodic\",\"id\":\"$LC_ID\"}}}")
+TEXT=$(extract_text "$RESP")
+assert_eq "7.1-g restore 恢复成功" "$TEXT" ".status" '"restored"'
+
+# Step 7: 确认 search 中重新出现
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":206,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"lifecycle-test","query":"LIFECYCLE-UNIQUE-ABC"}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "7.1-h 恢复后重新可搜索" "$TEXT" ".total" "0"
+
+subsection "7.2 forget_batch + list_archived 批量归档"
+clean_db
+
+# 创建两条带同一 tag 的记录
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":210,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"lifecycle-test","session_id":"batch-sess","summary":"batch item one BATCH-LIFECYCLE-TAG","content":"content one","tags":["batch-lifecycle-tag"]}}}')
+TEXT=$(extract_text "$RESP")
+assert_eq "7.2-a 创建 batch item 1" "$TEXT" ".status" '"created"'
+
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":211,"method":"tools/call","params":{"name":"create_episodic","arguments":{"project_id":"lifecycle-test","session_id":"batch-sess","summary":"batch item two BATCH-LIFECYCLE-TAG","content":"content two","tags":["batch-lifecycle-tag"]}}}')
+TEXT=$(extract_text "$RESP")
+assert_eq "7.2-b 创建 batch item 2" "$TEXT" ".status" '"created"'
+
+# 批量归档（apply=true）；响应字段为 .count（已归档数量）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":212,"method":"tools/call","params":{"name":"forget_batch","arguments":{"project_id":"lifecycle-test","memory_type":"episodic","tags":["batch-lifecycle-tag"],"apply":true}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "7.2-c forget_batch count >= 1" "$TEXT" ".count" "0"
+
+# 确认 search 中消失
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":213,"method":"tools/call","params":{"name":"search_memory","arguments":{"project_id":"lifecycle-test","query":"BATCH-LIFECYCLE-TAG"}}}')
+TEXT=$(extract_text "$RESP")
+assert_num_eq "7.2-d 批量归档后搜索不到" "$TEXT" ".total" "0"
+
+# list_archived 应有记录（响应字段为 .archived 数组）
+RESP=$(mcp_call '{"jsonrpc":"2.0","id":214,"method":"tools/call","params":{"name":"list_archived","arguments":{"project_id":"lifecycle-test","memory_type":"episodic","limit":10}}}')
+TEXT=$(extract_text "$RESP")
+assert_gt "7.2-e list_archived 返回批量归档的记录" "$TEXT" ".archived | length" "0"
 
 # ═══════════════════════════════════════════════════════════════════════
 # 测试结果汇总
