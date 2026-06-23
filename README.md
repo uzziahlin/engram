@@ -62,14 +62,34 @@ The release binary is self-contained — SQLite is bundled and the git library i
 
 ### Build from Source (developers)
 
+Build locally and run the **same flow as the install script** — build → install to `~/.engram/bin` → init the database → configure detected MCP clients — via the bundled `Makefile`:
+
 ```bash
 git clone https://github.com/uzziahlin/engram.git
 cd engram
-cargo build --release
+make            # build → install → init → configure (equivalent to install.sh)
+```
 
-# The binary is at target/release/engram (engram.exe on Windows)
-# Optionally install system-wide:
-cargo install --path .
+Useful targets (run `make help` for the full list):
+
+| Command | What it does |
+|---|---|
+| `make` / `make all` | Build, install to `~/.engram/bin`, init the DB, configure MCP clients |
+| `make build` | Just compile the release binary |
+| `make install` | Build + copy the binary into `INSTALL_DIR` |
+| `make configure CLIENTS="claude cursor"` | (Re)configure only the listed MCP clients |
+| `make uninstall` | Remove the binary and engram entries from MCP configs (`PURGE=1` also deletes `~/.engram`) |
+| `make clean` | Remove cargo build artifacts |
+
+Overridable variables: `INSTALL_DIR` (default `~/.engram/bin`), `CLIENTS` (`auto`, or a space-separated subset of `claude cursor windsurf codex`), `DATA_DIR`, `PURGE`. The Makefile shares its install/configure logic with `install.sh` through `scripts/engram-common.sh`, so both paths behave identically.
+
+Prefer raw cargo? It still works:
+
+```bash
+cargo build --release    # binary lands in cargo's target dir (honors CARGO_TARGET_DIR)
+cargo install --path .   # or install system-wide into ~/.cargo/bin
+
+cargo build --release --features semantic   # opt-in: local embedding semantic search (larger binary; see [semantic] config)
 ```
 
 Requires Rust 1.75+ and a C compiler (only for the bundled SQLite via `rusqlite`; the git layer is pure-Rust `gix`). No external databases or services needed.
@@ -77,8 +97,9 @@ Requires Rust 1.75+ and a C compiler (only for the bundled SQLite via `rusqlite`
 ### Verify
 
 ```bash
+# smoke-test the binary — prints usage, no DB or --project needed
 engram --help
-# or run as MCP server (stdio):
+# run as the MCP server (stdio) — this is what your editor launches with no args:
 engram
 ```
 
@@ -120,6 +141,15 @@ When to read:
 - Before modifying files → related_files
 - When needing project context → architectural_decisions
 ```
+
+Instead of hand-writing the memory guidelines above, generate them per project:
+
+```bash
+engram init-guide            # writes ENGRAM.md (project_id defaults to the dir name)
+                             # then asks whether to add `@ENGRAM.md` to CLAUDE.md
+```
+
+`@ENGRAM.md` uses Claude Code's import syntax, so the guide loads with your `CLAUDE.md`.
 
 ### Cursor
 
@@ -207,6 +237,17 @@ All tools require a `project_id` parameter for multi-project isolation.
 | `ingest_commits` | Auto-generate episodic memories from git history | `repo_path`, `count`, `project_id` |
 | `collect_sources` | Gather structured evidence from a project for bootstrap (no writes) | `repo_path`, `dimensions`, `max_commits`, `project_id` |
 
+### Lifecycle Tools
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `forget_memory` | Soft-delete (archive) a memory; reversible | `project_id`, `memory_type`, `id` |
+| `restore_memory` | Un-archive a memory | `project_id`, `memory_type`, `id` |
+| `update_memory` | Patch fields of an existing memory | `project_id`, `memory_type`, `id`, …fields |
+| `forget_batch` | Archive by tags/before date (dry-run by default) | `project_id`, `memory_type`, `tags`, `before`, `apply` |
+| `list_archived` | List archived (soft-deleted) memories | `project_id`, `memory_type`, `limit` |
+| `consolidate_memories` | Detect and archive near-duplicate memories (dry-run by default) | `project_id`, `include_near_dup`, `apply` |
+
 ### Prompts
 
 Engram also exposes MCP **prompts** (server-side templates any MCP client can fetch):
@@ -229,13 +270,23 @@ wal_mode = true                          # Write-Ahead Logging for performance
 [retrieval]
 default_limit = 10                       # Default search result count
 fallback_timeout_ms = 50                 # Timeout per memory source
-
+recency_half_life_days = 30              # Recency decay half-life (days) for reranking
 [context]
 context_window_tokens = 200000           # LLM context window size
 memory_budget_percent = 15               # % of context for memories
 
 [graph]
 max_nodes = 10000                        # Max graph nodes per project
+
+[mcp]
+worker_threads = 1                       # Concurrent request handlers (default 1 = FIFO sequential; raise only if your client pipelines independent requests)
+
+[semantic]                               # Semantic search — only active in builds compiled with --features semantic
+enabled = false                          # Turn on embedding-based retrieval
+model_id = "sentence-transformers/all-MiniLM-L6-v2"   # fetched once into ~/.engram/models on first run
+# model_path = "/path/to/model-dir"      # Air-gapped override: dir with config.json/tokenizer.json/model.safetensors
+rrf_k = 60                               # Reciprocal Rank Fusion constant (fuses BM25 + vector ranks)
+top_k = 50                               # Vector candidates fused with BM25
 ```
 
 Data is stored in `~/.engram/memory.db` by default.
@@ -272,6 +323,9 @@ Data is stored in `~/.engram/memory.db` by default.
 - **Dual-write pipeline** — main tables + FTS5 virtual tables in the same SQLite transaction
 - **Project isolation** — all memories scoped by `project_id`, supporting multi-project workflows
 - **BM25 via FTS5** — built into SQLite, no external search engine needed
+- **Ranking signals** — `search_memory` reranks BM25 results by recency (exponential half-life decay against the real clock), per-record `importance`, and a memory-type prior (`type_weight`). The relationship graph powers `related_files` only; it does **not** participate in search ranking.
+- **Connection pool + concurrency** — the repository uses an r2d2 pool over WAL-mode SQLite (multi-reader, single-writer via `busy_timeout`); concurrent reads no longer serialize. MCP request handling dispatches to a bounded worker pool (`[mcp] worker_threads`, default 1 = FIFO sequential — safe for stdio clients that pipeline dependent requests; raise only for independent workloads).
+- **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
 
 ---
 
@@ -280,22 +334,40 @@ Data is stored in `~/.engram/memory.db` by default.
 Engram also works as a command-line tool:
 
 ```bash
-# Search memories
-engram search "authentication refactor"
+# Search memories (query uses --query, not a positional arg)
+engram search --project myproj --query "authentication refactor"
 
 # Create memories
-engram create-episodic --summary "Fixed memory leak" --importance 0.7
-engram create-decision --title "Use SQLite" --rationale "Local-first, zero config"
-engram create-failure --incident "FTS5 crash" --severity 4
-engram create-procedural --name "deploy" --steps "test,build,push"
+engram create-episodic --project myproj --summary "Fixed memory leak" --importance 0.7
+engram create-decision --project myproj --title "Use SQLite" --context "local-first" --rationale "zero config"
+engram create-failure --project myproj --incident "FTS5 crash" --root-cause "..." --fix "..." --prevention "..." --severity 4
+engram create-procedural --project myproj --name "deploy" --steps "test,build,push"
 
 # Ingest git history
 engram ingest --project myproj --repo .
 
 # View history
-engram timeline --days 7
-engram recent-failures
-engram decisions
+engram timeline --project myproj --days 7
+engram recent-failures --project myproj
+engram decisions --project myproj
+
+# Generate an agent guide for this project (ENGRAM.md) and optionally import it
+engram init-guide --project myproj
+
+# Forget / restore / update individual memories
+engram forget --project myproj --type episodic --id <id>
+engram restore --project myproj --type episodic --id <id>
+engram update --project myproj --type failure --id <id> --set severity=5
+
+# Batch forget by tag (dry-run by default, add --apply to commit)
+engram forget-batch --project myproj --tag bootstrap          # preview
+engram forget-batch --project myproj --tag bootstrap --apply  # commit
+
+# List archived memories and deduplicate
+engram list-archived --project myproj
+engram consolidate --project myproj          # report exact duplicates (dry-run)
+engram consolidate --project myproj --near   # also report near-duplicates (fuzzy)
+engram consolidate --project myproj --apply  # archive duplicates
 ```
 
 ---
@@ -337,10 +409,10 @@ Re-running is idempotent — commits already stored as episodic memories are ski
 - [x] Git integration (auto-ingest commits)
 - [x] Project bootstrap (collect_sources + prompts)
 - [x] CLI interface
-- [ ] Memory consolidation (merge/deduplicate over time)
+- [x] Memory consolidation (dedup + soft-delete lifecycle: forget/restore/update)
+- [x] Embedding-based semantic search (candle + RRF fusion, behind the `semantic` feature)
 - [ ] Reflection engine (self-improving retrieval)
 - [ ] HTTP MCP transport (for remote access)
-- [ ] Embedding-based semantic search
 - [ ] Multi-agent memory sharing
 
 ---

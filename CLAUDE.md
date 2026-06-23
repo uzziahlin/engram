@@ -48,3 +48,4 @@ create_episodic(project_id="engram", session_id="<session>",
   files_touched=["src/storage/repository.rs"], tags=["fts5", "bugfix"],
   importance=0.7)
 ```
+@ENGRAM.md
