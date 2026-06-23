@@ -41,6 +41,7 @@ macro_rules! impl_memory_crud {
         update_fn = $update_fn:ident,
         delete_fn = $delete_fn:ident,
         search_fn = $search_fn:ident,
+        list_active_fn = $list_active_fn:ident,
 
         select_cols = $select_cols:literal,
         search_cols = $search_cols:literal,
@@ -58,7 +59,8 @@ macro_rules! impl_memory_crud {
     ) => {
         // ─── CREATE ──────────────────────────────────────────────
         pub fn $create_fn(&self, $mem: &$Struct) -> Result<()> {
-            let $tx = self.conn.unchecked_transaction()?;
+            let conn = self.conn()?;
+            let $tx = conn.unchecked_transaction()?;
             $tx.execute($insert_sql, $($insert_params)*)?;
             $tx.execute($fts_insert_sql, $($fts_params)*)?;
             $($entity_link)*
@@ -68,7 +70,8 @@ macro_rules! impl_memory_crud {
 
         // ─── GET ─────────────────────────────────────────────────
         pub fn $get_fn(&self, id: &str) -> Result<Option<$Struct>> {
-            let mut stmt = self.conn.prepare(concat!(
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(concat!(
                 "SELECT ", $select_cols, " FROM ", $table, " WHERE id = ?1"
             ))?;
             let $row = stmt.query_row(params![id], |$row| {
@@ -79,7 +82,8 @@ macro_rules! impl_memory_crud {
 
         // ─── UPDATE ──────────────────────────────────────────────
         pub fn $update_fn(&self, $mem: &$Struct) -> Result<()> {
-            let $tx = self.conn.unchecked_transaction()?;
+            let conn = self.conn()?;
+            let $tx = conn.unchecked_transaction()?;
             $tx.execute($update_sql, $($update_params)*)?;
             // FTS5: delete-then-insert
             $tx.execute(
@@ -93,7 +97,8 @@ macro_rules! impl_memory_crud {
 
         // ─── DELETE ──────────────────────────────────────────────
         pub fn $delete_fn(&self, id: &str, project_id: &str) -> Result<bool> {
-            let $tx = self.conn.unchecked_transaction()?;
+            let conn = self.conn()?;
+            let $tx = conn.unchecked_transaction()?;
             let affected = $tx.execute(
                 concat!("DELETE FROM ", $table, " WHERE id = ?1 AND project_id = ?2"),
                 params![id, project_id],
@@ -122,11 +127,12 @@ macro_rules! impl_memory_crud {
             &self, query: &str, project_id: &str, limit: usize,
         ) -> Result<Vec<ScoredMemory<$Struct>>> {
             let fts_query = Self::sanitize_fts_query(query);
-            let mut stmt = self.conn.prepare(concat!(
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(concat!(
                 "SELECT ", $search_cols, ", bm25(", $fts_table, ") as score",
                 " FROM ", $fts_table, " f",
                 " JOIN ", $table, " m ON f.memory_id = m.id",
-                " WHERE ", $fts_table, " MATCH ?1 AND m.project_id = ?2",
+                " WHERE ", $fts_table, " MATCH ?1 AND m.project_id = ?2 AND m.archived_at IS NULL",
                 " ORDER BY f.rank LIMIT ?3"
             ))?;
             let rows = stmt.query_map(params![fts_query, project_id, limit], |$row| {
@@ -138,6 +144,35 @@ macro_rules! impl_memory_crud {
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
+            }
+            Ok(results)
+        }
+
+        // ─── LIST ACTIVE (plain SELECT, no FTS) — for reindex/backfill ──
+        pub fn $list_active_fn(&self, project: Option<&str>) -> Result<Vec<$Struct>> {
+            let conn = self.conn()?;
+            let mut results = Vec::new();
+            match project {
+                Some(p) => {
+                    let mut stmt = conn.prepare(concat!(
+                        "SELECT ", $select_cols, " FROM ", $table,
+                        " WHERE archived_at IS NULL AND project_id = ?1 ORDER BY created_at"
+                    ))?;
+                    let rows = stmt.query_map(params![p], |$row| Ok($($row_mapper)*))?;
+                    for r in rows {
+                        results.push(r?);
+                    }
+                }
+                None => {
+                    let mut stmt = conn.prepare(concat!(
+                        "SELECT ", $select_cols, " FROM ", $table,
+                        " WHERE archived_at IS NULL ORDER BY created_at"
+                    ))?;
+                    let rows = stmt.query_map([], |$row| Ok($($row_mapper)*))?;
+                    for r in rows {
+                        results.push(r?);
+                    }
+                }
             }
             Ok(results)
         }
