@@ -14,6 +14,8 @@ pub struct Config {
     pub graph: GraphConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub semantic: SemanticConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +113,29 @@ mod tests {
             "tilde must be expanded to an absolute home path"
         );
     }
+
+    #[test]
+    fn retrieval_half_life_defaults_to_30_days() {
+        assert_eq!(RetrievalConfig::default().recency_half_life_days, 30);
+    }
+
+    #[test]
+    fn mcp_worker_threads_defaults_to_1() {
+        // Default 1 = sequential request processing (safe for stdio MCP where
+        // a single client pipelines dependent requests, e.g. create-then-search).
+        // Raising worker_threads opts into concurrent processing.
+        assert_eq!(McpConfig::default().worker_threads, 1);
+    }
+
+    #[test]
+    fn semantic_defaults_off_with_minilm() {
+        let c = SemanticConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.model_id, "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(c.rrf_k, 60.0);
+        assert_eq!(c.top_k, 50);
+        assert!(c.model_path.is_none());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +146,8 @@ pub struct RetrievalConfig {
     pub fallback_timeout_ms: u64,
     #[serde(default = "RetrievalConfig::default_fallback_max_results")]
     pub fallback_max_results: usize,
+    #[serde(default = "RetrievalConfig::default_recency_half_life_days")]
+    pub recency_half_life_days: u64,
 }
 
 impl Default for RetrievalConfig {
@@ -129,6 +156,7 @@ impl Default for RetrievalConfig {
             default_limit: Self::default_limit(),
             fallback_timeout_ms: Self::default_fallback_timeout_ms(),
             fallback_max_results: Self::default_fallback_max_results(),
+            recency_half_life_days: Self::default_recency_half_life_days(),
         }
     }
 }
@@ -142,6 +170,9 @@ impl RetrievalConfig {
     }
     fn default_fallback_max_results() -> usize {
         100
+    }
+    fn default_recency_half_life_days() -> u64 {
+        30
     }
 }
 
@@ -201,12 +232,15 @@ impl GraphConfig {
 pub struct McpConfig {
     #[serde(default = "McpConfig::default_transport")]
     pub transport: String,
+    #[serde(default = "McpConfig::default_worker_threads")]
+    pub worker_threads: usize,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: Self::default_transport(),
+            worker_threads: Self::default_worker_threads(),
         }
     }
 }
@@ -214,6 +248,51 @@ impl Default for McpConfig {
 impl McpConfig {
     fn default_transport() -> String {
         "stdio".to_string()
+    }
+    fn default_worker_threads() -> usize {
+        1
+    }
+}
+
+/// Semantic / embedding retrieval config. Disabled by default to keep the
+/// release binary self-contained; only takes effect with `--features semantic`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "SemanticConfig::default_model_id")]
+    pub model_id: String,
+    /// Override model directory (air-gapped / user-provided). When None, the
+    /// model is fetched on first run into `~/.engram/models/<model_id>`.
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
+    #[serde(default = "SemanticConfig::default_rrf_k")]
+    pub rrf_k: f32,
+    #[serde(default = "SemanticConfig::default_top_k")]
+    pub top_k: usize,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_id: Self::default_model_id(),
+            model_path: None,
+            rrf_k: Self::default_rrf_k(),
+            top_k: Self::default_top_k(),
+        }
+    }
+}
+
+impl SemanticConfig {
+    fn default_model_id() -> String {
+        "sentence-transformers/all-MiniLM-L6-v2".to_string()
+    }
+    fn default_rrf_k() -> f32 {
+        60.0
+    }
+    fn default_top_k() -> usize {
+        50
     }
 }
 

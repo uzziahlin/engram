@@ -40,11 +40,12 @@ fn run_mcp_server() -> anyhow::Result<()> {
     let graph = GraphEngine::new();
     tracing::info!("Graph engine initialized");
 
+    let worker_threads = config.mcp.worker_threads;
     let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
 
-    let server = McpServer::with_provider(provider);
-    tracing::info!("Starting engram MCP server on stdio...");
-    server.run()?;
+    let server = McpServer::with_provider_and_workers(provider, worker_threads);
+    tracing::info!("Starting engram MCP server on stdio ({worker_threads} workers)...");
+    Arc::new(server).run()?;
 
     Ok(())
 }

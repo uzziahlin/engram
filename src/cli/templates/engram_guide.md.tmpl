@@ -1,0 +1,24 @@
+# Engram Memory — Agent Guide
+
+This project uses **engram**, a local MCP memory server, for long-term
+engineering memory. Its tools are in your MCP tool list — use them
+proactively, don't wait to be asked. Every call needs project_id: "{{PROJECT_ID}}".
+
+**Session rhythm:** before starting a task, search_memory for prior context;
+after finishing meaningful work, write the matching memory below.
+
+## When to WRITE
+- Finished a feature/task → create_episodic
+  (set files_touched; importance: small fix ~0.3, core feature ≥0.7)
+- Made a design/architecture decision → create_decision (context, rationale, tradeoffs)
+- Fixed a bug or resolved an incident → create_failure (root_cause, fix, prevention; severity 1–5)
+- Established a workflow/convention → create_procedural (steps)
+
+## When to READ
+- Before a new task → search_memory
+- Before modifying a file → related_files
+- Need design background → architectural_decisions
+- Avoid repeating past bugs → recent_failures
+
+Full parameter schemas come from MCP; this guide covers *when* to use each tool
+and project conventions. All tools require project_id = "{{PROJECT_ID}}".

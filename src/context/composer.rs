@@ -126,7 +126,7 @@ impl ContextComposer {
                 "[{}] {} (score: {:.2}, {})",
                 result.memory_type,
                 result.summary,
-                result.relevance_score,
+                result.relevance_score.clamp(0.0, 1.0),
                 format_timestamp(result.created_at),
             );
 
@@ -258,6 +258,7 @@ mod tests {
                 },
                 summary: format!("Test result number {i}"),
                 relevance_score: 0.5 + (i as f32 * 0.02),
+                importance: 0.5,
                 created_at: 1716940800 + i as i64 * 1000,
             })
             .collect();
@@ -279,6 +280,7 @@ mod tests {
                 memory_type: "procedural".into(),
                 summary: "deployment workflow".into(),
                 relevance_score: 0.9,
+                importance: 0.5,
                 created_at: 1000,
             },
             SearchResult {
@@ -286,6 +288,7 @@ mod tests {
                 memory_type: "failure".into(),
                 summary: "auth outage".into(),
                 relevance_score: 0.5,
+                importance: 0.5,
                 created_at: 2000,
             },
             SearchResult {
@@ -293,6 +296,7 @@ mod tests {
                 memory_type: "decision".into(),
                 summary: "use redis".into(),
                 relevance_score: 0.7,
+                importance: 0.5,
                 created_at: 1500,
             },
         ];
@@ -317,6 +321,7 @@ mod tests {
                 memory_type: "failure".into(),
                 summary: "first copy".into(),
                 relevance_score: 0.9,
+                importance: 0.5,
                 created_at: 1000,
             },
             SearchResult {
@@ -324,6 +329,7 @@ mod tests {
                 memory_type: "failure".into(),
                 summary: "duplicate".into(),
                 relevance_score: 0.8,
+                importance: 0.5,
                 created_at: 1000,
             },
             SearchResult {
@@ -331,6 +337,7 @@ mod tests {
                 memory_type: "decision".into(),
                 summary: "unique entry".into(),
                 relevance_score: 0.7,
+                importance: 0.5,
                 created_at: 2000,
             },
         ];

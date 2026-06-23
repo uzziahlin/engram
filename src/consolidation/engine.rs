@@ -1,6 +1,23 @@
-use crate::storage::MemoryRepository;
+use crate::storage::{MemoryKind, MemoryRepository};
 use anyhow::Result;
-use std::collections::HashSet;
+use rusqlite::params;
+use std::collections::{HashMap, HashSet};
+
+/// One group of duplicate memories: keeper kept active, others to be archived.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsolidationGroup {
+    pub keeper_id: String,
+    pub duplicate_ids: Vec<String>,
+    pub reason: String,
+}
+
+/// Consolidation result for a single memory kind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsolidationPlan {
+    pub memory_type: String,
+    pub groups: Vec<ConsolidationGroup>,
+    pub archived: usize,
+}
 
 /// Consolidation engine (MVP stub).
 /// Basic rule-based deduplication: content hash + time-window merging.
@@ -29,38 +46,120 @@ impl ConsolidationEngine {
         format!("{:016x}", hash)
     }
 
-    /// Deduplicate episodic memories by content hash within a project.
-    /// Returns the IDs of duplicates found.
-    pub fn deduplicate_episodic(
+    /// Build a consolidation plan for one kind: groups of exact (and optionally
+    /// near-) duplicate active memories. keeper = earliest created. Does NOT mutate.
+    pub fn plan_for_kind(
         &self,
         repo: &MemoryRepository,
         project_id: &str,
-    ) -> Result<Vec<String>> {
-        let conn = repo.connection();
-        let mut stmt = conn.prepare(
-            "SELECT id, summary, content FROM episodic_memories WHERE project_id = ?1 ORDER BY created_at ASC",
-        )?;
+        kind: MemoryKind,
+        include_near_dup: bool,
+        threshold: f64,
+    ) -> Result<ConsolidationPlan> {
+        // (id, created_at, canonical_text) for active memories, oldest first.
+        let sql = format!(
+            "SELECT id, created_at, {} AS dedup_text FROM {} \
+             WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
+            kind.dedup_text_expr(),
+            kind.table()
+        );
+        let conn = repo.connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let recs: Vec<(String, String)> = stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
 
-        let mut seen_hashes = HashSet::new();
-        let mut duplicates = Vec::new();
+        let mut grouped: HashSet<usize> = HashSet::new();
+        let mut groups: Vec<ConsolidationGroup> = Vec::new();
 
-        let rows = stmt.query_map(rusqlite::params![project_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (id, summary, content) = row?;
-            let hash = Self::content_hash(&summary, &content);
-            if !seen_hashes.insert(hash) {
-                duplicates.push(id);
+        // Exact duplicates by content hash.
+        let mut by_hash: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, (_, text)) in recs.iter().enumerate() {
+            by_hash.entry(Self::content_hash(text, "")).or_default().push(i);
+        }
+        for idxs in by_hash.values() {
+            if idxs.len() > 1 {
+                let keeper = idxs[0]; // earliest (recs sorted asc)
+                let dups: Vec<String> = idxs[1..].iter().map(|&j| recs[j].0.clone()).collect();
+                for &j in idxs {
+                    grouped.insert(j);
+                }
+                groups.push(ConsolidationGroup {
+                    keeper_id: recs[keeper].0.clone(),
+                    duplicate_ids: dups,
+                    reason: "exact".into(),
+                });
             }
         }
 
-        Ok(duplicates)
+        // Optional near-duplicates among the still-ungrouped, by Jaccard.
+        if include_near_dup {
+            let remaining: Vec<usize> = (0..recs.len()).filter(|i| !grouped.contains(i)).collect();
+            for (pos, &a) in remaining.iter().enumerate() {
+                if grouped.contains(&a) {
+                    continue;
+                }
+                let mut dups = Vec::new();
+                for &b in &remaining[pos + 1..] {
+                    if grouped.contains(&b) {
+                        continue;
+                    }
+                    if Self::jaccard_similarity(&recs[a].1, &recs[b].1, threshold) {
+                        dups.push(recs[b].0.clone());
+                        grouped.insert(b);
+                    }
+                }
+                if !dups.is_empty() {
+                    grouped.insert(a);
+                    groups.push(ConsolidationGroup {
+                        keeper_id: recs[a].0.clone(),
+                        duplicate_ids: dups,
+                        reason: format!("near(jaccard>={threshold})"),
+                    });
+                }
+            }
+        }
+
+        Ok(ConsolidationPlan {
+            memory_type: kind.as_str().into(),
+            groups,
+            archived: 0,
+        })
+    }
+
+    /// Plan (and optionally apply) consolidation across the given kinds.
+    /// `apply=false` → dry-run (no mutation). `apply=true` → archive duplicates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consolidate(
+        &self,
+        repo: &MemoryRepository,
+        project_id: &str,
+        kinds: &[MemoryKind],
+        include_near_dup: bool,
+        threshold: f64,
+        apply: bool,
+        now: i64,
+    ) -> Result<Vec<ConsolidationPlan>> {
+        let mut plans = Vec::new();
+        for &kind in kinds {
+            let mut plan = self.plan_for_kind(repo, project_id, kind, include_near_dup, threshold)?;
+            if apply {
+                let mut archived = 0;
+                for group in &plan.groups {
+                    for dup_id in &group.duplicate_ids {
+                        if repo.archive(kind, dup_id, project_id, now)? {
+                            archived += 1;
+                        }
+                    }
+                }
+                plan.archived = archived;
+            }
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// Check if two texts are near-duplicates using Jaccard similarity.
@@ -87,6 +186,63 @@ impl ConsolidationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // MemoryKind/MemoryRepository come via `use super::*` once Step 3b adds the
+    // top-level import; only models need an explicit use here.
+    use crate::models::EpisodicMemory;
+
+    fn repo_with_dupes() -> MemoryRepository {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |summary: &str, content: &str, ts: i64| EpisodicMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: content.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: ts,
+            updated_at: ts,
+        };
+        // 两条完全相同（精确重复），keeper 应为更早的 ts=100。
+        repo.create_episodic(&mk("same", "body", 100)).unwrap();
+        repo.create_episodic(&mk("same", "body", 200)).unwrap();
+        // 一条独立。
+        repo.create_episodic(&mk("unique", "other", 300)).unwrap();
+        repo
+    }
+
+    #[test]
+    fn test_consolidate_dry_run_reports_but_does_not_archive() {
+        let repo = repo_with_dupes();
+        let engine = ConsolidationEngine::new();
+        let plans = engine
+            .consolidate(&repo, "p", &[MemoryKind::Episodic], false, 0.85, false, 999)
+            .unwrap();
+        // 一组精确重复，duplicate_ids 长度 1。
+        let groups: Vec<_> = plans.iter().flat_map(|p| &p.groups).collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].duplicate_ids.len(), 1);
+        // dry-run：数据未变，search 仍能搜到（两条 "same" 都在）。
+        assert_eq!(repo.search_episodic("same", "p", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_consolidate_apply_archives_duplicates_keeps_earliest() {
+        let repo = repo_with_dupes();
+        let engine = ConsolidationEngine::new();
+        let plans = engine
+            .consolidate(&repo, "p", &[MemoryKind::Episodic], false, 0.85, true, 999)
+            .unwrap();
+        let group = &plans[0].groups[0];
+        // keeper 仍活跃，且必须是最早创建的那条（ts=100，而非 ts=200）。
+        let keeper = repo.get_episodic(&group.keeper_id).unwrap().unwrap();
+        assert_eq!(keeper.created_at, 100, "keeper must be the earliest (ts=100)");
+        assert_eq!(repo.search_episodic("same", "p", 10).unwrap().len(), 1);
+        assert_eq!(repo.list_archived(MemoryKind::Episodic, "p", 10).unwrap().len(), 1);
+    }
 
     #[test]
     fn test_content_hash_deterministic() {
