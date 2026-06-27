@@ -271,6 +271,11 @@ wal_mode = true                          # Write-Ahead Logging for performance
 default_limit = 10                       # Default search result count
 fallback_timeout_ms = 50                 # Timeout per memory source
 recency_half_life_days = 30              # Recency decay half-life (days) for reranking
+intent_routing = true                    # Route search to only the memory types implied by intent (General searches all four); off = always query every type
+weight_relevance = 0.4                   # BM25 score weight in the final ranking
+weight_recency = 0.2                     # Base recency-decay weight (intents may raise it via max)
+weight_importance = 0.4                  # Base per-record importance weight (intents may raise it via max)
+weight_type = 0.4                        # Base memory-type prior weight (intents may raise it via max)
 [context]
 context_window_tokens = 200000           # LLM context window size
 memory_budget_percent = 15               # % of context for memories

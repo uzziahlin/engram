@@ -153,7 +153,7 @@ impl IntentClassifier {
         let mut intents = Vec::new();
 
         for (keyword, intent_list) in &self.keyword_map {
-            if lower.contains(keyword.as_str()) {
+            if Self::keyword_matches(&lower, keyword.as_str()) {
                 for intent in intent_list {
                     if !intents.contains(intent) {
                         intents.push(intent.clone());
@@ -167,6 +167,38 @@ impl IntentClassifier {
         } else {
             intents
         }
+    }
+
+    /// Match `keyword` against (lowercased) `text`.
+    ///
+    /// ASCII keywords require word boundaries on both sides, so `fix` no longer
+    /// matches `fixture`/`suffix`. CJK keywords fall back to plain `contains` —
+    /// CJK text has no whitespace tokenization, so a boundary check would
+    /// wrongly reject valid matches like `修复` inside `修复认证模块`.
+    fn keyword_matches(text: &str, keyword: &str) -> bool {
+        // Non-ASCII (or mixed) keywords keep substring semantics.
+        let is_ascii_token = keyword
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'-');
+        if !is_ascii_token {
+            return text.contains(keyword);
+        }
+
+        // ASCII token: both sides must be a non-letter or the string edge.
+        let kb = keyword.as_bytes();
+        let tb = text.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(keyword) {
+            let start = from + rel;
+            let end = start + kb.len();
+            let left_ok = start == 0 || !tb[start - 1].is_ascii_alphabetic();
+            let right_ok = end >= tb.len() || !tb[end].is_ascii_alphabetic();
+            if left_ok && right_ok {
+                return true;
+            }
+            from = end;
+        }
+        false
     }
 }
 
@@ -222,5 +254,42 @@ mod tests {
         let classifier = IntentClassifier::new();
         let intents = classifier.classify("what is the CI pipeline process");
         assert!(intents.contains(&MemoryIntent::Workflow));
+    }
+
+    #[test]
+    fn test_word_boundary_rejects_embedded_substrings() {
+        let classifier = IntentClassifier::new();
+        // "fix" inside "fixture"/"suffix" must NOT trigger Debugging.
+        let intents = classifier.classify("update the test fixture");
+        assert!(
+            !intents.contains(&MemoryIntent::Debugging),
+            "fixture must not match 'fix'"
+        );
+        let intents = classifier.classify("trim the suffix array");
+        assert!(!intents.contains(&MemoryIntent::Debugging));
+        // "merge" inside "emerge" must NOT trigger Refactor.
+        let intents = classifier.classify("issues start to emerge here");
+        assert!(!intents.contains(&MemoryIntent::Refactor));
+    }
+
+    #[test]
+    fn test_word_boundary_matches_isolated_token() {
+        let classifier = IntentClassifier::new();
+        // Isolated or space-delimited "fix" still matches.
+        assert!(classifier
+            .classify("I need to fix this bug")
+            .contains(&MemoryIntent::Debugging));
+        assert!(classifier
+            .classify("fix")
+            .contains(&MemoryIntent::Debugging));
+    }
+
+    #[test]
+    fn test_cjk_keyword_still_matches_mid_sentence() {
+        let classifier = IntentClassifier::new();
+        // CJK keywords keep substring semantics — match inside a sentence.
+        assert!(classifier
+            .classify("如何修复认证模块")
+            .contains(&MemoryIntent::Debugging));
     }
 }

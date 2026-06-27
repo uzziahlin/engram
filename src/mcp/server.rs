@@ -362,12 +362,19 @@ impl DefaultMemoryProvider {
     pub fn new(repo: MemoryRepository, graph: GraphEngine, config: Config) -> Self {
         #[cfg(feature = "semantic")]
         let embedder = Self::init_embedder(&config);
+        // Read the ranking weights before `config` is moved into the struct.
+        let plan_weights = crate::retrieval::planner::PlanWeights {
+            relevance: config.retrieval.weight_relevance,
+            recency: config.retrieval.weight_recency,
+            importance: config.retrieval.weight_importance,
+            type_weight: config.retrieval.weight_type,
+        };
         Self {
             repo,
             graph: Mutex::new(graph),
             config,
             classifier: IntentClassifier::new(),
-            planner: RetrievalPlanner::new(),
+            planner: RetrievalPlanner::new(plan_weights),
             reranker: Reranker::new(),
             composer: ContextComposer::new(),
             loaded_projects: Mutex::new(HashSet::new()),
@@ -629,7 +636,18 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let now_ts = chrono::Utc::now().timestamp();
 
         let mut results = if let Some(ref mt) = input.memory_type {
+            // Explicit type filter takes precedence over intent routing.
             BM25Retriever::search_by_type(repo, &input.query, &input.project_id, mt, input.limit)?
+        } else if self.config.retrieval.intent_routing {
+            // Route to only the memory types implied by the classified intent
+            // (General intent expands to all four, matching the old search_all).
+            BM25Retriever::search_by_types(
+                repo,
+                &input.query,
+                &input.project_id,
+                &plan.sources,
+                input.limit,
+            )?
         } else {
             BM25Retriever::search_all(repo, &input.query, &input.project_id, input.limit)?
         };

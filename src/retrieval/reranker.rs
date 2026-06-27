@@ -18,7 +18,7 @@ impl Reranker {
 
     /// Rerank search results.
     ///
-    ///   final = W_REL * relevance
+    ///   final = relevance_weight * relevance
     ///         + recency_weight  * recency_decay(now, created_at; half_life)
     ///         + importance_weight * importance
     ///         + type_weight     * type_prior
@@ -32,8 +32,6 @@ impl Reranker {
         if results.is_empty() {
             return;
         }
-
-        const W_REL: f32 = 0.4;
 
         for result in results.iter_mut() {
             let relevance = result.relevance_score;
@@ -55,7 +53,7 @@ impl Reranker {
                 _ => 0.4,
             };
 
-            let final_score = W_REL * relevance
+            let final_score = plan.relevance_weight * relevance
                 + plan.recency_weight * recency_decay
                 + plan.importance_weight * result.importance
                 + plan.type_weight * type_prior;
@@ -98,6 +96,7 @@ mod tests {
     fn make_plan() -> RetrievalPlan {
         RetrievalPlan {
             sources: vec![MemorySource::Episodic],
+            relevance_weight: 0.4,
             recency_weight: 0.2,
             importance_weight: 0.6,
             type_weight: 0.4,

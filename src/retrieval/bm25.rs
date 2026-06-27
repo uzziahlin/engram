@@ -1,4 +1,5 @@
 use crate::models::{DecisionMemory, EpisodicMemory, FailureMemory, ProceduralMemory};
+use crate::retrieval::planner::MemorySource;
 use crate::storage::{MemoryRepository, ScoredMemory};
 use anyhow::Result;
 
@@ -125,32 +126,35 @@ impl BM25Retriever {
             .collect()
     }
 
-    /// Search all memory types via FTS5 BM25 for a given query.
-    /// Returns combined results sorted by relevance.
-    pub fn search_all(
+    /// Search a subset of memory types via FTS5 BM25, merging and sorting by
+    /// relevance. Used to route `search_memory` to only the types implied by
+    /// the classified intent. `search_all` is this with all four sources.
+    pub fn search_by_types(
         repo: &MemoryRepository,
         query: &str,
         project_id: &str,
+        sources: &[MemorySource],
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let mut results = Vec::new();
-
-        results.extend(Self::to_results(
-            repo.search_episodic(query, project_id, limit)?,
-            "episodic",
-        ));
-        results.extend(Self::to_results(
-            repo.search_decisions(query, project_id, limit)?,
-            "decision",
-        ));
-        results.extend(Self::to_results(
-            repo.search_failures(query, project_id, limit)?,
-            "failure",
-        ));
-        results.extend(Self::to_results(
-            repo.search_procedural(query, project_id, limit)?,
-            "procedural",
-        ));
+        for src in sources {
+            let typed = match src {
+                MemorySource::Episodic => {
+                    Self::to_results(repo.search_episodic(query, project_id, limit)?, "episodic")
+                }
+                MemorySource::Decision => {
+                    Self::to_results(repo.search_decisions(query, project_id, limit)?, "decision")
+                }
+                MemorySource::Failure => {
+                    Self::to_results(repo.search_failures(query, project_id, limit)?, "failure")
+                }
+                MemorySource::Procedural => Self::to_results(
+                    repo.search_procedural(query, project_id, limit)?,
+                    "procedural",
+                ),
+            };
+            results.extend(typed);
+        }
 
         // Sort by relevance score descending
         results.sort_by(|a, b| {
@@ -161,6 +165,17 @@ impl BM25Retriever {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    /// Search all memory types via FTS5 BM25 for a given query.
+    /// Returns combined results sorted by relevance.
+    pub fn search_all(
+        repo: &MemoryRepository,
+        query: &str,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        Self::search_by_types(repo, query, project_id, MemorySource::all(), limit)
     }
 
     /// Search a specific memory type.
@@ -357,5 +372,76 @@ mod tests {
             "procedural",
         );
         assert!((r[0].importance - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_by_types_returns_only_requested_types() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+
+        let ep = EpisodicMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "alpha episodic".into(),
+            content: "alpha".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        let fail = FailureMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: "p".into(),
+            incident: "alpha failure".into(),
+            root_cause: "rc".into(),
+            fix: "fx".into(),
+            prevention: "pv".into(),
+            severity: 3,
+            tags: vec![],
+            created_at: 2,
+            updated_at: 2,
+        };
+        let dec = DecisionMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: "p".into(),
+            title: "alpha decision".into(),
+            context: "ctx".into(),
+            rationale: "r".into(),
+            tradeoffs: "to".into(),
+            related_files: vec![],
+            tags: vec![],
+            created_at: 3,
+            updated_at: 3,
+        };
+        repo.create_episodic(&ep).unwrap();
+        repo.create_failure(&fail).unwrap();
+        repo.create_decision(&dec).unwrap();
+
+        // Request only Failure + Episodic → Decision must be filtered out.
+        let r = BM25Retriever::search_by_types(
+            &repo,
+            "alpha",
+            "p",
+            &[MemorySource::Failure, MemorySource::Episodic],
+            10,
+        )
+        .unwrap();
+        let types: std::collections::HashSet<&str> =
+            r.iter().map(|x| x.memory_type.as_str()).collect();
+        assert!(types.contains("failure"));
+        assert!(types.contains("episodic"));
+        assert!(
+            !types.contains("decision"),
+            "decision must be filtered out by source routing"
+        );
+
+        // search_all (all four) surfaces decision too.
+        let r_all = BM25Retriever::search_all(&repo, "alpha", "p", 10).unwrap();
+        let types_all: std::collections::HashSet<&str> =
+            r_all.iter().map(|x| x.memory_type.as_str()).collect();
+        assert!(types_all.contains("decision"));
     }
 }

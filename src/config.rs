@@ -148,6 +148,23 @@ pub struct RetrievalConfig {
     pub fallback_max_results: usize,
     #[serde(default = "RetrievalConfig::default_recency_half_life_days")]
     pub recency_half_life_days: u64,
+    /// Route `search_memory` to only the memory types implied by the classified
+    /// intent (General intent still searches all four). Turn off to always query
+    /// every type regardless of intent.
+    #[serde(default = "RetrievalConfig::default_intent_routing")]
+    pub intent_routing: bool,
+    /// Global ranking-signal weights. Defaults reproduce the pre-config
+    /// hard-coded values, so an absent `[retrieval]` section is a no-op.
+    /// `weight_relevance` scales the BM25 score; the other three are the base
+    /// values the per-intent planner adjusts (max-increments) on top of.
+    #[serde(default = "RetrievalConfig::default_weight_relevance")]
+    pub weight_relevance: f32,
+    #[serde(default = "RetrievalConfig::default_weight_recency")]
+    pub weight_recency: f32,
+    #[serde(default = "RetrievalConfig::default_weight_importance")]
+    pub weight_importance: f32,
+    #[serde(default = "RetrievalConfig::default_weight_type")]
+    pub weight_type: f32,
 }
 
 impl Default for RetrievalConfig {
@@ -157,6 +174,11 @@ impl Default for RetrievalConfig {
             fallback_timeout_ms: Self::default_fallback_timeout_ms(),
             fallback_max_results: Self::default_fallback_max_results(),
             recency_half_life_days: Self::default_recency_half_life_days(),
+            intent_routing: Self::default_intent_routing(),
+            weight_relevance: Self::default_weight_relevance(),
+            weight_recency: Self::default_weight_recency(),
+            weight_importance: Self::default_weight_importance(),
+            weight_type: Self::default_weight_type(),
         }
     }
 }
@@ -173,6 +195,21 @@ impl RetrievalConfig {
     }
     fn default_recency_half_life_days() -> u64 {
         30
+    }
+    fn default_intent_routing() -> bool {
+        true
+    }
+    fn default_weight_relevance() -> f32 {
+        0.4
+    }
+    fn default_weight_recency() -> f32 {
+        0.2
+    }
+    fn default_weight_importance() -> f32 {
+        0.4
+    }
+    fn default_weight_type() -> f32 {
+        0.4
     }
 }
 
