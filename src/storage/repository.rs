@@ -22,6 +22,17 @@ pub struct ArchivedRow {
     pub archived_at: i64,
 }
 
+/// Aggregated feedback for one distinct query string (for `query_stats`).
+/// `count` = how often the query ran; `result_count_avg` = average hits per
+/// run (a low value flags a query the store fails to satisfy).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryStatRow {
+    pub query: String,
+    pub count: i64,
+    pub result_count_avg: f64,
+    pub last_at: i64,
+}
+
 /// The four memory types, mapped to their physical tables.
 /// Used by lifecycle ops (archive/restore/list/consolidate) so a single
 /// generic implementation serves all four tables. Table names come only from
@@ -306,6 +317,25 @@ impl MemoryRepository {
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_project_model
                 ON memory_embeddings(project_id, model_id);",
+        )?;
+
+        // Retrieval feedback log: one row per search_memory call. Powers
+        // `query_stats` / `engram queries` for hit-rate analysis. Independent of
+        // the four memory kinds — deliberately outside MemoryKind / the CRUD macro.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS query_log (
+                id           TEXT PRIMARY KEY,
+                project_id   TEXT NOT NULL,
+                query        TEXT NOT NULL,
+                memory_type  TEXT,
+                result_ids   TEXT NOT NULL,
+                result_count INTEGER NOT NULL,
+                created_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_query_log_project_time
+                ON query_log(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_query_log_query
+                ON query_log(project_id, query);",
         )?;
 
         tx.commit()?;
@@ -947,6 +977,66 @@ impl MemoryRepository {
                 memory_type: kind.as_str().to_string(),
                 label: row.get(1)?,
                 archived_at: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ─── Retrieval feedback (query_log) ─────────────────────────────
+    /// Record one `search_memory` invocation. Best-effort by design — callers
+    /// swallow the error so a logging failure never breaks search.
+    pub fn record_query(
+        &self,
+        project_id: &str,
+        query: &str,
+        result_ids: &[String],
+        memory_type: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO query_log \
+             (id, project_id, query, memory_type, result_ids, result_count, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                project_id,
+                query,
+                memory_type,
+                serde_json::to_string(result_ids)?,
+                result_ids.len() as i64,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate `query_log` by query string over a time window: how often each
+    /// query ran and its average hit count, most-frequent first. A low
+    /// `result_count_avg` flags queries the store fails to satisfy.
+    pub fn query_stats(
+        &self,
+        project_id: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<QueryStatRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT query, COUNT(*) AS cnt, AVG(result_count) AS avg_hits, \
+             MAX(created_at) AS last_at FROM query_log \
+             WHERE project_id = ?1 AND created_at >= ?2 \
+             GROUP BY query ORDER BY cnt DESC, last_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, since, limit], |row| {
+            Ok(QueryStatRow {
+                query: row.get(0)?,
+                count: row.get(1)?,
+                result_count_avg: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                last_at: row.get(3)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1926,6 +2016,44 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "archived one");
         assert_eq!(rows[0].memory_type, "episodic");
+    }
+
+    #[test]
+    fn query_log_records_and_aggregates() {
+        let repo = setup_repo();
+        // Two runs of "auth" (3 then 1 hits), one run of "cache" (0 hits).
+        repo.record_query(
+            "p",
+            "auth",
+            &["a".into(), "b".into(), "c".into()],
+            None,
+            100,
+        )
+        .unwrap();
+        repo.record_query("p", "auth", &["a".into()], None, 200)
+            .unwrap();
+        repo.record_query("p", "cache", &[], None, 150).unwrap();
+
+        let stats = repo.query_stats("p", 0, 10).unwrap();
+        assert_eq!(stats.len(), 2);
+        // "auth" is the most frequent query → first.
+        assert_eq!(stats[0].query, "auth");
+        assert_eq!(stats[0].count, 2);
+        assert!(
+            (stats[0].result_count_avg - 2.0).abs() < 1e-6,
+            "avg hits = (3+1)/2 = 2.0"
+        );
+        assert_eq!(stats[0].last_at, 200);
+        assert_eq!(stats[1].query, "cache");
+        assert_eq!(stats[1].count, 1);
+
+        // Time window filters out entries before the cutoff.
+        let recent = repo.query_stats("p", 180, 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].query, "auth");
+
+        // Project isolation.
+        assert!(repo.query_stats("other", 0, 10).unwrap().is_empty());
     }
 
     // ─── Transaction Rollback Test ─────────────────────────────────

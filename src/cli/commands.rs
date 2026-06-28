@@ -15,6 +15,9 @@ const IMPORT_LINE: &str = "@ENGRAM.md";
 
 fn open_repo(config: &Config) -> Result<MemoryRepository> {
     let repo = MemoryRepository::new(&config.storage.database_path)?;
+    // Ensure the schema is current — creates any new tables (e.g. query_log)
+    // on databases that predate them. Idempotent via CREATE ... IF NOT EXISTS.
+    repo.initialize_schema()?;
     Ok(repo)
 }
 
@@ -290,6 +293,23 @@ pub fn search(args: &[String]) -> Result<()> {
         all.truncate(limit);
         all
     };
+
+    // Best-effort retrieval feedback (mirrors MCP search_memory): log this
+    // query + its hits so `engram queries` / MCP `query_stats` can surface
+    // hit-rate signal. A logging failure never breaks the command.
+    let result_ids: Vec<String> = results
+        .iter()
+        .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect();
+    if let Err(e) = repo.record_query(
+        &project_id,
+        &query,
+        &result_ids,
+        memory_type.as_deref(),
+        now_ts(),
+    ) {
+        tracing::warn!("query log failed: {e}");
+    }
 
     print_json(&serde_json::json!({"results": results, "total": results.len()}));
     Ok(())
@@ -601,6 +621,26 @@ pub fn timeline(args: &[String]) -> Result<()> {
     let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
     print_json(&serde_json::json!({"events": events}));
+    Ok(())
+}
+
+/// `engram queries` — retrieval feedback: aggregate past search queries by
+/// frequency and average hit count. Surfaces which queries are common and
+/// which return few results.
+pub fn queries(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let days = optional_num(args, "days").unwrap_or(7.0) as i64;
+    let limit = optional_num(args, "limit").unwrap_or(10.0) as usize;
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+
+    let since = now_ts() - (days * 86400);
+    let stats = repo.query_stats(&project_id, since, limit)?;
+
+    print_json(&serde_json::json!({
+        "queries": serde_json::to_value(&stats)?
+    }));
     Ok(())
 }
 

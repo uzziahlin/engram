@@ -126,6 +126,16 @@ pub struct ArchitecturalDecisionsInput {
     limit: usize,
 }
 
+/// query_stats tool input — retrieval feedback aggregated by query string.
+#[derive(Debug, Deserialize)]
+pub struct QueryStatsInput {
+    project_id: String,
+    #[serde(default = "default_days")]
+    days: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
 /// create_episodic tool input.
 #[derive(Debug, Deserialize)]
 pub struct CreateEpisodicInput {
@@ -306,6 +316,7 @@ pub trait MemoryToolProvider: Send + Sync {
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value>;
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value>;
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value>;
+    fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value>;
     fn architectural_decisions(
         &self,
         input: ArchitecturalDecisionsInput,
@@ -722,6 +733,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             })
             .collect();
 
+        // Best-effort retrieval feedback: log this query + its hits so
+        // `query_stats` / `engram queries` can surface hit-rate signal. A
+        // logging failure must never break search.
+        let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+        if let Err(e) = repo.record_query(
+            &input.project_id,
+            &input.query,
+            &result_ids,
+            input.memory_type.as_deref(),
+            now_ts,
+        ) {
+            tracing::warn!("query log failed: {e}");
+        }
+
         Ok(serde_json::json!({
             "results": result_items,
             "total": result_items.len(),
@@ -814,6 +839,24 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
         Ok(serde_json::json!({ "events": events }))
+    }
+
+    fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let since = chrono::Utc::now().timestamp() - (input.days * 86400);
+        let rows = repo.query_stats(&input.project_id, since, input.limit)?;
+        let queries: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "query": r.query,
+                    "count": r.count,
+                    "result_count_avg": (r.result_count_avg * 100.0).round() / 100.0,
+                    "last_at": r.last_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "queries": queries }))
     }
 
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value> {
@@ -1301,6 +1344,9 @@ impl McpServer {
             fn recent_failures(&self, _: RecentFailuresInput) -> Result<serde_json::Value> {
                 Ok(serde_json::json!({"failures": []}))
             }
+            fn query_stats(&self, _: QueryStatsInput) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"queries": []}))
+            }
             fn architectural_decisions(
                 &self,
                 _: ArchitecturalDecisionsInput,
@@ -1418,6 +1464,19 @@ impl McpServer {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "service": { "type": "string", "description": "Filter by service name" },
                         "limit": { "type": "integer", "description": "Max results", "default": 10 },
+                    },
+                    "required": ["project_id"],
+                }),
+            },
+            ToolDefinition {
+                name: "query_stats".into(),
+                description: "Aggregate past search queries by frequency and average hit count — surfaces which queries are common and which return few results (retrieval feedback)".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "days": { "type": "integer", "description": "Number of days to look back", "default": 7 },
+                        "limit": { "type": "integer", "description": "Max distinct queries", "default": 10 },
                     },
                     "required": ["project_id"],
                 }),
@@ -1803,6 +1862,9 @@ impl McpServer {
                         self.provider,
                         recent_failures
                     ),
+                    "query_stats" => {
+                        dispatch_tool!(arguments, QueryStatsInput, self.provider, query_stats)
+                    }
                     "architectural_decisions" => dispatch_tool!(
                         arguments,
                         ArchitecturalDecisionsInput,
@@ -2097,7 +2159,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = McpServer::list_tools();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"search_memory"));
@@ -2105,6 +2167,7 @@ mod tests {
         assert!(names.contains(&"timeline"));
         assert!(names.contains(&"recent_failures"));
         assert!(names.contains(&"architectural_decisions"));
+        assert!(names.contains(&"query_stats"));
         assert!(names.contains(&"create_episodic"));
         assert!(names.contains(&"create_decision"));
         assert!(names.contains(&"create_failure"));
@@ -2156,7 +2219,7 @@ mod tests {
         assert!(response.result.is_some());
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
     }
 
     #[test]
@@ -2406,6 +2469,49 @@ mod tests {
 
         assert!(response.result.is_some());
         assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn search_memory_logs_query_for_feedback() {
+        // search_memory must record each query to query_log (retrieval feedback).
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&crate::models::EpisodicMemory {
+            id: "e1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "oauth token bug".into(),
+            content: "c".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        })
+        .unwrap();
+        let graph = GraphEngine::new();
+        let config = Config::default();
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let server = McpServer::with_provider(provider.clone());
+
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "name": "search_memory",
+                "arguments": { "project_id": "p", "query": "oauth" }
+            })),
+        });
+        assert!(response.result.is_some());
+
+        // The query must have been logged for retrieval feedback.
+        let stats = provider.repo.query_stats("p", 0, 10).unwrap();
+        assert!(
+            stats.iter().any(|s| s.query == "oauth"),
+            "query 'oauth' must be logged for feedback: {stats:?}"
+        );
     }
 
     #[test]

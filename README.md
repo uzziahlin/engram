@@ -225,6 +225,7 @@ All tools require a `project_id` parameter for multi-project isolation.
 | `timeline` | Get a timeline of memory events for the past N days | `days`, `project_id` |
 | `recent_failures` | List recent failure/incident memories | `limit`, `project_id` |
 | `architectural_decisions` | List architecture decision records | `limit`, `project_id` |
+| `query_stats` | Aggregate past search queries by frequency and avg hit count (retrieval feedback) | `days`, `limit`, `project_id` |
 
 ### Write Tools
 
@@ -307,7 +308,7 @@ Data is stored in `~/.engram/memory.db` by default.
 └──────────────────────────┬──────────────────────────────────┘
                            │ JSON-RPC
 ┌──────────────────────────▼──────────────────────────────────┐
-│                      MCP Server (17 tools)                   │
+│                      MCP Server (18 tools)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   MemoryToolProvider trait                    │
 ├─────────────┬─────────────────┬─────────────────────────────┤
@@ -354,6 +355,9 @@ engram ingest --project myproj --repo .
 
 # View history
 engram timeline --project myproj --days 7
+
+# Retrieval feedback: which queries are common / return few results
+engram queries --project myproj --days 7
 engram recent-failures --project myproj
 engram decisions --project myproj
 
