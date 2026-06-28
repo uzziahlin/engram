@@ -188,15 +188,15 @@ subsection "1.2 tools/list 工具列表"
 REQ_LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 RESP=$(mcp_call "$REQ_LIST")
 TOOL_COUNT=$(echo "$RESP" | jq '.result.tools | length')
-# 工具集: 11 基础(含 query_stats) + 1 collect_sources + 6 lifecycle = 18
-if [ "$TOOL_COUNT" = "18" ]; then
-    assert_pass "1.2a 返回 18 个工具"
+# 工具集: 11 基础(含 query_stats) + 1 collect_sources + 6 lifecycle + 4 reflection = 22
+if [ "$TOOL_COUNT" = "22" ]; then
+    assert_pass "1.2a 返回 22 个工具"
 else
-    assert_fail "1.2a 返回 18 个工具 (actual=$TOOL_COUNT)"
+    assert_fail "1.2a 返回 22 个工具 (actual=$TOOL_COUNT)"
 fi
 
 # 验证所有工具名称（delete_xxx 已替换为 forget_memory/restore_memory 等生命周期工具）
-EXPECTED_TOOLS=(search_memory related_files timeline recent_failures architectural_decisions query_stats create_episodic create_decision create_failure create_procedural ingest_commits collect_sources forget_memory restore_memory update_memory forget_batch list_archived consolidate_memories)
+EXPECTED_TOOLS=(search_memory related_files timeline recent_failures architectural_decisions query_stats create_episodic create_decision create_failure create_procedural ingest_commits collect_sources forget_memory restore_memory update_memory forget_batch list_archived consolidate_memories reflect list_suggestions confirm_suggestion reject_suggestion)
 ACTUAL_TOOLS=$(echo "$RESP" | jq -r '.result.tools[].name')
 for t in "${EXPECTED_TOOLS[@]}"; do
     if echo "$ACTUAL_TOOLS" | grep -qxF "$t"; then
