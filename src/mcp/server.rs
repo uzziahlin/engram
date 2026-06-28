@@ -3,10 +3,9 @@ use crate::config::Config;
 use crate::consolidation::ConsolidationEngine;
 use crate::context::composer::{ContextBudget, ContextComposer};
 use crate::git_integration::GitIntegration;
+use crate::mcp::embedding_service::EmbeddingService;
 use crate::models::*;
 use crate::retrieval::bm25::BM25Retriever;
-#[cfg(feature = "semantic")]
-use crate::retrieval::bm25::SearchResult;
 use crate::retrieval::intent_classifier::IntentClassifier;
 use crate::retrieval::planner::RetrievalPlanner;
 use crate::retrieval::reranker::Reranker;
@@ -366,17 +365,6 @@ pub trait MemoryToolProvider: Send + Sync {
     fn reject_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value>;
 }
 
-/// Result of a `reindex_embeddings` run; serialized as the CLI's JSON output.
-#[cfg(feature = "semantic")]
-#[derive(Debug, Default, Serialize)]
-pub struct ReindexReport {
-    pub total: usize,
-    pub embedded: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub dry_run: bool,
-}
-
 /// Default implementation of MemoryToolProvider backed by SQLite.
 ///
 /// `MemoryRepository` holds an r2d2 connection pool (Send+Sync), so `repo`
@@ -390,16 +378,13 @@ pub struct DefaultMemoryProvider {
     planner: RetrievalPlanner,
     reranker: Reranker,
     composer: ContextComposer,
-    /// Local embedding model, present only when semantic search is enabled and
-    /// the model loaded successfully. `None` ⇒ pure-BM25 path (unchanged).
-    #[cfg(feature = "semantic")]
-    embedder: Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>>,
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+    embedding: EmbeddingService,
 }
 
 impl DefaultMemoryProvider {
     pub fn new(repo: MemoryRepository, config: Config) -> Self {
-        #[cfg(feature = "semantic")]
-        let embedder = Self::init_embedder(&config);
+        // Build the embedding service (semantic, if enabled) before `config` moves.
         // Read the ranking weights before `config` is moved into the struct.
         let plan_weights = crate::retrieval::planner::PlanWeights {
             relevance: config.retrieval.weight_relevance,
@@ -409,13 +394,12 @@ impl DefaultMemoryProvider {
         };
         Self {
             repo,
+            embedding: EmbeddingService::new(&config),
             config,
             classifier: IntentClassifier::new(),
             planner: RetrievalPlanner::new(plan_weights),
             reranker: Reranker::new(),
             composer: ContextComposer::new(),
-            #[cfg(feature = "semantic")]
-            embedder,
         }
     }
 
@@ -425,221 +409,18 @@ impl DefaultMemoryProvider {
         &self.repo
     }
 
-    /// Build the embedding model from config (semantic enabled + model available).
-    /// Returns None (logging a warning) on any failure so the server still runs
-    /// in pure-BM25 mode.
-    #[cfg(feature = "semantic")]
-    fn init_embedder(
-        config: &Config,
-    ) -> Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>> {
-        use crate::retrieval::embedding::{ensure_model, CandleBertEmbedder};
-        if !config.semantic.enabled {
-            return None;
-        }
-        let dir = config.semantic.model_path.clone().unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".engram/models")
-                .join(
-                    config
-                        .semantic
-                        .model_id
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("model"),
-                )
-        });
-        // Only auto-fetch when no explicit path was given (air-gapped users
-        // provide model_path and we never touch the network).
-        if config.semantic.model_path.is_none() {
-            if let Err(e) = ensure_model(&config.semantic.model_id, &dir) {
-                tracing::warn!(
-                    "semantic enabled but model fetch failed ({e}); disabling semantic search"
-                );
-                return None;
-            }
-        }
-        match CandleBertEmbedder::from_local(&dir, &config.semantic.model_id) {
-            Ok(e) => {
-                tracing::info!(
-                    "semantic search enabled: model {}",
-                    config.semantic.model_id
-                );
-                Some(Box::new(e))
-            }
-            Err(e) => {
-                tracing::warn!("semantic model load failed ({e}); disabling semantic search");
-                None
-            }
-        }
-    }
-
-    /// Embed `text` and store the vector for `id`. No-op when the embedder is
-    /// absent. Failures are logged, never fatal (embedding is an enhancement).
-    #[cfg(feature = "semantic")]
-    fn index_embedding(&self, memory_type: &str, id: &str, project_id: &str, text: &str) {
-        if let Some(e) = self.embedder.as_ref() {
-            match e.embed(&[text]) {
-                Ok(v) if !v.is_empty() => {
-                    if let Err(err) = self.repo.upsert_embedding(
-                        id,
-                        memory_type,
-                        project_id,
-                        &v[0],
-                        e.model_id(),
-                        e.dim(),
-                    ) {
-                        tracing::warn!("upsert_embedding failed for {id}: {err}");
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => tracing::warn!("embed failed for {id}: {err}"),
-            }
-        }
-    }
-
-    /// Embed one memory during reindex, updating `report`. Skips when already
-    /// embedded (unless `force`); counts only when `dry_run`. Per-memory errors
-    /// are logged and counted as `failed`, never aborting the batch.
-    #[cfg(feature = "semantic")]
-    #[allow(clippy::too_many_arguments)]
-    fn reindex_one(
-        &self,
-        report: &mut ReindexReport,
-        already: &HashSet<String>,
-        memory_type: &str,
-        id: &str,
-        project_id: &str,
-        text: String,
-        force: bool,
-        dry_run: bool,
-    ) {
-        report.total += 1;
-        if !force && already.contains(id) {
-            report.skipped += 1;
-            return;
-        }
-        if dry_run {
-            report.embedded += 1; // would embed
-            return;
-        }
-        let embedder = self
-            .embedder
-            .as_ref()
-            .expect("embedder presence is checked by reindex_embeddings");
-        match embedder.embed(&[text.as_str()]) {
-            Ok(v) if !v.is_empty() => {
-                match self.repo.upsert_embedding(
-                    id,
-                    memory_type,
-                    project_id,
-                    &v[0],
-                    embedder.model_id(),
-                    embedder.dim(),
-                ) {
-                    Ok(()) => report.embedded += 1,
-                    Err(e) => {
-                        tracing::warn!("reindex upsert failed for {id}: {e}");
-                        report.failed += 1;
-                    }
-                }
-            }
-            Ok(_) => {
-                tracing::warn!("reindex embed returned empty for {id}");
-                report.failed += 1;
-            }
-            Err(e) => {
-                tracing::warn!("reindex embed failed for {id}: {e}");
-                report.failed += 1;
-            }
-        }
-    }
-
-    /// Backfill embeddings for active memories. `project=None` = all projects.
-    /// Default skips memories already embedded for the current model; `force`
-    /// re-embeds all. `dry_run` counts without writing. Errors when the embedder
-    /// is absent (semantic disabled or model load failed).
+    /// Backfill embeddings for active memories (semantic feature).
+    /// Forwards to the embedded `EmbeddingService`; see its `reindex` for
+    /// the full `project`/`force`/`dry_run` semantics.
     #[cfg(feature = "semantic")]
     pub fn reindex_embeddings(
         &self,
         project: Option<&str>,
         force: bool,
         dry_run: bool,
-    ) -> Result<ReindexReport> {
-        let embedder = self.embedder.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic search is not active: enable [semantic] in ~/.engram/config.toml \
-                 and ensure the model is available"
-            )
-        })?;
-        let model_id = embedder.model_id().to_string();
-        let already = if force {
-            HashSet::new()
-        } else {
-            self.repo.embedded_ids(project, &model_id)?
-        };
-
-        let mut report = ReindexReport {
-            dry_run,
-            ..Default::default()
-        };
-        for m in self.repo.list_active_episodic(project)? {
-            self.reindex_one(
-                &mut report,
-                &already,
-                "episodic",
-                &m.id,
-                &m.project_id,
-                m.embedding_text(),
-                force,
-                dry_run,
-            );
-        }
-        for m in self.repo.list_active_decision(project)? {
-            self.reindex_one(
-                &mut report,
-                &already,
-                "decision",
-                &m.id,
-                &m.project_id,
-                m.embedding_text(),
-                force,
-                dry_run,
-            );
-        }
-        for m in self.repo.list_active_failure(project)? {
-            self.reindex_one(
-                &mut report,
-                &already,
-                "failure",
-                &m.id,
-                &m.project_id,
-                m.embedding_text(),
-                force,
-                dry_run,
-            );
-        }
-        for m in self.repo.list_active_procedural(project)? {
-            self.reindex_one(
-                &mut report,
-                &already,
-                "procedural",
-                &m.id,
-                &m.project_id,
-                m.embedding_text(),
-                force,
-                dry_run,
-            );
-        }
-        tracing::info!(
-            "reindex: total={} embedded={} skipped={} failed={} dry_run={}",
-            report.total,
-            report.embedded,
-            report.skipped,
-            report.failed,
-            report.dry_run
-        );
-        Ok(report)
+    ) -> Result<crate::mcp::embedding_service::ReindexReport> {
+        self.embedding
+            .reindex(self.lock_repo(), project, force, dry_run)
     }
 }
 
@@ -673,48 +454,19 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         };
 
         // Semantic fusion: when an embedder is present, blend vector top-K with
-        // the BM25 candidates via RRF. Vector-only hits are materialized so they
-        // can surface even when BM25 missed them entirely.
+        // the BM25 candidates via RRF via the embedding service. Vector-only
+        // hits are materialized so they can surface even when BM25 missed them.
         #[cfg(feature = "semantic")]
         {
-            if let Some(e) = self.embedder.as_ref() {
-                if let Ok(mut qv) = e.embed(&[input.query.as_str()]) {
-                    if !qv.is_empty() {
-                        let qvec = qv.remove(0);
-                        let loaded =
-                            repo.load_active_embeddings(&input.project_id, e.model_id())?;
-                        let type_of: std::collections::HashMap<String, String> = loaded
-                            .iter()
-                            .map(|(id, ty, _)| (id.clone(), ty.clone()))
-                            .collect();
-                        let cands: Vec<(String, Vec<f32>)> =
-                            loaded.into_iter().map(|(id, _, v)| (id, v)).collect();
-                        let vec_ids = crate::retrieval::vector::top_k_cosine(
-                            &qvec,
-                            &cands,
-                            self.config.semantic.top_k,
-                        );
-                        let bm25_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-                        let fused = crate::retrieval::fusion::rrf_fuse(
-                            &[bm25_ids, vec_ids],
-                            self.config.semantic.rrf_k,
-                        );
-                        let mut by_id: std::collections::HashMap<String, SearchResult> =
-                            results.into_iter().map(|r| (r.id.clone(), r)).collect();
-                        let missing: Vec<(String, String)> = fused
-                            .iter()
-                            .filter(|id| !by_id.contains_key(*id))
-                            .filter_map(|id| type_of.get(id).map(|ty| (ty.clone(), id.clone())))
-                            .collect();
-                        for sr in BM25Retriever::fetch_by_ids(repo, &missing)? {
-                            by_id.entry(sr.id.clone()).or_insert(sr);
-                        }
-                        results = fused
-                            .into_iter()
-                            .filter_map(|id| by_id.remove(&id))
-                            .collect();
-                    }
-                }
+            if self.embedding.is_active() {
+                results = self.embedding.fuse(
+                    repo,
+                    &input.query,
+                    &input.project_id,
+                    results,
+                    self.config.semantic.top_k,
+                    self.config.semantic.rrf_k,
+                )?;
             }
         }
 
@@ -921,7 +673,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         repo.create_episodic(&memory)?;
         #[cfg(feature = "semantic")]
-        self.index_embedding(
+        self.embedding.index(
+            repo,
             "episodic",
             &memory.id,
             &memory.project_id,
@@ -955,7 +708,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         repo.create_decision(&memory)?;
         #[cfg(feature = "semantic")]
-        self.index_embedding(
+        self.embedding.index(
+            repo,
             "decision",
             &memory.id,
             &memory.project_id,
@@ -992,7 +746,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         repo.create_failure(&memory)?;
         #[cfg(feature = "semantic")]
-        self.index_embedding(
+        self.embedding.index(
+            repo,
             "failure",
             &memory.id,
             &memory.project_id,
@@ -1025,7 +780,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         repo.create_procedural(&memory)?;
         #[cfg(feature = "semantic")]
-        self.index_embedding(
+        self.embedding.index(
+            repo,
             "procedural",
             &memory.id,
             &memory.project_id,
