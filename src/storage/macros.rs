@@ -117,6 +117,11 @@ macro_rules! impl_memory_crud {
                     "DELETE FROM entities WHERE id = ?1",
                     params![id],
                 )?;
+                // Clean up any stored embedding for this memory
+                $tx.execute(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                    params![id],
+                )?;
             }
             $tx.commit()?;
             Ok(affected > 0)

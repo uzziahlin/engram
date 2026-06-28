@@ -3,7 +3,6 @@ use crate::config::Config;
 use crate::consolidation::ConsolidationEngine;
 use crate::context::composer::{ContextBudget, ContextComposer};
 use crate::git_integration::GitIntegration;
-use crate::graph::GraphEngine;
 use crate::models::*;
 use crate::retrieval::bm25::BM25Retriever;
 #[cfg(feature = "semantic")]
@@ -16,9 +15,7 @@ use crate::storage::MemoryRepository;
 use crate::storage::ScoredMemory;
 
 use anyhow::{Context as AnyhowContext, Result};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
@@ -352,17 +349,15 @@ pub struct ReindexReport {
 ///
 /// `MemoryRepository` holds an r2d2 connection pool (Send+Sync), so `repo`
 /// needs no Mutex: read concurrency comes from WAL multi-reader, write
-/// concurrency from `busy_timeout` + WAL's single-writer rule. Only the
-/// in-memory mutable state (`graph`, `loaded_projects`) is Mutex-protected.
+/// concurrency from `busy_timeout` + WAL's single-writer rule. All state lives
+/// in SQLite; the provider holds no in-memory caches.
 pub struct DefaultMemoryProvider {
     repo: MemoryRepository,
-    graph: Mutex<GraphEngine>,
     config: Config,
     classifier: IntentClassifier,
     planner: RetrievalPlanner,
     reranker: Reranker,
     composer: ContextComposer,
-    loaded_projects: Mutex<HashSet<String>>,
     /// Local embedding model, present only when semantic search is enabled and
     /// the model loaded successfully. `None` ⇒ pure-BM25 path (unchanged).
     #[cfg(feature = "semantic")]
@@ -370,7 +365,7 @@ pub struct DefaultMemoryProvider {
 }
 
 impl DefaultMemoryProvider {
-    pub fn new(repo: MemoryRepository, graph: GraphEngine, config: Config) -> Self {
+    pub fn new(repo: MemoryRepository, config: Config) -> Self {
         #[cfg(feature = "semantic")]
         let embedder = Self::init_embedder(&config);
         // Read the ranking weights before `config` is moved into the struct.
@@ -382,13 +377,11 @@ impl DefaultMemoryProvider {
         };
         Self {
             repo,
-            graph: Mutex::new(graph),
             config,
             classifier: IntentClassifier::new(),
             planner: RetrievalPlanner::new(plan_weights),
             reranker: Reranker::new(),
             composer: ContextComposer::new(),
-            loaded_projects: Mutex::new(HashSet::new()),
             #[cfg(feature = "semantic")]
             embedder,
         }
@@ -398,22 +391,6 @@ impl DefaultMemoryProvider {
     /// pool (Send+Sync); each method borrows its own pooled connection.
     fn lock_repo(&self) -> &MemoryRepository {
         &self.repo
-    }
-
-    /// Lock the graph mutex, recovering from poison instead of panicking.
-    fn lock_graph(&self) -> std::sync::MutexGuard<'_, GraphEngine> {
-        self.graph.lock().unwrap_or_else(|e| {
-            tracing::error!("graph mutex poisoned, recovering: {e}");
-            e.into_inner()
-        })
-    }
-
-    /// Lock the loaded_projects mutex, recovering from poison instead of panicking.
-    fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
-        self.loaded_projects.lock().unwrap_or_else(|e| {
-            tracing::error!("loaded_projects mutex poisoned, recovering: {e}");
-            e.into_inner()
-        })
     }
 
     /// Build the embedding model from config (semantic enabled + model available).
@@ -755,56 +732,19 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value> {
-        // Load graph for this project only once
-        {
-            let mut loaded = self.lock_loaded();
-            if !loaded.contains(&input.project_id) {
-                let repo = self.lock_repo();
-                let mut graph = self.lock_graph();
-                graph.load_from_repo(repo, &input.project_id)?;
-                loaded.insert(input.project_id.clone());
-            }
-        }
-
         let repo = self.lock_repo();
-        let graph = self.lock_graph();
-
-        let entity_id = {
-            let conn = repo.connection()?;
-            let mut stmt = conn
-                .prepare("SELECT id FROM entities WHERE name = ?1 AND project_id = ?2 LIMIT 1")?;
-            stmt.query_row(rusqlite::params![input.file, input.project_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-        };
-
-        let relations = if let Some(eid) = &entity_id {
-            graph
-                .get_relations(eid)
-                .iter()
-                .map(|rel| {
-                    let target = if rel.from_entity == *eid {
-                        graph
-                            .get_entity(&rel.to_entity)
-                            .map(|e| e.name.clone())
-                            .unwrap_or_default()
-                    } else {
-                        graph
-                            .get_entity(&rel.from_entity)
-                            .map(|e| e.name.clone())
-                            .unwrap_or_default()
-                    };
-                    serde_json::json!({
-                        "to": target,
-                        "type": rel.relation_type.as_str(),
-                    })
+        // Resolve the file's graph neighborhood directly from the indexed
+        // graph_relations table — no full-project graph load into memory.
+        let (entity_id, edges) = repo.related_files_for(&input.file, &input.project_id)?;
+        let relations: Vec<_> = edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "to": e.other_name,
+                    "type": e.relation_type,
                 })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
+            })
+            .collect();
         Ok(serde_json::json!({
             "entities": [{
                 "id": entity_id.unwrap_or_default(),
@@ -1983,7 +1923,7 @@ mod tests {
     fn make_provider() -> DefaultMemoryProvider {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        DefaultMemoryProvider::new(repo, crate::graph::GraphEngine::new(), Config::default())
+        DefaultMemoryProvider::new(repo, Config::default())
     }
 
     /// End-to-end semantic recall with the REAL MiniLM model.
@@ -2017,7 +1957,7 @@ mod tests {
             repo.initialize_schema().unwrap();
             let mut config = Config::default();
             config.semantic.enabled = enabled;
-            let provider = DefaultMemoryProvider::new(repo, GraphEngine::new(), config);
+            let provider = DefaultMemoryProvider::new(repo, config);
             for (summary, content) in mems {
                 provider
                     .create_episodic(CreateEpisodicInput {
@@ -2109,7 +2049,7 @@ mod tests {
         // 2) Build a semantic-enabled provider over THAT repo (moves repo in).
         let mut config = Config::default();
         config.semantic.enabled = true;
-        let provider = DefaultMemoryProvider::new(repo, GraphEngine::new(), config);
+        let provider = DefaultMemoryProvider::new(repo, config);
 
         let query = "login keeps failing and re-authenticating"; // lexically disjoint
         let recalled = |p: &DefaultMemoryProvider| -> bool {
@@ -2226,10 +2166,9 @@ mod tests {
     fn test_create_episodic_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         // Create episodic memory
         let result = provider
@@ -2264,13 +2203,51 @@ mod tests {
     }
 
     #[test]
+    fn related_files_resolves_via_repo_index() {
+        // related_files must work without the (now-removed) in-memory graph:
+        // it resolves the file's neighborhood straight from graph_relations.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, Config::default()));
+
+        provider
+            .create_episodic(CreateEpisodicInput {
+                project_id: "p".into(),
+                session_id: "s".into(),
+                summary: "summary".into(),
+                content: "content".into(),
+                files_touched: vec!["auth.ts".into()],
+                related_commits: vec![],
+                importance: 0.0,
+                tags: vec![],
+            })
+            .unwrap();
+
+        let result = provider
+            .related_files(RelatedFilesInput {
+                project_id: "p".into(),
+                file: "auth.ts".into(),
+            })
+            .unwrap();
+
+        let entities = result["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["type"], "File");
+        assert_eq!(entities[0]["name"], "auth.ts");
+        let relations = entities[0]["relations"].as_array().unwrap();
+        assert!(
+            relations.iter().any(|r| r["type"] == "Touches"),
+            "expected a Touches relation, got: {relations:?}"
+        );
+    }
+
+    #[test]
     fn search_output_includes_importance() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         provider
             .create_episodic(CreateEpisodicInput {
@@ -2316,10 +2293,9 @@ mod tests {
     fn test_create_decision_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         let result = provider
             .create_decision(CreateDecisionInput {
@@ -2351,10 +2327,9 @@ mod tests {
     fn test_create_failure_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         let result = provider
             .create_failure(CreateFailureInput {
@@ -2376,10 +2351,9 @@ mod tests {
     fn test_create_procedural_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         let result = provider
             .create_procedural(CreateProceduralInput {
@@ -2402,10 +2376,9 @@ mod tests {
     fn test_ingest_commits_with_temp_repo() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         // Create temp git repo (via system git — see git_integration::make_test_repo)
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2448,10 +2421,9 @@ mod tests {
     fn test_search_memory_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
 
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
         let server = McpServer::with_provider(provider);
 
         let response = server.handle_request(JsonRpcRequest {
@@ -2490,9 +2462,8 @@ mod tests {
             updated_at: 1_700_000_000,
         })
         .unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
         let server = McpServer::with_provider(provider.clone());
 
         let response = server.handle_request(JsonRpcRequest {
@@ -2538,9 +2509,8 @@ mod tests {
     fn setup_server() -> McpServer {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
         McpServer::with_provider(provider)
     }
 
@@ -2829,9 +2799,8 @@ mod tests {
     fn test_collect_sources_with_provider() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
@@ -2863,9 +2832,8 @@ mod tests {
     fn test_collect_sources_rejects_empty_dimensions() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        let graph = GraphEngine::new();
         let config = Config::default();
-        let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+        let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
         let dir = tempfile::tempdir().unwrap();
         let err = provider

@@ -787,6 +787,92 @@ pub fn list_archived(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `engram gc [--older-than <dur> | --all] [--apply] [--vacuum] [--no-checkpoint]`
+///
+/// Physically delete archived memories and reclaim space. By default this is a
+/// **dry run**: it reports what *would* be removed without touching anything.
+/// Pass `--apply` to commit.
+///
+/// - `--older-than <dur>`: only delete memories archived longer ago than this
+///   duration (`30d`, `12h`, `45m`, `8w`, `30s`). Mutually exclusive with `--all`.
+/// - `--all`: delete every archived memory regardless of age.
+/// - `--vacuum`: after deletion, rebuild the DB file to reclaim free pages.
+///   Implies `--apply`. Requires no other process (e.g. the MCP server) to be
+///   using the database.
+/// - `--no-checkpoint`: skip the WAL checkpoint that otherwise follows `--apply`.
+///
+/// GC is global (cross-project); it is a maintenance op, not a per-project query.
+pub fn gc(args: &[String]) -> Result<()> {
+    let apply = args.iter().any(|a| a == "--apply");
+    let vacuum = args.iter().any(|a| a == "--vacuum");
+    let no_checkpoint = args.iter().any(|a| a == "--no-checkpoint");
+    let all = args.iter().any(|a| a == "--all");
+    let older_than = optional_str(args, "older-than");
+    // --vacuum only makes sense with --apply.
+    let apply = apply || vacuum;
+
+    if all && older_than.is_some() {
+        anyhow::bail!("--all and --older-than are mutually exclusive");
+    }
+    let older_than_seconds = if all {
+        0i64
+    } else if let Some(d) = older_than {
+        parse_duration(&d)?
+    } else {
+        anyhow::bail!("gc requires either --older-than <dur> (e.g. 30d, 12h, 45m, 8w, 30s) or --all");
+    };
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let now = now_ts();
+
+    let report = repo.gc_archived(older_than_seconds, apply, now)?;
+    print_json(&serde_json::to_value(&report)?);
+
+    // Reclaim space: checkpoint the WAL (best-effort), then optionally VACUUM.
+    if apply && !no_checkpoint {
+        if let Err(e) = repo.wal_checkpoint_truncate() {
+            tracing::warn!("wal_checkpoint skipped: {e}");
+        }
+    }
+    if vacuum {
+        repo.vacuum().with_context(|| {
+            "VACUUM failed — ensure no other process (e.g. the MCP server) is \
+             using the database, then retry"
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Parse a short duration string (`30d`, `12h`, `45m`, `8w`, `30s`) into seconds.
+/// Units: s=second, m=minute, h=hour, d=day, w=week.
+fn parse_duration(s: &str) -> Result<i64> {
+    let mut chars = s.chars();
+    let unit = chars.next_back();
+    let (unit, n): (char, i64) = match unit {
+        Some(u @ ('s' | 'm' | 'h' | 'd' | 'w')) => {
+            let num_str = chars.as_str();
+            let n: i64 = num_str.parse().with_context(|| {
+                format!("invalid duration '{s}': number part is not an integer")
+            })?;
+            (u, n)
+        }
+        _ => anyhow::bail!("invalid duration '{s}': expected e.g. 30d, 12h, 45m, 8w, 30s"),
+    };
+    let per_unit: i64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        'w' => 604_800,
+        // unreachable: unit is constrained above
+        _ => unreachable!(),
+    };
+    n.checked_mul(per_unit)
+        .with_context(|| format!("duration '{s}' overflows i64"))
+}
+
 pub fn consolidate(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = optional_str(args, "type");
@@ -835,8 +921,7 @@ pub fn reindex(args: &[String]) -> Result<()> {
         let config = load_config()?;
         let repo = open_repo(&config)?;
         repo.initialize_schema()?;
-        let graph = crate::graph::GraphEngine::new();
-        let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, graph, config);
+        let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
         let report = provider.reindex_embeddings(project.as_deref(), force, dry_run)?;
         print_json(&serde_json::to_value(&report)?);
         Ok(())
@@ -966,5 +1051,22 @@ mod tests {
             msg.contains("--set") && msg.contains('='),
             "expected clear --set error mentioning '=', got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_duration_supports_units() {
+        assert_eq!(parse_duration("30d").unwrap(), 30 * 86_400);
+        assert_eq!(parse_duration("12h").unwrap(), 12 * 3_600);
+        assert_eq!(parse_duration("45m").unwrap(), 45 * 60);
+        assert_eq!(parse_duration("8w").unwrap(), 8 * 604_800);
+        assert_eq!(parse_duration("30s").unwrap(), 30);
+    }
+
+    #[test]
+    fn parse_duration_rejects_bad_input() {
+        assert!(parse_duration("30").is_err()); // missing unit
+        assert!(parse_duration("30x").is_err()); // unknown unit
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("d").is_err()); // no number
     }
 }

@@ -1,5 +1,4 @@
 use engram::config::Config;
-use engram::graph::GraphEngine;
 use engram::mcp::server::{DefaultMemoryProvider, McpServer};
 use engram::storage::MemoryRepository;
 use std::sync::Arc;
@@ -34,14 +33,10 @@ fn run_mcp_server() -> anyhow::Result<()> {
 
     let repo = MemoryRepository::new(&config.storage.database_path)?;
     repo.initialize_schema()?;
-    repo.migrate_fts5_add_tags()?;
     tracing::info!("SQLite schema initialized");
 
-    let graph = GraphEngine::new();
-    tracing::info!("Graph engine initialized");
-
     let worker_threads = config.mcp.worker_threads;
-    let provider = Arc::new(DefaultMemoryProvider::new(repo, graph, config));
+    let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
     let server = McpServer::with_provider_and_workers(provider, worker_threads);
     tracing::info!("Starting engram MCP server on stdio ({worker_threads} workers)...");

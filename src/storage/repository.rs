@@ -4,7 +4,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Wrapper for a memory with its FTS5 BM25 relevance score.
 #[derive(Debug, Clone)]
@@ -20,6 +20,36 @@ pub struct ArchivedRow {
     pub memory_type: String,
     pub label: String,
     pub archived_at: i64,
+}
+
+/// Outcome of a garbage-collection pass over archived memories (for `gc_archived`).
+///
+/// `applied=false` (dry-run) lists what *would* be removed; `applied=true`
+/// lists what was actually deleted.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GcReport {
+    pub applied: bool,
+    pub older_than_seconds: i64,
+    /// `(memory_type, count)` pairs in `MemoryKind::all()` order.
+    pub per_type: Vec<(String, usize)>,
+    /// Deleted (or would-be-deleted) memory ids with their type.
+    pub deleted: Vec<GcDeletedRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GcDeletedRow {
+    pub memory_type: String,
+    pub id: String,
+}
+
+/// One edge of a file entity's neighborhood, for `related_files_for` / the MCP
+/// `related_files` tool. `direction` is relative to the queried file entity
+/// (`outgoing` = it is the `from_entity`, `incoming` = it is the `to_entity`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelatedFileEdge {
+    pub other_name: String,
+    pub relation_type: String,
+    pub direction: String,
 }
 
 /// Aggregated feedback for one distinct query string (for `query_stats`).
@@ -112,10 +142,28 @@ impl MemoryKind {
     }
 }
 
+/// Highest schema version produced by [`MemoryRepository::initialize_schema`].
+///
+/// Existing databases whose `PRAGMA user_version` is below this are migrated
+/// forward; new databases are created at this version directly (no registered
+/// migration runs on a fresh DB — the CREATE statements already encode it).
+/// Bump this whenever a new migration is appended to
+/// [`MemoryRepository::migrations`].
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
+/// A single registered migration: receives the repository and either succeeds
+/// or returns an error. Factored into a type alias to keep `migrations()`'s
+/// signature readable (clippy::type_complexity).
+type MigrationFn = fn(&MemoryRepository) -> Result<()>;
+
 /// Repository for all memory CRUD operations with FTS5 dual-write.
 ///
 pub struct MemoryRepository {
     pool: Pool<SqliteConnectionManager>,
+    /// Filesystem path of the database (`None` for in-memory). Used to open an
+    /// isolated connection for operations that cannot share the pool
+    /// (e.g. `VACUUM`, which requires no other active connection).
+    db_path: Option<PathBuf>,
 }
 
 impl MemoryRepository {
@@ -128,7 +176,10 @@ impl MemoryRepository {
         let pool = Pool::builder()
             .build(manager)
             .context("failed to build connection pool")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: Some(db_path.to_path_buf()),
+        })
     }
 
     /// Open an in-memory database (for testing).
@@ -142,7 +193,10 @@ impl MemoryRepository {
             .max_size(1)
             .build(manager)
             .context("failed to build in-memory pool")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: None,
+        })
     }
 
     /// PRAGMAs applied to every pooled connection at init (via `with_init`).
@@ -341,8 +395,9 @@ impl MemoryRepository {
         tx.commit()?;
         drop(conn);
 
-        // 对既有库补列（新库的 CREATE TABLE 已带该列，迁移会检测到并跳过）。
-        self.migrate_add_archived_at()?;
+        // Versioned migrations: stamp/advance `PRAGMA user_version` and run any
+        // pending registered migrations. See `run_migrations`.
+        self.run_migrations()?;
 
         Ok(())
     }
@@ -481,6 +536,112 @@ impl MemoryRepository {
             }
         }
         Ok(())
+    }
+
+    // ─── Schema versioning ───────────────────────────────────────
+
+    /// Registered migrations, ordered by their target schema version.
+    ///
+    /// Each entry is `(target_version, migrate_fn)` — `target_version` is the
+    /// version reached *after* the migration runs. A migration only runs when
+    /// `predecessor < user_version <= target` would advance it, i.e. when the
+    /// current `user_version` is below its target.
+    ///
+    /// Migrations MUST be idempotent (re-running on an already-migrated DB is a
+    /// no-op) and MUST NOT rely on an outer transaction.
+    ///
+    /// NOTE: the legacy `archived_at` column and the FTS5 `tags` column are NOT
+    /// in this registry — they are baked into `initialize_schema`'s CREATE
+    /// statements. New databases get them directly. Legacy databases (detected
+    /// at `user_version == 0`) have these two historical migrations applied
+    /// idempotently by [`Self::run_migrations`] before being stamped to
+    /// `CURRENT_SCHEMA_VERSION`; the FTS rebuild only fires when the `tags`
+    /// column is actually missing.
+    fn migrations() -> &'static [(i32, MigrationFn)] {
+        // Empty for now: CURRENT_SCHEMA_VERSION == 1 corresponds to the schema
+        // as built by initialize_schema. Append future migrations here, e.g.:
+        //     static REG: [(i32, MigrationFn); 1] =
+        //         [(2, Self::migrate_add_something)];
+        //     &REG
+        &[]
+    }
+
+    /// Advance the database schema to [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// Safe mapping of the legacy (un-versioned) world:
+    /// - `user_version == CURRENT` → nothing to do.
+    /// - `user_version == 0` with memory tables already present → a legacy
+    ///   database created/migrated by the older probe-based code (which never
+    ///   set `user_version`). Run the two historical idempotent migrations
+    ///   (`archived_at`, FTS `tags`) to ensure completeness, then stamp to
+    ///   CURRENT. Both probe before altering, so an already-complete DB is
+    ///   untouched — the FTS rebuild only fires when the `tags` column is
+    ///   actually missing.
+    /// - `user_version == 0` with no memory tables → fresh DB just created by
+    ///   `initialize_schema`; stamped to CURRENT.
+    /// - `0 < user_version < CURRENT` → run registered migrations forward,
+    ///   bumping the version after each successful migration.
+    pub fn run_migrations(&self) -> Result<()> {
+        let current = self.user_version()?;
+        if current == CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        if current == 0 {
+            if self.has_memory_tables()? {
+                // Legacy DB created/migrated by the older probe-based code
+                // (which never set user_version). Its schema may be incomplete:
+                // the FTS5 `tags` column was historically added only by an
+                // explicit startup call that not every entry point made. Both
+                // historical migrations probe before altering, so an
+                // already-complete DB is untouched.
+                tracing::info!(
+                    "schema migration: legacy DB at user_version=0; applying \
+                     idempotent historical migrations then stamping to \
+                     v{CURRENT_SCHEMA_VERSION}"
+                );
+                self.migrate_add_archived_at()?;
+                self.migrate_fts5_add_tags()?;
+            } else {
+                tracing::info!("schema migration: fresh DB; stamping to v{CURRENT_SCHEMA_VERSION}");
+            }
+            self.set_user_version(CURRENT_SCHEMA_VERSION)?;
+            return Ok(());
+        }
+
+        for &(target, migrate_fn) in Self::migrations() {
+            if target > current && target <= CURRENT_SCHEMA_VERSION {
+                tracing::info!("schema migration: applying migration to v{target}");
+                migrate_fn(self)?;
+                self.set_user_version(target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the current `PRAGMA user_version`.
+    pub fn user_version(&self) -> Result<i32> {
+        let conn = self.conn()?;
+        let v: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(v)
+    }
+
+    /// Stamp `PRAGMA user_version` to `v`. Uses `execute_batch` — the pragma
+    /// helper wraps the call in a savepoint, which is unnecessary here.
+    pub fn set_user_version(&self, v: i32) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute_batch(&format!("PRAGMA user_version = {v};"))?;
+        Ok(())
+    }
+
+    /// Whether the legacy memory tables exist (heuristic for "was this DB
+    /// created/migrated by the older probe-based code at user_version=0").
+    fn has_memory_tables(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists = conn
+            .prepare("SELECT 1 FROM episodic_memories LIMIT 0")
+            .is_ok();
+        Ok(exists)
     }
 
     // ─── Entity Linking Helper ────────────────────────────────────
@@ -1134,6 +1295,115 @@ impl MemoryRepository {
         Ok(results)
     }
 
+    // ─── Garbage Collection ───────────────────────────────────────
+
+    /// Physically delete archived memories older than `older_than_seconds`.
+    ///
+    /// Candidates are rows with `archived_at IS NOT NULL AND
+    /// archived_at < now - older_than_seconds`. When `older_than_seconds <= 0`,
+    /// *all* archived rows match (the CLI `--all` mode). `apply=false` is a
+    /// dry run: nothing is deleted, but the report lists what *would* go.
+    /// Deleting also purges the FTS index, graph relations/entities, and any
+    /// stored embedding (see the `delete_*` macros in `storage/macros.rs`).
+    ///
+    /// Checkpoint/vacuum are deliberately separate (`wal_checkpoint_truncate`,
+    /// `vacuum`) so callers control when free space is actually reclaimed.
+    pub fn gc_archived(&self, older_than_seconds: i64, apply: bool, now: i64) -> Result<GcReport> {
+        // `<= 0` means "all archived": use a threshold nothing is below.
+        let threshold = if older_than_seconds > 0 {
+            now - older_than_seconds
+        } else {
+            i64::MAX
+        };
+
+        let mut per_type = Vec::new();
+        let mut deleted = Vec::new();
+
+        for kind in MemoryKind::all() {
+            // Collect candidates first so we don't hold a read cursor while
+            // the per-row delete_* opens its own transaction.
+            let candidates: Vec<(String, String)> = {
+                let conn = self.conn()?;
+                let sql = format!(
+                    "SELECT id, project_id FROM {} \
+                     WHERE archived_at IS NOT NULL AND archived_at < ?1",
+                    kind.table()
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![threshold], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+
+            let kind_str = kind.as_str().to_string();
+            per_type.push((kind_str.clone(), candidates.len()));
+
+            for (id, project_id) in candidates {
+                let removed = if apply {
+                    match kind {
+                        MemoryKind::Episodic => self.delete_episodic(&id, &project_id)?,
+                        MemoryKind::Decision => self.delete_decision(&id, &project_id)?,
+                        MemoryKind::Failure => self.delete_failure(&id, &project_id)?,
+                        MemoryKind::Procedural => self.delete_procedural(&id, &project_id)?,
+                    }
+                } else {
+                    // Dry run: report every candidate as "would delete".
+                    true
+                };
+                if removed {
+                    deleted.push(GcDeletedRow {
+                        memory_type: kind_str.clone(),
+                        id,
+                    });
+                }
+            }
+        }
+
+        Ok(GcReport {
+            applied: apply,
+            older_than_seconds,
+            per_type,
+            deleted,
+        })
+    }
+
+    /// Truncate the WAL back into the main database file. Best-effort: any
+    /// failure is logged and swallowed (SQLite self-checkpoints on close).
+    ///
+    /// Uses `execute_batch` because the pragma helper wraps the call in a
+    /// savepoint and `wal_checkpoint` cannot run inside a transaction. The
+    /// pooled connection is in autocommit mode outside an explicit
+    /// transaction, so this runs cleanly; if a caller left a transaction open
+    /// the checkpoint simply no-ops with a warning.
+    pub fn wal_checkpoint_truncate(&self) -> Result<()> {
+        let conn = self.conn()?;
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            tracing::warn!("wal_checkpoint(TRUNCATE) failed (non-fatal): {e}");
+        }
+        Ok(())
+    }
+
+    /// Rebuild the database file, reclaiming free pages. Opens an isolated
+    /// (non-pooled) connection because `VACUUM` requires no other active
+    /// connection in WAL mode. Errors out for in-memory databases; callers
+    /// should run this while the MCP server is stopped.
+    pub fn vacuum(&self) -> Result<()> {
+        let db_path = self
+            .db_path
+            .as_ref()
+            .context("VACUUM requires a file-backed database (in-memory DBs cannot be vacuumed)")?;
+        let conn = rusqlite::Connection::open(db_path).with_context(|| {
+            format!(
+                "failed to open isolated connection for VACUUM at {}",
+                db_path.display()
+            )
+        })?;
+        conn.execute_batch("VACUUM;")
+            .context("VACUUM failed (is another process using the database?)")?;
+        Ok(())
+    }
+
     // ─── Entity / Graph CRUD ───────────────────────────────────────
 
     /// Map a row to an Entity. Centralizes the repeated row mapping logic.
@@ -1244,6 +1514,63 @@ impl MemoryRepository {
             results.push(Self::row_to_relation(row)?);
         }
         Ok(results)
+    }
+
+    /// Resolve a file entity by name and return its graph neighborhood
+    /// directly from the indexed `graph_relations` table — *without* loading
+    /// the whole project graph into memory. Powers the MCP `related_files`
+    /// tool, replacing the earlier full-graph `load_from_repo` approach.
+    ///
+    /// Returns `(entity_id, edges)`; `entity_id` is `None` when no `File`
+    /// entity with that name exists in the project.
+    pub fn related_files_for(
+        &self,
+        file_name: &str,
+        project_id: &str,
+    ) -> Result<(Option<String>, Vec<RelatedFileEdge>)> {
+        let conn = self.conn()?;
+
+        // Resolve the File entity id, scoped to entity_type='File' (entities may
+        // share a name across types under the UNIQUE(project_id,entity_type,name)
+        // constraint; the tool's semantics are file-scoped).
+        let entity_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities \
+                 WHERE name = ?1 AND project_id = ?2 AND entity_type = 'File' LIMIT 1",
+                params![file_name, project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let edges = match entity_id {
+            None => Vec::new(),
+            Some(ref eid) => {
+                // One JOIN pulls every neighbor: the other endpoint's name, the
+                // relation type, and the direction relative to this file.
+                let mut stmt = conn.prepare(
+                    "SELECT o.name, r.relation_type,
+                            CASE WHEN r.from_entity = e.id THEN 'outgoing'
+                                 ELSE 'incoming' END AS direction
+                     FROM entities e
+                     JOIN graph_relations r
+                       ON r.from_entity = e.id OR r.to_entity = e.id
+                     JOIN entities o
+                       ON o.id = CASE WHEN r.from_entity = e.id
+                                      THEN r.to_entity ELSE r.from_entity END
+                     WHERE e.id = ?1",
+                )?;
+                let rows = stmt.query_map(params![eid.as_str()], |row| {
+                    Ok(RelatedFileEdge {
+                        other_name: row.get(0)?,
+                        relation_type: row.get(1)?,
+                        direction: row.get(2)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        Ok((entity_id, edges))
     }
 
     pub fn remove_relation(&self, id: i64) -> Result<bool> {
@@ -1444,6 +1771,60 @@ mod tests {
 
     fn now() -> i64 {
         chrono::Utc::now().timestamp()
+    }
+
+    // ─── Schema Versioning Tests ──────────────────────────────────
+
+    #[test]
+    fn new_db_is_stamped_to_current_version() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_db_at_v0_with_tables_is_stamped_without_destructive_migrations() {
+        // Simulate a legacy DB: schema built, then user_version forced back to 0
+        // (as if created by the older probe-based code that never set the pragma).
+        let repo = setup_repo();
+        repo.set_user_version(0).unwrap();
+        assert_eq!(repo.user_version().unwrap(), 0);
+
+        // Seed a row + its FTS index entry; if run_migrations re-ran the legacy
+        // FTS rebuild it would DROP+recreate the FTS tables and lose searchability.
+        let mem = EpisodicMemory {
+            id: "legacy-1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "legacy summary".into(),
+            content: "legacy content".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.0,
+            tags: vec![],
+            created_at: now(),
+            updated_at: now(),
+        };
+        repo.create_episodic(&mem).unwrap();
+
+        // v0 DB with tables present → stamped to CURRENT, no migration runs.
+        repo.run_migrations().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        // FTS index intact → the seeded row is still searchable.
+        let hits = repo.search_episodic("legacy", "p", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.id, "legacy-1");
+    }
+
+    #[test]
+    fn run_migrations_is_idempotent() {
+        let repo = setup_repo();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        // Re-running on an already-current DB (and re-initializing) is a no-op.
+        repo.run_migrations().unwrap();
+        repo.initialize_schema().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     // ─── Episodic Memory Tests ─────────────────────────────────────
@@ -1717,6 +2098,46 @@ mod tests {
     }
 
     // ─── Entity / Graph Tests ──────────────────────────────────────
+
+    #[test]
+    fn related_files_for_returns_file_neighborhood() {
+        let repo = setup_repo();
+        // create_episodic links a Memory entity to a File entity per
+        // files_touched via a "Touches" relation (ensure_linked_entities).
+        let mem = EpisodicMemory {
+            id: "e1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "summary".into(),
+            content: "content".into(),
+            files_touched: vec!["auth.ts".into()],
+            related_commits: vec![],
+            importance: 0.0,
+            tags: vec![],
+            created_at: now(),
+            updated_at: now(),
+        };
+        repo.create_episodic(&mem).unwrap();
+
+        let (entity_id, edges) = repo.related_files_for("auth.ts", "p").unwrap();
+        assert!(entity_id.is_some(), "File entity for auth.ts should exist");
+        let touches: Vec<_> = edges
+            .iter()
+            .filter(|e| e.relation_type == "Touches")
+            .collect();
+        assert_eq!(touches.len(), 1, "expected one Touches edge");
+        // The other endpoint is the memory entity, named by its memory id.
+        assert_eq!(touches[0].other_name, "e1");
+        assert_eq!(touches[0].direction, "incoming");
+    }
+
+    #[test]
+    fn related_files_for_unknown_file_is_empty() {
+        let repo = setup_repo();
+        let (entity_id, edges) = repo.related_files_for("nope.ts", "p").unwrap();
+        assert!(entity_id.is_none());
+        assert!(edges.is_empty());
+    }
 
     #[test]
     fn test_entity_and_graph_crud() {
@@ -2145,6 +2566,114 @@ mod tests {
             .load_active_embeddings("p", "minilm")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn delete_memory_also_removes_its_embedding() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        seed_episodic(&repo, "m1");
+        repo.upsert_embedding("m1", "episodic", "p", &[0.1, 0.2, 0.3], "minilm", 3)
+            .unwrap();
+        assert_eq!(repo.load_active_embeddings("p", "minilm").unwrap().len(), 1);
+
+        // Hard-deleting the memory must purge its embedding too (regression:
+        // the delete macro used to leave memory_embeddings rows orphaned).
+        assert!(repo.delete_episodic("m1", "p").unwrap());
+        assert!(repo
+            .load_active_embeddings("p", "minilm")
+            .unwrap()
+            .is_empty());
+    }
+
+    // ─── Garbage Collection Tests ─────────────────────────────────
+
+    #[test]
+    fn gc_dry_run_keeps_archived_rows() {
+        let repo = setup_repo();
+        seed_episodic(&repo, "g1");
+        // Archived long ago (archived_at = 1000).
+        repo.archive(MemoryKind::Episodic, "g1", "p", 1000).unwrap();
+
+        let report = repo.gc_archived(1, false, now()).unwrap();
+        assert!(!report.applied);
+        assert_eq!(report.deleted.len(), 1);
+        // Dry run: row still present.
+        assert!(repo.get_episodic("g1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_apply_deletes_expired_archived_and_embedding() {
+        let repo = setup_repo();
+        seed_episodic(&repo, "g1");
+        repo.upsert_embedding("g1", "episodic", "p", &[0.1], "minilm", 1)
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "g1", "p", 1000).unwrap();
+
+        let report = repo.gc_archived(1, true, now()).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.per_type[0].0, "episodic");
+        assert_eq!(report.per_type[0].1, 1);
+        // Physically gone, and its embedding purged too.
+        assert!(repo.get_episodic("g1").unwrap().is_none());
+        assert!(repo
+            .load_active_embeddings("p", "minilm")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn gc_skips_recently_archived() {
+        let repo = setup_repo();
+        seed_episodic(&repo, "g1");
+        let recent = now();
+        repo.archive(MemoryKind::Episodic, "g1", "p", recent)
+            .unwrap();
+
+        // older_than=3600s: the just-archived row is not yet expired.
+        let report = repo.gc_archived(3600, true, now()).unwrap();
+        assert_eq!(report.deleted.len(), 0);
+        assert!(repo.get_episodic("g1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_all_mode_deletes_every_archived() {
+        let repo = setup_repo();
+        seed_episodic(&repo, "g1");
+        // Recently archived, but --all (older_than=0) ignores age.
+        repo.archive(MemoryKind::Episodic, "g1", "p", now())
+            .unwrap();
+
+        let report = repo.gc_archived(0, true, now()).unwrap();
+        assert_eq!(report.deleted.len(), 1);
+        assert!(repo.get_episodic("g1").unwrap().is_none());
+    }
+
+    #[test]
+    fn wal_checkpoint_runs_on_file_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = MemoryRepository::new(&tmp.path().join("gc.db")).unwrap();
+        repo.initialize_schema().unwrap();
+        seed_episodic(&repo, "g1");
+        // Should not error (best-effort, but expected to succeed on a quiet DB).
+        repo.wal_checkpoint_truncate().unwrap();
+    }
+
+    #[test]
+    fn vacuum_reclaims_file_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = MemoryRepository::new(&tmp.path().join("gc.db")).unwrap();
+        repo.initialize_schema().unwrap();
+        seed_episodic(&repo, "g1");
+        // VACUUM via an isolated connection on a quiet DB succeeds.
+        repo.vacuum().unwrap();
+    }
+
+    #[test]
+    fn vacuum_errors_on_in_memory_db() {
+        let repo = setup_repo();
+        assert!(repo.vacuum().is_err());
     }
 
     #[test]

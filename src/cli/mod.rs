@@ -5,7 +5,7 @@ use anyhow::Result;
 /// Usage text for `engram help`/`--help`/`-h`. (No-argument invocation starts
 /// the MCP server — see `main.rs` — so this is reached only via an explicit
 /// help flag or an unknown command.)
-const USAGE: &str = "Usage: engram <command> [options]\n\nCommands:\n  search            Search memories\n  create-episodic   Create episodic memory\n  create-decision   Create decision memory\n  create-failure    Create failure memory\n  create-procedural Create procedural memory\n  ingest            Ingest git commits\n  collect           Collect bootstrap evidence from a project\n  recent-failures   List recent failures\n  decisions         List architectural decisions\n  timeline          Show project timeline\n  queries           Show popular search queries (retrieval feedback)\n  forget            Archive (soft-delete) a memory by id\n  restore           Un-archive a memory by id\n  update            Patch fields of a memory (--set key=value)\n  forget-batch      Archive memories by --tag/--before (dry-run; --apply to commit)\n  list-archived     List archived memories\n  consolidate       Find/merge duplicate memories (--near, --apply)\n  reindex           Backfill embeddings for existing memories (semantic build)\n  init              Initialize database\n  init-guide        Generate ENGRAM.md agent guide; optionally @import into CLAUDE.md\n\nRun 'engram' with no arguments to start the MCP server (stdio).";
+const USAGE: &str = "Usage: engram <command> [options]\n\nCommands:\n  search            Search memories\n  create-episodic   Create episodic memory\n  create-decision   Create decision memory\n  create-failure    Create failure memory\n  create-procedural Create procedural memory\n  ingest            Ingest git commits\n  collect           Collect bootstrap evidence from a project\n  recent-failures   List recent failures\n  decisions         List architectural decisions\n  timeline          Show project timeline\n  queries           Show popular search queries (retrieval feedback)\n  forget            Archive (soft-delete) a memory by id\n  restore           Un-archive a memory by id\n  update            Patch fields of a memory (--set key=value)\n  forget-batch      Archive memories by --tag/--before (dry-run; --apply to commit)\n  list-archived     List archived memories\n  gc                Garbage-collect archived memories + reclaim WAL space (dry-run; --apply)\n  consolidate       Find/merge duplicate memories (--near, --apply)\n  reindex           Backfill embeddings for existing memories (semantic build)\n  init              Initialize database\n  init-guide        Generate ENGRAM.md agent guide; optionally @import into CLAUDE.md\n\nRun 'engram' with no arguments to start the MCP server (stdio).";
 
 /// Run the CLI with the given arguments.
 pub fn run(args: &[String]) -> Result<()> {
@@ -40,6 +40,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "update" => commands::update(cmd_args),
         "forget-batch" => commands::forget_batch(cmd_args),
         "list-archived" => commands::list_archived(cmd_args),
+        "gc" => commands::gc(cmd_args),
         "consolidate" => commands::consolidate(cmd_args),
         "reindex" => commands::reindex(cmd_args),
         "init" => commands::init(cmd_args),
@@ -86,5 +87,10 @@ mod tests {
     #[test]
     fn usage_lists_reindex() {
         assert!(USAGE.contains("reindex"));
+    }
+
+    #[test]
+    fn usage_lists_gc() {
+        assert!(USAGE.contains("Garbage-collect"));
     }
 }
