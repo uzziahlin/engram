@@ -40,6 +40,20 @@ install_binary() {
     xattr -d com.apple.quarantine "$_tmp" 2>/dev/null || true
   fi
   mv -f "$_tmp" "$_dst"
+  # macOS 15+ (Sequoia/Tahoe): a Rust ad-hoc-signed binary (linker-signed at
+  # build time) copied to a new path fails AMFI provenance validation and is
+  # SIGKILL'd at exec — kernel logs "load code signature error 2". The process
+  # dies before MCP's stdio loop starts, so clients report "Transport not
+  # connected". Re-sign at the destination so a fresh ad-hoc signature is
+  # anchored to this path; provenance is per-machine, so CI-side signing can't
+  # help. codesign ships with macOS (/usr/bin/codesign).
+  if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+    if codesign --force --sign - "$_dst" >/dev/null 2>&1; then
+      ok "Re-signed ad-hoc for macOS launch"
+    else
+      warn "codesign failed; macOS may SIGKILL the binary on launch"
+    fi
+  fi
 }
 
 # --- initialize the database ---
