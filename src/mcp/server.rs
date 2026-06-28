@@ -1082,80 +1082,47 @@ impl Default for McpServer {
     }
 }
 
+/// Generate `NoopProvider` stub methods returning fixed placeholder JSON.
+///
+/// Each entry is `name, InputType, { json object }`; entries are `;`-separated
+/// because the JSON object literal contains commas. The `{...}` is captured as
+/// a single token tree and forwarded verbatim to `serde_json::json!`.
+macro_rules! noop_stubs {
+    ($($name:ident, $input:ty, $json:tt);* $(;)?) => {
+        $(
+            fn $name(&self, _: $input) -> Result<serde_json::Value> {
+                Ok(serde_json::json!($json))
+            }
+        )*
+    };
+}
 impl McpServer {
     pub fn new() -> Self {
         struct NoopProvider;
         impl MemoryToolProvider for NoopProvider {
-            fn search_memory(&self, _: SearchMemoryInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"results": [], "total": 0}))
-            }
-            fn related_files(&self, _: RelatedFilesInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"entities": []}))
-            }
-            fn timeline(&self, _: TimelineInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"events": []}))
-            }
-            fn recent_failures(&self, _: RecentFailuresInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"failures": []}))
-            }
-            fn query_stats(&self, _: QueryStatsInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"queries": []}))
-            }
-            fn architectural_decisions(
-                &self,
-                _: ArchitecturalDecisionsInput,
-            ) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"decisions": []}))
-            }
-            fn create_episodic(&self, _: CreateEpisodicInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn create_decision(&self, _: CreateDecisionInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn create_failure(&self, _: CreateFailureInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn create_procedural(&self, _: CreateProceduralInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn ingest_commits(&self, _: IngestCommitsInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"ingested": 0}))
-            }
-            fn collect_sources(&self, _: CollectSourcesInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"summary": {"total_items": 0}}))
-            }
-            fn forget_memory(&self, _: ForgetMemoryInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"archived": false, "status": "noop"}))
-            }
-            fn restore_memory(&self, _: RestoreMemoryInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"restored": false, "status": "noop"}))
-            }
-            fn update_memory(&self, _: UpdateMemoryInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn forget_batch(&self, _: ForgetBatchInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"applied": false, "matched": [], "count": 0}))
-            }
-            fn list_archived(&self, _: ListArchivedInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"archived": [], "count": 0}))
-            }
-            fn consolidate_memories(&self, _: ConsolidateInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"applied": false, "plans": [], "total_archived": 0}))
-            }
-            fn reflect(&self, _: ReflectInput) -> Result<serde_json::Value> {
-                Ok(
-                    serde_json::json!({"applied": false, "proposed": 0, "created": 0, "suggestions": []}),
-                )
-            }
-            fn list_suggestions(&self, _: ListSuggestionsInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"count": 0, "suggestions": []}))
-            }
-            fn confirm_suggestion(&self, _: SuggestionIdInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
-            }
-            fn reject_suggestion(&self, _: SuggestionIdInput) -> Result<serde_json::Value> {
-                Ok(serde_json::json!({"id": "", "status": "noop"}))
+            noop_stubs! {
+                search_memory, SearchMemoryInput, {"results": [], "total": 0};
+                related_files, RelatedFilesInput, {"entities": []};
+                timeline, TimelineInput, {"events": []};
+                recent_failures, RecentFailuresInput, {"failures": []};
+                query_stats, QueryStatsInput, {"queries": []};
+                architectural_decisions, ArchitecturalDecisionsInput, {"decisions": []};
+                create_episodic, CreateEpisodicInput, {"id": "", "status": "noop"};
+                create_decision, CreateDecisionInput, {"id": "", "status": "noop"};
+                create_failure, CreateFailureInput, {"id": "", "status": "noop"};
+                create_procedural, CreateProceduralInput, {"id": "", "status": "noop"};
+                ingest_commits, IngestCommitsInput, {"ingested": 0};
+                collect_sources, CollectSourcesInput, {"summary": {"total_items": 0}};
+                forget_memory, ForgetMemoryInput, {"archived": false, "status": "noop"};
+                restore_memory, RestoreMemoryInput, {"restored": false, "status": "noop"};
+                update_memory, UpdateMemoryInput, {"id": "", "status": "noop"};
+                forget_batch, ForgetBatchInput, {"applied": false, "matched": [], "count": 0};
+                list_archived, ListArchivedInput, {"archived": [], "count": 0};
+                consolidate_memories, ConsolidateInput, {"applied": false, "plans": [], "total_archived": 0};
+                reflect, ReflectInput, {"applied": false, "proposed": 0, "created": 0, "suggestions": []};
+                list_suggestions, ListSuggestionsInput, {"count": 0, "suggestions": []};
+                confirm_suggestion, SuggestionIdInput, {"id": "", "status": "noop"};
+                reject_suggestion, SuggestionIdInput, {"id": "", "status": "noop"};
             }
         }
         Self {
