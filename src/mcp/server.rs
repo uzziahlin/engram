@@ -542,26 +542,16 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
         let since = chrono::Utc::now().timestamp() - (input.days * 86400);
-        let conn = repo.connection()?;
-
-        let mut stmt = conn.prepare(
-            "SELECT date(created_at, 'unixepoch') as day, COUNT(*) as cnt
-             FROM episodic_memories
-             WHERE project_id = ?1 AND created_at >= ?2 AND archived_at IS NULL
-             GROUP BY day ORDER BY day DESC",
-        )?;
-
-        let rows = stmt.query_map(rusqlite::params![input.project_id, since], |row| {
-            let day: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok(serde_json::json!({
-                "date": day,
-                "episodic_count": count,
-            }))
-        })?;
-
-        let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-
+        let rows = repo.timeline(&input.project_id, since)?;
+        let events: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "date": r.day,
+                    "episodic_count": r.count,
+                })
+            })
+            .collect();
         Ok(serde_json::json!({ "events": events }))
     }
 
