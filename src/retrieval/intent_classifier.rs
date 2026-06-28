@@ -150,6 +150,17 @@ impl IntentClassifier {
     /// Falls back to [General] if no keywords match.
     pub fn classify(&self, query: &str) -> Vec<MemoryIntent> {
         let lower = query.to_lowercase();
+
+        // Identifier-like queries (a single token joined by `-`/`_`, e.g. tags,
+        // file names, symbols like "unique-tag-test-xyz") are precise lookups
+        // meant to span all memory types. Don't let a substring keyword (e.g.
+        // "test") route them away from a type the user may want — only natural-
+        // language queries (whitespace-separated prose) go through intent
+        // routing.
+        if Self::is_identifier_like(&lower) {
+            return vec![MemoryIntent::General];
+        }
+
         let mut intents = Vec::new();
 
         for (keyword, intent_list) in &self.keyword_map {
@@ -199,6 +210,18 @@ impl IntentClassifier {
             from = end;
         }
         false
+    }
+
+    /// Whether `s` looks like an identifier (tag/file/symbol) rather than prose.
+    ///
+    /// True for a single whitespace-free token containing `-` or `_` joining
+    /// alphanumeric segments (e.g. "unique-tag-test-xyz", "auth_utils"). Such
+    /// queries are exact lookups and should hit every memory type, not be
+    /// narrowed by a coincidental keyword substring.
+    fn is_identifier_like(s: &str) -> bool {
+        !s.chars().any(|c| c.is_whitespace())
+            && (s.contains('-') || s.contains('_'))
+            && s.chars().any(|c| c.is_ascii_alphanumeric())
     }
 }
 
@@ -291,5 +314,38 @@ mod tests {
         assert!(classifier
             .classify("如何修复认证模块")
             .contains(&MemoryIntent::Debugging));
+    }
+
+    #[test]
+    fn test_identifier_like_query_routes_to_general() {
+        let classifier = IntentClassifier::new();
+        // Tags / symbols / filenames are precise lookups across all types —
+        // a coincidental keyword substring ("test" inside "unique-tag-test-xyz")
+        // must not narrow the search to Workflow (which excludes Decision).
+        for q in [
+            "unique-tag-test-xyz",
+            "auth_utils",
+            "e2e-test",
+            "fix-auth-bug",
+        ] {
+            let intents = classifier.classify(q);
+            assert_eq!(
+                intents,
+                vec![MemoryIntent::General],
+                "identifier-like query {q:?} should route to General, got {intents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prose_query_still_routes_by_keyword() {
+        let classifier = IntentClassifier::new();
+        // Natural-language queries (whitespace-separated prose) still route —
+        // "test" in a sentence legitimately suggests Workflow.
+        assert!(classifier
+            .classify("how to test the build")
+            .contains(&MemoryIntent::Workflow));
+        // A bare keyword with no separator still routes (not identifier-like).
+        assert!(classifier.classify("test").contains(&MemoryIntent::Workflow));
     }
 }
