@@ -20,5 +20,34 @@ after finishing meaningful work, write the matching memory below.
 - Need design background → architectural_decisions
 - Avoid repeating past bugs → recent_failures
 
+## Search tips (`search_memory`)
+
+Two query shapes route differently — pick by intent:
+
+- **Natural language** (whitespace-separated prose, e.g. `how to debug auth`):
+  intent-routed — prioritizes memory types relevant to the detected intent
+  (Debugging→failures+episodic, Architecture→decisions, …). Best for *concept*
+  queries where you want noise reduced.
+- **Identifier / exact lookup** (a single token with `-` or `_`, e.g. a tag
+  `unique-tag-test-xyz`, filename `auth_utils`, symbol `parse_duration`):
+  classified as General and searches **all** memory types for full recall.
+  Pass it verbatim — don't split it into words.
+
+Tokenization: FTS5 splits on `-`/`_`/punctuation, so `auth-utils` matches both
+`auth` and `utils`. CJK is matched per-character.
+
+Tags: search by the tag string directly (tags are indexed).
+
+When results are thin: flip query shape (prose ↔ identifier), widen the
+wording, or pivot via `related_files` (memories touching a file).
+
+## Feedback tools (read the store's health)
+
+- `recent_failures` — before chasing a bug, check a similar failure is already
+  documented (don't re-solve it).
+- `query_stats` — which queries run often and their average hit count. A query
+  with high count but low `result_count_avg` means the store isn't satisfying
+  it → a signal to write the missing memory or refine tags.
+
 Full parameter schemas come from MCP; this guide covers *when* to use each tool
 and project conventions. All tools require project_id = "{{PROJECT_ID}}".

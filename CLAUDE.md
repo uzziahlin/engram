@@ -27,6 +27,14 @@
 - **修改文件前** → `related_files` 查看该文件的历史关联
 - **需要了解项目背景时** → `architectural_decisions`
 
+### 搜索技巧（`search_memory`）
+
+- **自然语言 query**（如「如何调试认证」）→ 按意图路由到相关记忆类型（降噪）
+- **标识符 query**（tag / 文件名 / 符号，如 `auth-utils`、`unique-tag-test-xyz`）→ 全查所有类型（保召回），直接传原文、不要拆词
+- **找不到时**：换 query 形态（自然语言 ↔ 标识符）、放宽措辞、或用 `related_files` 从文件反查关联记忆
+- **反馈工具**：`query_stats` 看哪些 query 命中率低（低 = 该补相关记忆）；`recent_failures` 改 bug 前查同类故障避免重复踩坑
+- 详细机制（FTS5 分词、CJK、路由规则）见 `@ENGRAM.md` 的 Search tips
+
 ### 示例
 
 **场景：修复了一个 FTS5 搜索崩溃的 bug**
