@@ -4,6 +4,8 @@
 > **基线**：commit `b116b67`，`src/mcp/server.rs` = 3468 行（其中测试 ~1365 行，占 39%）
 > **状态图例**：每个 Phase = 一个独立 PR，可单独 review / merge / 回滚
 > **硬约束**：每个 Phase 完成后，lib 190 测试 + e2e 必须全绿（**零行为变更**）
+>
+> **✅ 完成（2026-06-29）**：5 个 Phase 落地（0 测试外移 / 1 embedding 独立 / 2 传输层独立 / 5 SQL 回收 / 4 NoopProvider 宏化），Phase 3 评审后放弃（避免过度设计）。server.rs 生产代码 2103→**1711 行**（-392），拆出 `embedding_service.rs`(326) + `transport.rs`(134) + `server_tests.rs`(1367)。全程 lib 187 + e2e 4 全绿、双 feature clippy `-D warnings` 通过。注：`MemoryToolProvider` trait 实为 **22** 方法（非早先所记 23）。分支 `refactor/server-decompose`。
 
 ---
 
@@ -156,7 +158,9 @@
 - **风险**：极低。
 - **验收**：`timeline` 工具输出与重构前完全一致（`test_jsonrpc_timeline` 测试兜底）；mcp 层 grep `SELECT/INSERT/UPDATE/DELETE` 无业务 SQL 残留。
 
-### Phase 3 · create_* 去重（P2，**可选，易过度设计**）
+### Phase 3 · create_* 去重　⊘ 评审后放弃（2026-06-29，避免过度设计）
+
+> **评审结论**：放弃。create_* 骨架虽重复，但核心是构造特定 Memory struct（字段 inherent 差异）；泛型化需新建 trait `CreateInput` + 4 个 Input impl（`into_memory`/`validate`）+ repo 侧泛型 create。`into_memory` 的字段映射本质与现有构造 Memory 相同，只是搬到 trait impl——**不减少复杂度、只移动它并加间接层**。净省 ~60 行却增一整层抽象与理解成本，属典型过度设计。保留 4 个 `create_*` 原样（共 ~145 行，清晰直白）。符合本设计预案「不顺手则放弃」。
 
 - **目标**：4 个 `create_*`（897–1040，共 ~145 行）骨架高度重复，评估泛型化收益。
 - **现状**：骨架一致（`lock_repo` + now + uuid + 构造 Memory + `repo.create_xxx` + `index_embedding` + 返回 json），差异仅在：字段映射、校验（importance 0–1 / severity 1–5）、memory_type 字符串、返回额外字段（failure 塞 severity）。
@@ -179,7 +183,9 @@
 - **风险**：中（过度设计）。
 - **验收**：若实施——4 个 create 工具行为不变（现有 create 测试兜底）；代码净减且更易读。
 
-### Phase 4 · 工具注册单一事实源（P2，**PoC 先行**）
+### Phase 4 · 工具注册单一事实源（选项 c）　✅ 已完成（2026-06-29）
+
+> **落地**：选项 (c)——NoopProvider 的 22 个重复 stub 用 `noop_stubs!` 声明宏生成（`$name:ident,$input:ty,$json:tt` 三元组、`;` 分隔、`$json:tt` 捕获 token tree 透传 `json!()`），加工具时从「手写新 fn」→「列表加一行」，减一处同步点。22 个占位 JSON 逐字保留（零行为变更）。选项 (a) schemars 未做（需引新依赖 + 全量 Input struct 改 + schema 还原度风险，单独立项）。
 
 - **目标**：根治「加工具改 6 处」与「schema/Input 双事实源漂移」。
 - **三选项权衡**：
@@ -201,9 +207,9 @@
 
 | 批次 | Phase | 产出 | 风险 |
 |---|---|---|---|
-| **P0**（先做，立竿见影） | **0 测试外移 ✅** → 1 embedding 独立 → 5 SQL 回收 | server.rs 砍掉 ~1600 行、职责清晰、消除最后裸 SQL | 低 |
-| **P1** | 2 传输层独立 | 传输/业务分离，为 HTTP transport 铺路 | 中 |
-| **P2**（易过度设计，克制） | 3 create_* 去重（可选）→ 4 工具注册（PoC 先行） | 降同步点 | 中-高 |
+| **P0**（先做，立竿见影） | **0 ✅** → **1 ✅** → **5 ✅** | server.rs 生产代码 2103→1711、embedding/传输独立、消除最后裸 SQL | 低 |
+| **P1** | **2 ✅** | 传输/业务分离，为 HTTP transport 铺路 | 中 |
+| **P2**（易过度设计，克制） | 3 ⊘ 放弃 → **4 ✅**（NoopProvider 宏化） | NoopProvider 减一处同步点 | 中 |
 
 > 每个 Phase 完成后：更新本文件状态、回写路线图 §4.1、commit 一个独立 PR。P2 的 Phase 3/4 在动工前需重新评审，确认抽象收益。
 
