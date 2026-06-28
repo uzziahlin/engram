@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::git_integration::GitIntegration;
 use crate::models::*;
+use crate::reflection::ReflectionEngine;
 use crate::storage::MemoryRepository;
 use anyhow::{Context, Result};
 use std::io::{self, IsTerminal, Write};
@@ -819,7 +820,9 @@ pub fn gc(args: &[String]) -> Result<()> {
     } else if let Some(d) = older_than {
         parse_duration(&d)?
     } else {
-        anyhow::bail!("gc requires either --older-than <dur> (e.g. 30d, 12h, 45m, 8w, 30s) or --all");
+        anyhow::bail!(
+            "gc requires either --older-than <dur> (e.g. 30d, 12h, 45m, 8w, 30s) or --all"
+        );
     };
 
     let config = load_config()?;
@@ -898,6 +901,83 @@ pub fn consolidate(args: &[String]) -> Result<()> {
     print_json(
         &serde_json::json!({"applied": apply, "plans": plans, "total_archived": total_archived}),
     );
+    Ok(())
+}
+
+/// `engram reflect --project <id> [--min <n>] [--apply]` — scan a project's
+/// active failures and propose preventive procedural rules for any tag
+/// recurring at least `--min` times (default: `[reflection].min_occurrences`).
+///
+/// Dry run by default: prints proposals without writing. Pass `--apply` to
+/// persist them as pending suggestions, which stay invisible to search until
+/// confirmed via `confirm-suggestion`.
+pub fn reflect(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let apply = args.iter().any(|a| a == "--apply");
+    let config = load_config()?;
+    let min = optional_num(args, "min")
+        .map(|n| n as usize)
+        .unwrap_or(config.reflection.min_occurrences);
+
+    let repo = open_repo(&config)?;
+    let engine = ReflectionEngine::with_min_occurrences(min);
+    let plan = engine.reflect(&repo, &project_id, apply, now_ts())?;
+
+    print_json(&serde_json::json!({
+        "applied": apply,
+        "min_occurrences": min,
+        "proposed": plan.suggestions.len(),
+        "created": plan.created,
+        "suggestions": serde_json::to_value(&plan.suggestions)?,
+    }));
+    Ok(())
+}
+
+/// `engram suggestions --project <id>` — list pending reflection proposals
+/// awaiting confirmation (each distills a recurring-failure tag into a draft
+/// preventive rule).
+pub fn suggestions(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let pending = repo.list_pending_suggestions(&project_id)?;
+    print_json(&serde_json::json!({
+        "count": pending.len(),
+        "suggestions": serde_json::to_value(&pending)?,
+    }));
+    Ok(())
+}
+
+/// `engram confirm-suggestion --project <id> --id <suggestion-id>` — promote a
+/// pending proposal into a searchable procedural memory.
+pub fn confirm_suggestion(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let id = require_str(args, "id")?;
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    match repo.confirm_suggestion(&id, &project_id, now_ts())? {
+        Some(proc_id) => print_json(&serde_json::json!({
+            "id": id,
+            "status": "confirmed",
+            "procedural_id": proc_id,
+        })),
+        None => anyhow::bail!("no pending suggestion '{id}' in project '{project_id}'"),
+    }
+    Ok(())
+}
+
+/// `engram reject-suggestion --project <id> --id <suggestion-id>` — discard a
+/// pending proposal without creating a procedural memory.
+pub fn reject_suggestion(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let id = require_str(args, "id")?;
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let rejected = repo.reject_suggestion(&id, &project_id, now_ts())?;
+    if !rejected {
+        anyhow::bail!("no pending suggestion '{id}' in project '{project_id}'");
+    }
+    print_json(&serde_json::json!({ "id": id, "status": "rejected" }));
     Ok(())
 }
 

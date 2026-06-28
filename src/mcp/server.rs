@@ -133,6 +133,32 @@ pub struct QueryStatsInput {
     limit: usize,
 }
 
+/// reflect tool input — scan a project's active failures for recurring tags and
+/// propose preventive rules.
+#[derive(Debug, Deserialize)]
+pub struct ReflectInput {
+    project_id: String,
+    /// Dry-run by default; `true` persists proposals as pending suggestions.
+    #[serde(default)]
+    apply: bool,
+    /// Override `[reflection].min_occurrences`; `None` uses the configured default.
+    #[serde(default)]
+    min_occurrences: Option<usize>,
+}
+
+/// list_suggestions tool input.
+#[derive(Debug, Deserialize)]
+pub struct ListSuggestionsInput {
+    project_id: String,
+}
+
+/// confirm_suggestion / reject_suggestion tool input (shared shape).
+#[derive(Debug, Deserialize)]
+pub struct SuggestionIdInput {
+    project_id: String,
+    id: String,
+}
+
 /// create_episodic tool input.
 #[derive(Debug, Deserialize)]
 pub struct CreateEpisodicInput {
@@ -332,6 +358,12 @@ pub trait MemoryToolProvider: Send + Sync {
     fn forget_batch(&self, input: ForgetBatchInput) -> Result<serde_json::Value>;
     fn list_archived(&self, input: ListArchivedInput) -> Result<serde_json::Value>;
     fn consolidate_memories(&self, input: ConsolidateInput) -> Result<serde_json::Value>;
+
+    // Reflection tools — propose preventive rules from recurring failures.
+    fn reflect(&self, input: ReflectInput) -> Result<serde_json::Value>;
+    fn list_suggestions(&self, input: ListSuggestionsInput) -> Result<serde_json::Value>;
+    fn confirm_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value>;
+    fn reject_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value>;
 }
 
 /// Result of a `reindex_embeddings` run; serialized as the CLI's JSON output.
@@ -1007,6 +1039,70 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         }))
     }
 
+    fn reflect(&self, input: ReflectInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let min = input
+            .min_occurrences
+            .unwrap_or(self.config.reflection.min_occurrences);
+        let engine = crate::reflection::ReflectionEngine::with_min_occurrences(min);
+        let plan = engine.reflect(
+            repo,
+            &input.project_id,
+            input.apply,
+            chrono::Utc::now().timestamp(),
+        )?;
+        Ok(serde_json::json!({
+            "applied": input.apply,
+            "min_occurrences": min,
+            "proposed": plan.suggestions.len(),
+            "created": plan.created,
+            "suggestions": serde_json::to_value(&plan.suggestions)?,
+        }))
+    }
+
+    fn list_suggestions(&self, input: ListSuggestionsInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let pending = repo.list_pending_suggestions(&input.project_id)?;
+        Ok(serde_json::json!({
+            "count": pending.len(),
+            "suggestions": serde_json::to_value(&pending)?,
+        }))
+    }
+
+    fn confirm_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        match repo.confirm_suggestion(
+            &input.id,
+            &input.project_id,
+            chrono::Utc::now().timestamp(),
+        )? {
+            Some(proc_id) => Ok(serde_json::json!({
+                "id": input.id,
+                "status": "confirmed",
+                "procedural_id": proc_id,
+            })),
+            None => anyhow::bail!(
+                "no pending suggestion '{}' in project '{}'",
+                input.id,
+                input.project_id
+            ),
+        }
+    }
+
+    fn reject_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let rejected =
+            repo.reject_suggestion(&input.id, &input.project_id, chrono::Utc::now().timestamp())?;
+        if !rejected {
+            anyhow::bail!(
+                "no pending suggestion '{}' in project '{}'",
+                input.id,
+                input.project_id
+            );
+        }
+        Ok(serde_json::json!({ "id": input.id, "status": "rejected" }))
+    }
+
     fn ingest_commits(&self, input: IngestCommitsInput) -> Result<serde_json::Value> {
         let repo_path = std::path::Path::new(&input.repo_path);
         let git = GitIntegration::new(repo_path)?;
@@ -1329,6 +1425,20 @@ impl McpServer {
             fn consolidate_memories(&self, _: ConsolidateInput) -> Result<serde_json::Value> {
                 Ok(serde_json::json!({"applied": false, "plans": [], "total_archived": 0}))
             }
+            fn reflect(&self, _: ReflectInput) -> Result<serde_json::Value> {
+                Ok(
+                    serde_json::json!({"applied": false, "proposed": 0, "created": 0, "suggestions": []}),
+                )
+            }
+            fn list_suggestions(&self, _: ListSuggestionsInput) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"count": 0, "suggestions": []}))
+            }
+            fn confirm_suggestion(&self, _: SuggestionIdInput) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"id": "", "status": "noop"}))
+            }
+            fn reject_suggestion(&self, _: SuggestionIdInput) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"id": "", "status": "noop"}))
+            }
         }
         Self {
             provider: Arc::new(NoopProvider),
@@ -1612,6 +1722,55 @@ impl McpServer {
                     "required": ["project_id"],
                 }),
             },
+            // ─── Reflection Tools ───────────────────────────────────
+            ToolDefinition {
+                name: "reflect".into(),
+                description: "Scan active failures for recurring tags and propose preventive procedural rules. Dry-run by default (apply=false); persisted proposals stay invisible to search until confirmed.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "apply": { "type": "boolean", "description": "false (default) = preview only; true = persist proposals as pending", "default": false },
+                        "min_occurrences": { "type": "integer", "description": "Override [reflection].min_occurrences threshold" },
+                    },
+                    "required": ["project_id"],
+                }),
+            },
+            ToolDefinition {
+                name: "list_suggestions".into(),
+                description: "List pending reflection proposals (draft preventive rules distilled from recurring failures) awaiting confirmation.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                    },
+                    "required": ["project_id"],
+                }),
+            },
+            ToolDefinition {
+                name: "confirm_suggestion".into(),
+                description: "Confirm a pending reflection proposal: promote it into a searchable procedural memory.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "id": { "type": "string", "description": "Suggestion id (from list_suggestions)" },
+                    },
+                    "required": ["project_id", "id"],
+                }),
+            },
+            ToolDefinition {
+                name: "reject_suggestion".into(),
+                description: "Reject a pending reflection proposal: discard it without creating a procedural memory.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "id": { "type": "string", "description": "Suggestion id (from list_suggestions)" },
+                    },
+                    "required": ["project_id", "id"],
+                }),
+            },
         ]
     }
 
@@ -1862,6 +2021,27 @@ impl McpServer {
                         self.provider,
                         consolidate_memories
                     ),
+                    "reflect" => {
+                        dispatch_tool!(arguments, ReflectInput, self.provider, reflect)
+                    }
+                    "list_suggestions" => dispatch_tool!(
+                        arguments,
+                        ListSuggestionsInput,
+                        self.provider,
+                        list_suggestions
+                    ),
+                    "confirm_suggestion" => dispatch_tool!(
+                        arguments,
+                        SuggestionIdInput,
+                        self.provider,
+                        confirm_suggestion
+                    ),
+                    "reject_suggestion" => dispatch_tool!(
+                        arguments,
+                        SuggestionIdInput,
+                        self.provider,
+                        reject_suggestion
+                    ),
                     _ => (
                         None,
                         Some(JsonRpcError {
@@ -2099,7 +2279,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = McpServer::list_tools();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 22);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"search_memory"));
@@ -2114,6 +2294,10 @@ mod tests {
         assert!(names.contains(&"create_procedural"));
         assert!(names.contains(&"ingest_commits"));
         assert!(names.contains(&"collect_sources"));
+        assert!(names.contains(&"reflect"));
+        assert!(names.contains(&"list_suggestions"));
+        assert!(names.contains(&"confirm_suggestion"));
+        assert!(names.contains(&"reject_suggestion"));
     }
 
     #[test]
@@ -2159,7 +2343,7 @@ mod tests {
         assert!(response.result.is_some());
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]
@@ -2370,6 +2554,166 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["status"], "created");
+    }
+
+    #[test]
+    fn test_reflection_reflect_list_confirm_closed_loop() {
+        let provider = make_provider();
+        let project = "test-project";
+
+        // Seed three auth failures → one recurring tag.
+        for _ in 0..3 {
+            provider
+                .create_failure(CreateFailureInput {
+                    project_id: project.into(),
+                    incident: "token expired".into(),
+                    root_cause: "clock skew".into(),
+                    fix: "tolerance window".into(),
+                    prevention: "monitor clock sync".into(),
+                    severity: 3,
+                    tags: vec!["auth".into()],
+                })
+                .unwrap();
+        }
+
+        // Dry-run reflect: previews one proposal, writes nothing.
+        let dry = provider
+            .reflect(ReflectInput {
+                project_id: project.into(),
+                apply: false,
+                min_occurrences: None,
+            })
+            .unwrap();
+        assert_eq!(dry["proposed"], 1);
+        assert_eq!(dry["created"], 0);
+        assert_eq!(dry["suggestions"][0]["pattern_tag"], "auth");
+
+        // Nothing persisted yet.
+        let none = provider
+            .list_suggestions(ListSuggestionsInput {
+                project_id: project.into(),
+            })
+            .unwrap();
+        assert_eq!(none["count"], 0);
+
+        // Apply: persists one pending proposal.
+        let applied = provider
+            .reflect(ReflectInput {
+                project_id: project.into(),
+                apply: true,
+                min_occurrences: None,
+            })
+            .unwrap();
+        assert_eq!(applied["created"], 1);
+
+        let pending = provider
+            .list_suggestions(ListSuggestionsInput {
+                project_id: project.into(),
+            })
+            .unwrap();
+        assert_eq!(pending["count"], 1);
+        let id = pending["suggestions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Core acceptance: a pending proposal is invisible to search_procedural.
+        let search_before = provider
+            .search_memory(SearchMemoryInput {
+                project_id: project.into(),
+                query: "auth".into(),
+                memory_type: Some("procedural".into()),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(search_before["results"].as_array().unwrap().len(), 0);
+
+        // Confirm → promoted into procedural_memories, now searchable.
+        let confirmed = provider
+            .confirm_suggestion(SuggestionIdInput {
+                project_id: project.into(),
+                id: id.clone(),
+            })
+            .unwrap();
+        assert_eq!(confirmed["status"], "confirmed");
+
+        let search_after = provider
+            .search_memory(SearchMemoryInput {
+                project_id: project.into(),
+                query: "auth".into(),
+                memory_type: Some("procedural".into()),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(search_after["results"].as_array().unwrap().len(), 1);
+
+        // No longer pending after confirmation.
+        let after = provider
+            .list_suggestions(ListSuggestionsInput {
+                project_id: project.into(),
+            })
+            .unwrap();
+        assert_eq!(after["count"], 0);
+    }
+
+    #[test]
+    fn test_reflection_reject_drops_pending() {
+        let provider = make_provider();
+        let project = "test-project";
+        for _ in 0..3 {
+            provider
+                .create_failure(CreateFailureInput {
+                    project_id: project.into(),
+                    incident: "x".into(),
+                    root_cause: "y".into(),
+                    fix: "z".into(),
+                    prevention: "rotate token".into(),
+                    severity: 2,
+                    tags: vec!["auth".into()],
+                })
+                .unwrap();
+        }
+        provider
+            .reflect(ReflectInput {
+                project_id: project.into(),
+                apply: true,
+                min_occurrences: None,
+            })
+            .unwrap();
+        let pending = provider
+            .list_suggestions(ListSuggestionsInput {
+                project_id: project.into(),
+            })
+            .unwrap();
+        let id = pending["suggestions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let rejected = provider
+            .reject_suggestion(SuggestionIdInput {
+                project_id: project.into(),
+                id,
+            })
+            .unwrap();
+        assert_eq!(rejected["status"], "rejected");
+
+        // Pending drained; no procedural created.
+        let after = provider
+            .list_suggestions(ListSuggestionsInput {
+                project_id: project.into(),
+            })
+            .unwrap();
+        assert_eq!(after["count"], 0);
+        let search = provider
+            .search_memory(SearchMemoryInput {
+                project_id: project.into(),
+                query: "auth".into(),
+                memory_type: Some("procedural".into()),
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(search["results"].as_array().unwrap().len(), 0);
     }
 
     #[test]

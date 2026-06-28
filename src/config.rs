@@ -16,6 +16,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub semantic: SemanticConfig,
+    #[serde(default)]
+    pub reflection: ReflectionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +332,31 @@ impl SemanticConfig {
     }
     fn default_top_k() -> usize {
         50
+    }
+}
+
+/// Reflection engine config. The reflection pass scans active failures, groups
+/// them by tag, and proposes a preventive procedural rule whenever a tag recurs
+/// at least `min_occurrences` times.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectionConfig {
+    /// Minimum active failures sharing a tag before a preventive rule is
+    /// proposed. Default 3.
+    #[serde(default = "ReflectionConfig::default_min_occurrences")]
+    pub min_occurrences: usize,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            min_occurrences: Self::default_min_occurrences(),
+        }
+    }
+}
+
+impl ReflectionConfig {
+    fn default_min_occurrences() -> usize {
+        3
     }
 }
 

@@ -63,6 +63,25 @@ pub struct QueryStatRow {
     pub last_at: i64,
 }
 
+/// One reflection proposal awaiting human confirmation (for `list_pending_suggestions`).
+/// `status` is `pending` while unconfirmed; `confirm_suggestion` promotes the
+/// draft into `procedural_memories` and sets `status = "confirmed"` + `resolved_at`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReflectionSuggestionRow {
+    pub id: String,
+    pub project_id: String,
+    pub pattern_tag: String,
+    pub source_failure_ids: Vec<String>,
+    pub source_preventions: Vec<String>,
+    pub occurrence_count: i64,
+    pub suggested_workflow_name: String,
+    pub suggested_steps: Vec<String>,
+    pub suggested_tags: Vec<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
 /// The four memory types, mapped to their physical tables.
 /// Used by lifecycle ops (archive/restore/list/consolidate) so a single
 /// generic implementation serves all four tables. Table names come only from
@@ -390,6 +409,32 @@ impl MemoryRepository {
                 ON query_log(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_query_log_query
                 ON query_log(project_id, query);",
+        )?;
+
+        // Reflection proposals: preventive rules distilled from recurring
+        // failures, awaiting human confirmation. Deliberately a separate table
+        // (NOT procedural_memories) so search_procedural never sees pending
+        // proposals — they only enter main retrieval after `confirm_suggestion`
+        // promotes one into procedural_memories. Independent of MemoryKind /
+        // the CRUD macro, like query_log, so CREATE IF NOT EXISTS suffices
+        // (no user_version bump needed on existing DBs).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS reflection_suggestions (
+                id                      TEXT PRIMARY KEY,
+                project_id              TEXT NOT NULL,
+                pattern_tag             TEXT NOT NULL,
+                source_failure_ids      TEXT NOT NULL,
+                source_preventions      TEXT NOT NULL,
+                occurrence_count        INTEGER NOT NULL,
+                suggested_workflow_name TEXT NOT NULL,
+                suggested_steps         TEXT NOT NULL,
+                suggested_tags          TEXT NOT NULL,
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                created_at              INTEGER NOT NULL,
+                resolved_at             INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflection_pending
+                ON reflection_suggestions(project_id, status, created_at DESC);",
         )?;
 
         tx.commit()?;
@@ -1293,6 +1338,223 @@ impl MemoryRepository {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    // ─── Reflection (recurring-failure → preventive rule) ─────────
+
+    /// All active (non-archived) failure memories for a project. The reflection
+    /// engine is the sole full-scan consumer; [`list_recent_failures`] is a
+    /// bounded "recent N" list, so this gets its own unbounded accessor.
+    pub fn list_active_failures_for_reflection(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<FailureMemory>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at
+             FROM failure_memories
+             WHERE project_id = ?1 AND archived_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(FailureMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                incident: row.get(2)?,
+                root_cause: row.get(3)?,
+                fix: row.get(4)?,
+                prevention: row.get(5)?,
+                severity: row.get(6)?,
+                tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Insert a reflection proposal (status='pending'). The caller de-duplicates
+    /// via [`has_pending_suggestion`] before calling.
+    pub fn insert_reflection_suggestion(&self, row: &ReflectionSuggestionRow) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO reflection_suggestions \
+             (id, project_id, pattern_tag, source_failure_ids, source_preventions, \
+              occurrence_count, suggested_workflow_name, suggested_steps, suggested_tags, \
+              status, created_at, resolved_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                row.id,
+                row.project_id,
+                row.pattern_tag,
+                serde_json::to_string(&row.source_failure_ids)?,
+                serde_json::to_string(&row.source_preventions)?,
+                row.occurrence_count,
+                row.suggested_workflow_name,
+                serde_json::to_string(&row.suggested_steps)?,
+                serde_json::to_string(&row.suggested_tags)?,
+                row.status,
+                row.created_at,
+                row.resolved_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a pending proposal already exists for `(project_id, pattern_tag)`.
+    /// Keeps `reflect` idempotent across repeated runs.
+    pub fn has_pending_suggestion(&self, project_id: &str, pattern_tag: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reflection_suggestions \
+             WHERE project_id = ?1 AND pattern_tag = ?2 AND status = 'pending')",
+            params![project_id, pattern_tag],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// All pending proposals for a project, newest first.
+    pub fn list_pending_suggestions(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ReflectionSuggestionRow>> {
+        Self::query_suggestions(
+            &self.conn()?,
+            "WHERE project_id = ?1 AND status = 'pending' ORDER BY created_at DESC",
+            params![project_id],
+        )
+    }
+
+    /// Confirm a proposal: promote its draft into `procedural_memories` via the
+    /// standard [`create_procedural`] path (main-table INSERT + FTS5 dual-write +
+    /// entity link), then mark the proposal `confirmed` + `resolved_at`. Returns
+    /// the new procedural memory's id, or `None` if no matching pending proposal
+    /// was found (already resolved / wrong project / unknown id). The promoted
+    /// procedural id is `"{suggestion_id}-proc"`, making confirm idempotent at
+    /// the data level.
+    pub fn confirm_suggestion(
+        &self,
+        id: &str,
+        project_id: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        // Read the pending draft first (None if already resolved / wrong project).
+        let draft = match self.get_suggestion(id, project_id)? {
+            Some(d) if d.status == "pending" => d,
+            _ => return Ok(None),
+        };
+
+        // Promote into procedural_memories through the shared create path.
+        let proc_id = format!("{}-proc", draft.id);
+        let memory = ProceduralMemory {
+            id: proc_id.clone(),
+            project_id: draft.project_id,
+            workflow_name: draft.suggested_workflow_name,
+            steps: draft.suggested_steps,
+            related_tools: vec![],
+            tags: draft.suggested_tags,
+            created_at: now,
+            updated_at: now,
+        };
+        self.create_procedural(&memory)?;
+
+        // Mark the proposal confirmed.
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE reflection_suggestions SET status = 'confirmed', resolved_at = ?1 \
+             WHERE id = ?2 AND project_id = ?3 AND status = 'pending'",
+            params![now, id, project_id],
+        )?;
+        Ok(Some(proc_id))
+    }
+
+    /// Reject a pending proposal: mark `rejected` + `resolved_at`. No procedural
+    /// memory is created. Returns false if no matching pending proposal exists.
+    pub fn reject_suggestion(&self, id: &str, project_id: &str, now: i64) -> Result<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE reflection_suggestions SET status = 'rejected', resolved_at = ?1 \
+             WHERE id = ?2 AND project_id = ?3 AND status = 'pending'",
+            params![now, id, project_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Fetch a single proposal by id within a project (any status). Used by
+    /// [`confirm_suggestion`] to read the draft before promoting it.
+    fn get_suggestion(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> Result<Option<ReflectionSuggestionRow>> {
+        Self::query_suggestion(
+            &self.conn()?,
+            "WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id],
+        )
+    }
+
+    /// Shared row mapper for a single suggestion SELECT.
+    fn query_suggestion(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        where_clause: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Option<ReflectionSuggestionRow>> {
+        let sql = format!(
+            "SELECT id, project_id, pattern_tag, source_failure_ids, source_preventions, \
+                    occurrence_count, suggested_workflow_name, suggested_steps, suggested_tags, \
+                    status, created_at, resolved_at
+             FROM reflection_suggestions {where_clause}"
+        );
+        let row = conn
+            .query_row(&sql, params, Self::map_suggestion_row)
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Shared row mapper for a multi-row suggestion SELECT.
+    fn query_suggestions(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        where_clause: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<ReflectionSuggestionRow>> {
+        let sql = format!(
+            "SELECT id, project_id, pattern_tag, source_failure_ids, source_preventions, \
+                    occurrence_count, suggested_workflow_name, suggested_steps, suggested_tags, \
+                    status, created_at, resolved_at
+             FROM reflection_suggestions {where_clause}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params, Self::map_suggestion_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Map a rusqlite Row to a [`ReflectionSuggestionRow`]. JSON columns
+    /// degrade to defaults on parse failure (corrupted cell), matching the
+    /// `row_get_json!` convention used elsewhere.
+    fn map_suggestion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReflectionSuggestionRow> {
+        Ok(ReflectionSuggestionRow {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            pattern_tag: row.get(2)?,
+            source_failure_ids: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+            source_preventions: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+            occurrence_count: row.get(5)?,
+            suggested_workflow_name: row.get(6)?,
+            suggested_steps: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+            suggested_tags: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+            status: row.get(9)?,
+            created_at: row.get(10)?,
+            resolved_at: row.get(11)?,
+        })
     }
 
     // ─── Garbage Collection ───────────────────────────────────────
@@ -2475,6 +2737,110 @@ mod tests {
 
         // Project isolation.
         assert!(repo.query_stats("other", 0, 10).unwrap().is_empty());
+    }
+
+    // ─── Reflection Suggestion Tests ───────────────────────────────
+
+    fn make_suggestion(id: &str, tag: &str) -> ReflectionSuggestionRow {
+        ReflectionSuggestionRow {
+            id: id.into(),
+            project_id: "p".into(),
+            pattern_tag: tag.into(),
+            source_failure_ids: vec!["f1".into(), "f2".into(), "f3".into()],
+            source_preventions: vec![format!("prevent {tag}")],
+            occurrence_count: 3,
+            suggested_workflow_name: format!("Prevent recurring {tag} failures"),
+            suggested_steps: vec![format!("prevent {tag}")],
+            suggested_tags: vec![tag.into(), "reflection".into(), "auto-generated".into()],
+            status: "pending".into(),
+            created_at: now(),
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn reflection_pending_is_isolated_from_search() {
+        let repo = setup_repo();
+        repo.insert_reflection_suggestion(&make_suggestion("s1", "fts5"))
+            .unwrap();
+
+        // Core acceptance: a pending proposal is NOT in procedural_memories, so
+        // search_procedural cannot see it (the whole point of the separate table).
+        assert!(repo.search_procedural("fts5", "p", 10).unwrap().is_empty());
+
+        // But the reflection accessors do see it.
+        assert!(repo.has_pending_suggestion("p", "fts5").unwrap());
+        assert!(!repo.has_pending_suggestion("p", "auth").unwrap());
+        let pending = repo.list_pending_suggestions("p").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pattern_tag, "fts5");
+        assert_eq!(pending[0].source_failure_ids.len(), 3);
+
+        // Project isolation.
+        assert!(repo.list_pending_suggestions("other").unwrap().is_empty());
+        assert!(!repo.has_pending_suggestion("other", "fts5").unwrap());
+    }
+
+    #[test]
+    fn reflection_confirm_promotes_into_searchable_procedural() {
+        let repo = setup_repo();
+        let now = now();
+        repo.insert_reflection_suggestion(&make_suggestion("s1", "fts5"))
+            .unwrap();
+
+        // Confirm → draft promoted into procedural_memories.
+        let proc_id = repo.confirm_suggestion("s1", "p", now).unwrap();
+        assert_eq!(proc_id.as_deref(), Some("s1-proc"));
+
+        // No longer pending; now searchable through the normal procedural path.
+        assert!(repo.list_pending_suggestions("p").unwrap().is_empty());
+        let hits = repo.search_procedural("fts5", "p", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory.id, "s1-proc");
+        assert_eq!(
+            hits[0].memory.workflow_name,
+            "Prevent recurring fts5 failures"
+        );
+
+        // Confirming again is a no-op (proposal already resolved).
+        assert!(repo.confirm_suggestion("s1", "p", now).unwrap().is_none());
+        // Still exactly one procedural (idempotent — no duplicate promotion).
+        assert_eq!(repo.search_procedural("fts5", "p", 10).unwrap().len(), 1);
+
+        // Unknown id / wrong project → None, nothing created.
+        assert!(repo.confirm_suggestion("nope", "p", now).unwrap().is_none());
+        assert!(repo
+            .confirm_suggestion("s1", "other", now)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reflection_reject_drops_from_pending_without_creating_procedural() {
+        let repo = setup_repo();
+        let now = now();
+        repo.insert_reflection_suggestion(&make_suggestion("s2", "auth"))
+            .unwrap();
+
+        assert!(repo.reject_suggestion("s2", "p", now).unwrap());
+        assert!(repo.list_pending_suggestions("p").unwrap().is_empty());
+        // Rejected → no procedural memory created.
+        assert!(repo.search_procedural("auth", "p", 10).unwrap().is_empty());
+
+        // Rejecting again is a no-op.
+        assert!(!repo.reject_suggestion("s2", "p", now).unwrap());
+    }
+
+    #[test]
+    fn reflection_table_created_idempotently_on_existing_db() {
+        // An already-initialized DB re-running initialize_schema must not error
+        // on the reflection_suggestions table (CREATE IF NOT EXISTS).
+        let repo = setup_repo();
+        repo.initialize_schema().unwrap();
+        repo.insert_reflection_suggestion(&make_suggestion("s1", "fts5"))
+            .unwrap();
+        repo.initialize_schema().unwrap();
+        assert_eq!(repo.list_pending_suggestions("p").unwrap().len(), 1);
     }
 
     // ─── Transaction Rollback Test ─────────────────────────────────

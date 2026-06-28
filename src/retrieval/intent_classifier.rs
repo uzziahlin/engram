@@ -346,6 +346,8 @@ mod tests {
             .classify("how to test the build")
             .contains(&MemoryIntent::Workflow));
         // A bare keyword with no separator still routes (not identifier-like).
-        assert!(classifier.classify("test").contains(&MemoryIntent::Workflow));
+        assert!(classifier
+            .classify("test")
+            .contains(&MemoryIntent::Workflow));
     }
 }
