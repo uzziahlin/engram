@@ -347,4 +347,110 @@ mod tests {
         let count = context.matches("[failure]").count() + context.matches("[decision]").count();
         assert_eq!(count, 2);
     }
+
+    #[test]
+    fn test_context_budget_proportion_allocation() {
+        // 验证 ContextBudget 的比例分配契约：
+        // max_tokens == total；reserved_for_memory == total * pct / 100；
+        // user 与 agent 平分剩余且相等。选 total/pct 使 remaining 为偶数，避免整数除法丢位。
+        let budget = ContextBudget::new(10000, 20);
+        assert_eq!(budget.max_tokens, 10000);
+        assert_eq!(budget.reserved_for_memory, 2000);
+        assert_eq!(budget.reserved_for_user, 4000);
+        assert_eq!(budget.reserved_for_agent, 4000);
+        assert_eq!(budget.reserved_for_user, budget.reserved_for_agent);
+        assert_eq!(
+            budget.reserved_for_user + budget.reserved_for_agent + budget.reserved_for_memory,
+            budget.max_tokens
+        );
+    }
+
+    #[test]
+    fn test_compose_context_truncates_when_over_budget() {
+        // 预算极小：reserved_for_memory 仅够放下部分条目，
+        // 触发 `tokens_used + entry_tokens > token_limit → break` 截断分支。
+        // 断言：输出条目数 < 输入条目数（确实截断），且 >= 1（至少放下首条），且不 panic。
+        let composer = ContextComposer::new();
+        // new(200, 10) → reserved_for_memory = 200 * 10 / 100 = 20。
+        let budget = ContextBudget::new(200, 10);
+        let results: Vec<SearchResult> = (0..5)
+            .map(|i| SearchResult {
+                id: format!("f-{i}"),
+                memory_type: "failure".into(),
+                summary: "f".into(),
+                relevance_score: 0.9,
+                importance: 0.5,
+                created_at: 1000,
+            })
+            .collect();
+        let context = composer.compose_context(&results, &budget);
+        let count = context.matches("[failure]").count();
+        assert!(count >= 1, "至少应放下首条，实际 {}", count);
+        assert!(count < 5, "应被预算截断，实际 {}", count);
+    }
+
+    #[test]
+    fn test_compose_context_empty_results_returns_empty() {
+        // 空结果集：compose_context 返回空字符串（非 marker），覆盖 context_parts.is_empty() 分支。
+        let composer = ContextComposer::new();
+        let budget = ContextBudget::new(10000, 20);
+        let context = composer.compose_context(&[], &budget);
+        assert!(context.is_empty(), "空结果应返回空字符串");
+        assert!(!context.contains("=== Memory Context ==="));
+    }
+
+    #[test]
+    fn test_compose_context_same_type_orders_by_score_desc() {
+        // 同类型（均为 failure，priority 相同）内应按 relevance_score 降序：
+        // 覆盖 sort_by_priority 的 then 分支。高分条目应在低分条目之前出现。
+        let composer = ContextComposer::new();
+        let budget = ContextBudget::new(100000, 50);
+        let results = vec![
+            SearchResult {
+                id: "low".into(),
+                memory_type: "failure".into(),
+                summary: "LOW".into(),
+                relevance_score: 0.3,
+                importance: 0.5,
+                created_at: 1000,
+            },
+            SearchResult {
+                id: "high".into(),
+                memory_type: "failure".into(),
+                summary: "HIGH".into(),
+                relevance_score: 0.9,
+                importance: 0.5,
+                created_at: 2000,
+            },
+        ];
+        let context = composer.compose_context(&results, &budget);
+        let high_pos = context.find("HIGH").expect("HIGH 应出现");
+        let low_pos = context.find("LOW").expect("LOW 应出现");
+        assert!(
+            high_pos < low_pos,
+            "同类型内高分应排在低分之前 (high={high_pos}, low={low_pos})"
+        );
+    }
+
+    #[test]
+    fn test_compose_context_clamps_relevance_above_one() {
+        // relevance_score > 1.0 时显示应 clamp 到 1.00（覆盖 .clamp(0.0, 1.0) 显示逻辑），
+        // 不应原样输出 1.50。
+        let composer = ContextComposer::new();
+        let budget = ContextBudget::new(100000, 50);
+        let results = vec![SearchResult {
+            id: "over".into(),
+            memory_type: "failure".into(),
+            summary: "overflow score".into(),
+            relevance_score: 1.5,
+            importance: 0.5,
+            created_at: 1000,
+        }];
+        let context = composer.compose_context(&results, &budget);
+        assert!(
+            context.contains("score: 1.00"),
+            "超过 1 的分数应 clamp 到 1.00，实际：{context}"
+        );
+        assert!(!context.contains("score: 1.50"), "不应原样输出 1.50");
+    }
 }

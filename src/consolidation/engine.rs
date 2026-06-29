@@ -192,7 +192,7 @@ mod tests {
     use super::*;
     // MemoryKind/MemoryRepository come via `use super::*` once Step 3b adds the
     // top-level import; only models need an explicit use here.
-    use crate::models::EpisodicMemory;
+    use crate::models::{DecisionMemory, EpisodicMemory};
 
     fn repo_with_dupes() -> MemoryRepository {
         let repo = MemoryRepository::new_in_memory().unwrap();
@@ -287,5 +287,200 @@ mod tests {
             "same text",
             0.99
         ));
+    }
+    // 构造一条 episodic 记录（可指定 project_id），便于跨项目/近义场景复用。
+    fn mk_episodic(summary: &str, content: &str, ts: i64, project_id: &str) -> EpisodicMemory {
+        EpisodicMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: content.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    #[test]
+    fn test_jaccard_threshold_boundary_ge_semantics() {
+        // 两个文本：交集 2 词、并集 4 词 → Jaccard 恰好 0.5。
+        // 验证 `>=` 闭区间语义：threshold=0.5 判相似，threshold=0.6 判不相似。
+        let a = "alpha beta gamma delta";
+        let b = "alpha beta";
+        assert!(
+            ConsolidationEngine::jaccard_similarity(a, b, 0.5),
+            "Jaccard 恰好等于 threshold 应判为 near-dup（闭区间）"
+        );
+        assert!(
+            !ConsolidationEngine::jaccard_similarity(a, b, 0.6),
+            "Jaccard 低于 threshold 应判为非 near-dup"
+        );
+    }
+
+    #[test]
+    fn test_plan_near_dup_end_to_end() {
+        // 近义（非精确）重复走通 plan_for_kind 全链路：SQL→内存→grouped。
+        // A={deploy,service}，B={deploy,service,config}，Jaccard=2/3≈0.667。
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mk_episodic("deploy service", "", 100, "p"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("deploy service config", "", 200, "p"))
+            .unwrap();
+
+        let engine = ConsolidationEngine::new();
+        let plan = engine
+            .plan_for_kind(&repo, "p", MemoryKind::Episodic, true, 0.6)
+            .unwrap();
+
+        assert_eq!(plan.groups.len(), 1, "应识别出一组近义重复");
+        let g = &plan.groups[0];
+        assert!(
+            g.reason.starts_with("near(jaccard>="),
+            "近义组 reason 应形如 near(jaccard>=...)，实际：{}",
+            g.reason
+        );
+        assert_eq!(g.duplicate_ids.len(), 1);
+        // keeper 必须是更早创建的 A（ts=100）。
+        let keeper = repo.get_episodic(&g.keeper_id).unwrap().unwrap();
+        assert_eq!(keeper.created_at, 100, "near-dup keeper 仍应为最早创建者");
+        assert_eq!(plan.archived, 0, "plan_for_kind 不应归档");
+    }
+
+    #[test]
+    fn test_near_dup_single_group_does_not_reopen() {
+        // A 与 B、C 均近义：应只产生一组（A 为 keeper，[B,C] 为 dups）。
+        // 验证 grouped HashSet 的「已并入则跳过」逻辑——B/C 不会再作为 keeper 开新组。
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mk_episodic("deploy service", "", 100, "p"))
+            .unwrap(); // A
+        repo.create_episodic(&mk_episodic("deploy service config", "", 200, "p"))
+            .unwrap(); // B
+        repo.create_episodic(&mk_episodic("deploy service runtime", "", 300, "p"))
+            .unwrap(); // C
+
+        let engine = ConsolidationEngine::new();
+        let plan = engine
+            .plan_for_kind(&repo, "p", MemoryKind::Episodic, true, 0.6)
+            .unwrap();
+
+        assert_eq!(plan.groups.len(), 1, "三条近义记录应只归为一组");
+        let g = &plan.groups[0];
+        assert_eq!(g.duplicate_ids.len(), 2, "B、C 都应并入 A 这一组");
+        let keeper = repo.get_episodic(&g.keeper_id).unwrap().unwrap();
+        assert_eq!(keeper.created_at, 100);
+    }
+
+    #[test]
+    fn test_consolidate_multiple_kinds_are_isolated() {
+        // 跨类型 consolidate：同时处理 episodic 与 decision，
+        // 断言返回 plan 数 == kinds 数、各 plan 的 memory_type 正确、互不串数据。
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        // episodic 一组精确重复。
+        repo.create_episodic(&mk_episodic("same", "body", 100, "p"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("same", "body", 200, "p"))
+            .unwrap();
+        // decision 一组精确重复（dedup_text = title||ctx||rationale||tradeoffs）。
+        let mk_dec = |ts: i64| DecisionMemory {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: "p".into(),
+            title: "t".into(),
+            context: "c".into(),
+            rationale: "r".into(),
+            tradeoffs: "to".into(),
+            related_files: vec![],
+            tags: vec![],
+            created_at: ts,
+            updated_at: ts,
+        };
+        repo.create_decision(&mk_dec(100)).unwrap();
+        repo.create_decision(&mk_dec(200)).unwrap();
+
+        let engine = ConsolidationEngine::new();
+        let plans = engine
+            .consolidate(
+                &repo,
+                "p",
+                &[MemoryKind::Episodic, MemoryKind::Decision],
+                false,
+                0.85,
+                false,
+                999,
+            )
+            .unwrap();
+
+        assert_eq!(plans.len(), 2, "kinds 数 == plan 数");
+        assert_eq!(plans[0].memory_type, "episodic");
+        assert_eq!(plans[1].memory_type, "decision");
+        // 各自恰好一组、互不影响。
+        assert_eq!(plans[0].groups.len(), 1);
+        assert_eq!(plans[1].groups.len(), 1);
+    }
+
+    #[test]
+    fn test_consolidate_apply_archived_count_across_groups() {
+        // apply=true 下多组重复归档：archived 计数应 == 实际归档行数（两组各 1 条 dup）。
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mk_episodic("a", "a", 100, "p"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("a", "a", 110, "p"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("b", "b", 200, "p"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("b", "b", 210, "p"))
+            .unwrap();
+
+        let engine = ConsolidationEngine::new();
+        let plans = engine
+            .consolidate(&repo, "p", &[MemoryKind::Episodic], false, 0.85, true, 999)
+            .unwrap();
+
+        let plan = &plans[0];
+        assert_eq!(plan.groups.len(), 2, "两组独立精确重复");
+        assert_eq!(plan.archived, 2, "archived 应等于实际归档行数");
+        assert_eq!(
+            repo.list_archived(MemoryKind::Episodic, "p", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_plan_isolates_by_project_id() {
+        // 跨项目隔离：两个 project 各有相同的精确重复，plan 只归集本项目内记录。
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mk_episodic("same", "body", 100, "p1"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("same", "body", 200, "p1"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("same", "body", 100, "p2"))
+            .unwrap();
+        repo.create_episodic(&mk_episodic("same", "body", 200, "p2"))
+            .unwrap();
+
+        let engine = ConsolidationEngine::new();
+        let plan_p1 = engine
+            .plan_for_kind(&repo, "p1", MemoryKind::Episodic, false, 0.85)
+            .unwrap();
+        let plan_p2 = engine
+            .plan_for_kind(&repo, "p2", MemoryKind::Episodic, false, 0.85)
+            .unwrap();
+
+        for plan in [&plan_p1, &plan_p2] {
+            assert_eq!(plan.groups.len(), 1, "每个项目各自一组");
+            assert_eq!(plan.groups[0].duplicate_ids.len(), 1);
+        }
+        // 两个项目的 keeper 不应是同一条。
+        assert_ne!(plan_p1.groups[0].keeper_id, plan_p2.groups[0].keeper_id);
     }
 }
