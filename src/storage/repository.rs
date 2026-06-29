@@ -63,6 +63,13 @@ pub struct QueryStatRow {
     pub last_at: i64,
 }
 
+/// One day bucket of episodic memory counts (for `timeline`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelineRow {
+    pub day: String,
+    pub count: i64,
+}
+
 /// One reflection proposal awaiting human confirmation (for `list_pending_suggestions`).
 /// `status` is `pending` while unconfirmed; `confirm_suggestion` promotes the
 /// draft into `procedural_memories` and sets `status = "confirmed"` + `resolved_at`.
@@ -1252,6 +1259,29 @@ impl MemoryRepository {
         Ok(out)
     }
 
+    /// Group non-archived episodic memories by UTC day over a time window,
+    /// most-recent day first. `since` is an absolute unix timestamp computed
+    /// by the caller.
+    pub fn timeline(&self, project_id: &str, since: i64) -> Result<Vec<TimelineRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT date(created_at, 'unixepoch') as day, COUNT(*) as cnt
+             FROM episodic_memories
+             WHERE project_id = ?1 AND created_at >= ?2 AND archived_at IS NULL
+             GROUP BY day ORDER BY day DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |row| {
+            Ok(TimelineRow {
+                day: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
     /// Check which commit hashes have already been ingested as episodic memories.
     /// Returns a HashSet of already-ingested commit hashes for O(1) lookup.
     pub fn get_ingested_commits(&self, project_id: &str) -> Result<HashSet<String>> {
