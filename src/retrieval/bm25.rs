@@ -444,4 +444,55 @@ mod tests {
             r_all.iter().map(|x| x.memory_type.as_str()).collect();
         assert!(types_all.contains("decision"));
     }
+
+    #[test]
+    fn bm25_search_ranks_relevant_higher() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |id: &str, summary: &str| EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: summary.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mk("e1", "learning rust memory system"))
+            .unwrap();
+        repo.create_episodic(&mk("e2", "python web server setup"))
+            .unwrap();
+        let results = repo.search_episodic("rust", "p", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(
+            results[0].memory.id, "e1",
+            "relevant memory should rank first"
+        );
+    }
+
+    #[test]
+    fn bm25_search_cjk_finds_chinese() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mem = EpisodicMemory {
+            id: "cjk1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "修复认证模块".into(),
+            content: "认证 token 刷新逻辑".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mem).unwrap();
+        let results = repo.search_episodic("认证", "p", 10).unwrap();
+        assert!(!results.is_empty(), "CJK search should find the memory");
+    }
 }
