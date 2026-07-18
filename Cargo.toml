@@ -2,6 +2,7 @@
 name = "engram"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "A local-first memory system for AI coding agents — persistent engineering knowledge via MCP"
 license = "MIT"
 readme = "README.md"
@@ -13,9 +14,7 @@ repository = "https://github.com/uzziahlin/engram"
 [features]
 default = []
 # Semantic/embedding retrieval — OFF by default to keep the release binary
-# self-contained and offline-friendly. Spike (see
-# docs/superpowers/plans/2026-06-22-semantic-search-spike.md) locks the
-# concrete impl before this feature gains dependencies.
+# self-contained and offline-friendly.
 semantic = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -28,7 +27,6 @@ semantic = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
-petgraph = "0.6"
 # gix (pure-Rust git) replaces git2 to eliminate dynamic linking of
 # openssl/libssh2/libz — keeps the release binary self-contained and portable.
 gix = { version = "0.83", default-features = false, features = ["blob-diff", "sha1"] }

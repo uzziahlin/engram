@@ -893,7 +893,7 @@ pub fn consolidate(args: &[String]) -> Result<()> {
         &project_id,
         &kinds,
         include_near_dup,
-        0.85,
+        crate::consolidation::engine::DEFAULT_JACCARD_THRESHOLD,
         apply,
         now_ts(),
     )?;

@@ -39,13 +39,12 @@ src/
 ├── lib.rs               # Library root
 ├── config.rs            # TOML configuration
 ├── models/              # Memory type definitions
-├── storage/             # SQLite + FTS5 persistence
+├── storage/             # SQLite + FTS5 + relationship graph
 ├── retrieval/           # BM25 search, intent classification
-├── graph/               # Relationship engine (petgraph)
 ├── git_integration/     # Git commit event processing
 ├── context/             # LLM context composition
-├── consolidation/       # Memory consolidation (future)
-├── reflection/          # Self-improvement (future)
+├── consolidation/       # Memory consolidation (dedup + near-dup)
+├── reflection/          # Failure → procedural suggestions
 ├── mcp/                 # MCP server implementation
 └── cli/                 # Command-line interface
 ```
@@ -98,14 +97,13 @@ Open an issue with the `enhancement` label. Describe:
 Engram follows a layered architecture:
 
 ```
-MCP Server → MemoryProvider trait → Repository + GraphEngine
+MCP Server → MemoryToolProvider trait → Repository
                                       ↓
                                   SQLite (FTS5)
 ```
 
 - **`MemoryToolProvider`** trait in `src/mcp/server.rs` is the integration point
-- **`MemoryRepository`** handles all SQLite operations
-- **`GraphEngine`** manages entity relationships via petgraph
+- **`MemoryRepository`** handles all SQLite operations, including the relationship graph (entities and relations stored as SQLite tables, queried by `related_files`)
 - All memories are scoped by `project_id` for multi-project isolation
 
 ## License

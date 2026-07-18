@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::mcp::transport::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestHandler};
 
 /// Jaccard similarity threshold for near-duplicate consolidation.
-const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.85;
+const CONSOLIDATE_JACCARD_THRESHOLD: f64 = crate::consolidation::engine::DEFAULT_JACCARD_THRESHOLD;
 
 /// Dispatch a tool call: deserialize arguments and invoke the provider method.
 /// Returns `(Some(result), None)` on successful parse, or `(None, Some(error))` on parse failure.
@@ -513,7 +513,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let since = chrono::Utc::now().timestamp() - (input.days * 86400);
+        let since = chrono::Utc::now().timestamp() - (input.days.saturating_mul(86400));
         let rows = repo.timeline(&input.project_id, since)?;
         let events: Vec<serde_json::Value> = rows
             .iter()
@@ -529,7 +529,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let since = chrono::Utc::now().timestamp() - (input.days * 86400);
+        let since = chrono::Utc::now().timestamp() - (input.days.saturating_mul(86400));
         let rows = repo.query_stats(&input.project_id, since, input.limit)?;
         let queries: Vec<serde_json::Value> = rows
             .iter()
@@ -826,7 +826,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let git = GitIntegration::new(repo_path)?;
         let session_id = input.session_id.unwrap_or_else(|| "auto-ingest".into());
 
-        let memories = git.process_recent_commits(&input.project_id, &session_id, input.count)?;
+        let memories =
+            git.process_recent_commits(&input.project_id, &session_id, input.count.min(1000))?;
 
         let repo = self.lock_repo();
 
@@ -879,7 +880,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         };
 
         let opts = collectors::CollectOptions {
-            max_commits: input.max_commits,
+            max_commits: input.max_commits.min(1000),
             ingested_commit_hashes: ingested_hashes,
             ..Default::default()
         };

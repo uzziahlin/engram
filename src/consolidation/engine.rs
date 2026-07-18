@@ -3,6 +3,8 @@ use anyhow::Result;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
+pub const DEFAULT_JACCARD_THRESHOLD: f64 = 0.85;
+
 /// One group of duplicate memories: keeper kept active, others to be archived.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConsolidationGroup {
@@ -154,8 +156,19 @@ impl ConsolidationEngine {
                 let mut archived = 0;
                 for group in &plan.groups {
                     for dup_id in &group.duplicate_ids {
-                        if repo.archive(kind, dup_id, project_id, now)? {
-                            archived += 1;
+                        // Best-effort: a single archive failure (e.g. SQLITE_BUSY)
+                        // must not abort the whole pass and leave a half-applied
+                        // intermediate state. Log and continue; `archived` stays
+                        // an accurate count of what was actually archived.
+                        match repo.archive(kind, dup_id, project_id, now) {
+                            Ok(true) => archived += 1,
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(
+                                kind = kind.as_str(),
+                                id = %dup_id,
+                                error = %e,
+                                "consolidate: failed to archive duplicate, skipping"
+                            ),
                         }
                     }
                 }
