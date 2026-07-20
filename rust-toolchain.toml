@@ -1,0 +1,6 @@
+# Pin the development toolchain so contributors and CI build with the same
+# stable Rust. The declared MSRV lives in Cargo.toml (`rust-version`) and is
+# verified by the dedicated `msrv` job in .github/workflows/ci.yml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -270,7 +270,6 @@ wal_mode = true                          # Write-Ahead Logging for performance
 
 [retrieval]
 default_limit = 10                       # Default search result count
-fallback_timeout_ms = 50                 # Timeout per memory source
 recency_half_life_days = 30              # Recency decay half-life (days) for reranking
 intent_routing = true                    # Route search to only the memory types implied by intent (General searches all four); off = always query every type
 weight_relevance = 0.4                   # BM25 score weight in the final ranking
@@ -308,12 +307,12 @@ Data is stored in `~/.engram/memory.db` by default.
 └──────────────────────────┬──────────────────────────────────┘
                            │ JSON-RPC
 ┌──────────────────────────▼──────────────────────────────────┐
-│                      MCP Server (18 tools)                   │
+│                      MCP Server (22 tools)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   MemoryToolProvider trait                    │
 ├─────────────┬─────────────────┬─────────────────────────────┤
-│  Retrieval  │   Repository    │        GraphEngine           │
-│  Pipeline   │   (SQLite+FTS5) │       (Petgraph)            │
+│  Retrieval  │   Repository    │     Relationship Graph     │
+│  Pipeline   │   (SQLite+FTS5) │        (SQLite)            │
 ├─────────────┤                 ├─────────────────────────────┤
 │ Intent →    │  Episodic       │  Entities: File, Fn,        │
 │ Route →     │  Decision       │  Module, Service, Commit    │
@@ -419,13 +418,13 @@ Re-running is idempotent — commits already stored as episodic memories are ski
 - [x] SQLite + FTS5 storage with 4 memory types
 - [x] MCP server (stdio transport)
 - [x] BM25 retrieval with intent classification
-- [x] Relationship graph engine
+- [x] Relationship graph (entities + relations in SQLite, queried via indexed adjacency)
 - [x] Git integration (auto-ingest commits)
 - [x] Project bootstrap (collect_sources + prompts)
 - [x] CLI interface
 - [x] Memory consolidation (dedup + soft-delete lifecycle: forget/restore/update)
 - [x] Embedding-based semantic search (candle + RRF fusion, behind the `semantic` feature)
-- [ ] Reflection engine (self-improving retrieval)
+- [x] Reflection engine (self-improving retrieval)
 - [ ] HTTP MCP transport (for remote access)
 - [ ] Multi-agent memory sharing
 

@@ -76,16 +76,6 @@ impl Reranker {
         let mut seen = std::collections::HashSet::new();
         results.retain(|r| seen.insert(r.id.clone()));
     }
-
-    /// Apply fallback resource limits.
-    pub fn apply_fallback_limits(
-        &self,
-        results: &mut Vec<SearchResult>,
-        max_input: usize,
-        max_output: usize,
-    ) {
-        results.truncate(max_output.min(max_input));
-    }
 }
 
 #[cfg(test)]
@@ -167,25 +157,6 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "1");
         assert_eq!(results[1].id, "2");
-    }
-
-    #[test]
-    fn test_fallback_limits() {
-        let reranker = Reranker::new();
-
-        let mut results: Vec<SearchResult> = (0..50)
-            .map(|i| SearchResult {
-                id: format!("{i}"),
-                memory_type: "episodic".into(),
-                summary: format!("result {i}"),
-                relevance_score: 0.5,
-                importance: 0.5,
-                created_at: 1000,
-            })
-            .collect();
-
-        reranker.apply_fallback_limits(&mut results, 25, 10);
-        assert_eq!(results.len(), 10);
     }
 
     fn result(id: &str, ty: &str, rel: f32, imp: f32, created_at: i64) -> SearchResult {

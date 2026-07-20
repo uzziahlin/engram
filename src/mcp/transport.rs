@@ -75,8 +75,14 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
             let response = handler.handle(req);
             if let Ok(s) = serde_json::to_string(&response) {
                 let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = writeln!(out, "{s}");
-                let _ = out.flush();
+                let written = writeln!(out, "{s}").and_then(|_| out.flush());
+                if let Err(e) = written {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        // stdout closed (MCP client gone) — stop this worker
+                        // instead of silently looping on a broken pipe.
+                        break;
+                    }
+                }
             }
         }));
     }
@@ -86,6 +92,31 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
         let line = line.context("failed to read from stdin")?;
         let line = line.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        // DoS guard: reject oversized requests before parsing them, so a
+        // misbehaving client can't exhaust memory with a huge single frame.
+        const MAX_REQ_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+        if line.len() > MAX_REQ_BYTES {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: None,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32700,
+                    message: format!(
+                        "Parse error: request too large ({} bytes; max {})",
+                        line.len(),
+                        MAX_REQ_BYTES
+                    ),
+                    data: None,
+                }),
+            };
+            if let Ok(s) = serde_json::to_string(&response) {
+                let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = writeln!(out, "{s}");
+                let _ = out.flush();
+            }
             continue;
         }
 

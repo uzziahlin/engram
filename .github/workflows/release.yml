@@ -20,7 +20,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Pre-release tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-test
+      - run: cargo test --locked
+
   build:
+    needs: test
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:

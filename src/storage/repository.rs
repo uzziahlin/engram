@@ -441,7 +441,24 @@ impl MemoryRepository {
                 resolved_at             INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_reflection_pending
-                ON reflection_suggestions(project_id, status, created_at DESC);",
+                ON reflection_suggestions(project_id, status, created_at DESC);
+            -- Historical de-dup (idempotent): before the partial unique index below
+            -- can be created on a pre-existing DB, collapse duplicate pending rows
+            -- per (project_id, pattern_tag) to a single survivor (earliest inserted,
+            -- via MIN(rowid)) and reject the rest. Re-runnable: each group ends up
+            -- with exactly one pending row, so subsequent runs update nothing.
+            UPDATE reflection_suggestions
+                SET status = 'rejected',
+                    resolved_at = CAST(strftime('%s','now') AS INTEGER)
+                WHERE status = 'pending'
+                  AND rowid NOT IN (
+                      SELECT MIN(rowid) FROM reflection_suggestions
+                      WHERE status = 'pending'
+                      GROUP BY project_id, pattern_tag
+                  );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reflection_pending_unique
+                ON reflection_suggestions(project_id, pattern_tag)
+                WHERE status = 'pending';",
         )?;
 
         tx.commit()?;
@@ -1613,7 +1630,7 @@ impl MemoryRepository {
 
         for kind in MemoryKind::all() {
             // Collect candidates first so we don't hold a read cursor while
-            // the per-row delete_* opens its own transaction.
+            // the per-row purge opens its own transaction.
             let candidates: Vec<(String, String)> = {
                 let conn = self.conn()?;
                 let sql = format!(
@@ -1631,14 +1648,25 @@ impl MemoryRepository {
             let kind_str = kind.as_str().to_string();
             per_type.push((kind_str.clone(), candidates.len()));
 
+            // GC must NOT call the generated `delete_*` macros: those hard-delete
+            // any matching row (active or archived) — used by tests that assert
+            // deletion of ACTIVE memories. Instead GC inlines a GUARDED delete
+            // (`AND archived_at IS NOT NULL`) via `gc_purge_one`, so a memory
+            // restored (archived_at = NULL) by another process between candidate
+            // collection and physical deletion is NOT destroyed. `engram gc` is a
+            // separate CLI process sharing the DB with the live MCP server, so
+            // this guard closes a silent-data-loss race that does not need
+            // worker_threads > 1 to trigger.
+            let fts_table = match kind {
+                MemoryKind::Episodic => "episodic_memories_fts",
+                MemoryKind::Decision => "decision_memories_fts",
+                MemoryKind::Failure => "failure_memories_fts",
+                MemoryKind::Procedural => "procedural_memories_fts",
+            };
+
             for (id, project_id) in candidates {
                 let removed = if apply {
-                    match kind {
-                        MemoryKind::Episodic => self.delete_episodic(&id, &project_id)?,
-                        MemoryKind::Decision => self.delete_decision(&id, &project_id)?,
-                        MemoryKind::Failure => self.delete_failure(&id, &project_id)?,
-                        MemoryKind::Procedural => self.delete_procedural(&id, &project_id)?,
-                    }
+                    self.gc_purge_one(kind.table(), fts_table, &id, &project_id)?
                 } else {
                     // Dry run: report every candidate as "would delete".
                     true
@@ -1658,6 +1686,48 @@ impl MemoryRepository {
             per_type,
             deleted,
         })
+    }
+
+    /// Physically delete one archived memory with the `archived_at IS NOT NULL`
+    /// guard, plus the same cascade (FTS / graph relations / entity / embedding)
+    /// used by the `delete_*` macros. Returns `false` (no-op) if the row is no
+    /// longer archived — e.g. restored between GC candidate collection and purge
+    /// — which is exactly what prevents GC from destroying a currently-live
+    /// memory. `table` and `fts_table` are hardcoded enum-derived literals, never
+    /// user input, so the `format!` SQL assembly is safe.
+    fn gc_purge_one(
+        &self,
+        table: &str,
+        fts_table: &str,
+        id: &str,
+        project_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let affected = tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE id = ?1 AND project_id = ?2 AND archived_at IS NOT NULL",
+                table
+            ),
+            params![id, project_id],
+        )?;
+        if affected > 0 {
+            tx.execute(
+                &format!("DELETE FROM {} WHERE memory_id = ?1", fts_table),
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
+                params![id],
+            )?;
+            tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(affected > 0)
     }
 
     /// Truncate the WAL back into the main database file. Best-effort: any
@@ -2873,10 +2943,129 @@ mod tests {
         assert_eq!(repo.list_pending_suggestions("p").unwrap().len(), 1);
     }
 
+    #[test]
+    fn reflection_unique_constraint_prevents_duplicate_pending() {
+        let repo = setup_repo();
+
+        // First pending proposal for (p, tag1) succeeds.
+        repo.insert_reflection_suggestion(&make_suggestion("s1", "tag1"))
+            .unwrap();
+
+        // A second pending proposal for the same (p, tag1) is rejected by the
+        // partial unique index idx_reflection_pending_unique.
+        assert!(
+            repo.insert_reflection_suggestion(&make_suggestion("s2", "tag1"))
+                .is_err(),
+            "duplicate pending insert must be rejected by the unique index"
+        );
+
+        // A different pattern_tag is unconstrained.
+        repo.insert_reflection_suggestion(&make_suggestion("s3", "tag2"))
+            .unwrap();
+
+        // Once the first proposal leaves `pending` (confirmed), the (p, tag1)
+        // slot frees up and a new pending proposal is allowed again.
+        repo.confirm_suggestion("s1", "p", now()).unwrap();
+        repo.insert_reflection_suggestion(&make_suggestion("s4", "tag1"))
+            .unwrap();
+    }
+
+    #[test]
+    fn gc_does_not_delete_restored_memory() {
+        // Race regression: gc collects archived candidates, then physically
+        // deletes them. If a memory is restored (archived_at = NULL) between
+        // collection and deletion, gc must NOT destroy it. Simulate the race:
+        // create -> archive -> (gc would collect here) -> restore -> gc(apply).
+        // The guarded delete (archived_at IS NOT NULL) in gc_purge_one must
+        // leave the now-active memory intact.
+        let repo = setup_repo();
+        let now = now();
+
+        let mem = EpisodicMemory {
+            id: "gc-restore-race-1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "GCRESTOREMARKERX race".into(),
+            content: "content".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        repo.create_episodic(&mem).unwrap();
+
+        // Archive, then immediately restore — emulating "gc already collected
+        // mem.id as a candidate" followed by a restore from another process.
+        repo.archive(MemoryKind::Episodic, &mem.id, &mem.project_id, now)
+            .unwrap();
+        repo.restore(MemoryKind::Episodic, &mem.id, &mem.project_id)
+            .unwrap();
+
+        // Run GC over all archived rows, applying deletions.
+        let _report = repo.gc_archived(0, true, now).unwrap();
+
+        // The memory must survive and remain active.
+        // The memory must survive — GC's guarded delete must not physically
+        // remove it.
+        let still = repo.get_episodic(&mem.id).unwrap();
+        assert!(still.is_some(), "restored memory must survive GC");
+
+        // Its FTS index row must still be present (cascade did not purge it).
+        let hits = repo
+            .search_episodic("GCRESTOREMARKERX", &mem.project_id, 10)
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "FTS index must still contain the restored memory"
+        );
+    }
+
+    #[test]
+    fn sanitize_fts_query_escapes_reserved_words_and_operators() {
+        // sanitize_fts_query wraps each whitespace-separated token in a
+        // double-quoted FTS5 phrase (doubling embedded quotes) and joins with
+        // " OR ". This must prevent FTS5 reserved words/operators in user input
+        // from acting as column filters or boolean operators — the historical
+        // UNIQUE-crash regression this guards against.
+        use MemoryRepository as R;
+
+        // Reserved word becomes a literal phrase, not an operator/column filter.
+        assert_eq!(R::sanitize_fts_query("UNIQUE"), "\"UNIQUE\"");
+
+        // Multiple tokens joined with OR, each quoted.
+        assert_eq!(R::sanitize_fts_query("foo bar"), "\"foo\" OR \"bar\"");
+
+        // Boolean operators inside the query are wrapped as literal phrases,
+        // NOT parsed as FTS5 AND/OR/NOT.
+        assert_eq!(
+            R::sanitize_fts_query("a AND b"),
+            "\"a\" OR \"AND\" OR \"b\""
+        );
+        assert_eq!(R::sanitize_fts_query("x OR y"), "\"x\" OR \"OR\" OR \"y\"");
+        assert_eq!(
+            R::sanitize_fts_query("p NOT q"),
+            "\"p\" OR \"NOT\" OR \"q\""
+        );
+
+        // Embedded double-quote is escaped by doubling (FTS5 phrase escape).
+        assert_eq!(R::sanitize_fts_query("a\"b"), "\"a\"\"b\"");
+
+        // FTS5 special chars (*, :, ^) inside quotes → literal.
+        assert_eq!(R::sanitize_fts_query("foo*"), "\"foo*\"");
+        assert_eq!(R::sanitize_fts_query("a:b"), "\"a:b\"");
+
+        // Empty / whitespace-only query yields a valid empty phrase (no crash,
+        // no malformed MATCH).
+        assert_eq!(R::sanitize_fts_query(""), "\"\"");
+        assert_eq!(R::sanitize_fts_query("   "), "\"\"");
+    }
+
     // ─── Transaction Rollback Test ─────────────────────────────────
 
     #[test]
-    fn test_transaction_rollback_on_fts_failure() {
+    fn create_then_read_roundtrip() {
         let repo = setup_repo();
 
         // Create a valid memory first

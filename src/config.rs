@@ -142,12 +142,11 @@ mod tests {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalConfig {
+    /// Note: the MCP server currently applies a protocol default of 10 when a
+    /// client omits `limit`; this field is reserved for wiring the configured
+    /// value into the server. It IS used for config validation.
     #[serde(default = "RetrievalConfig::default_limit")]
     pub default_limit: usize,
-    #[serde(default = "RetrievalConfig::default_fallback_timeout_ms")]
-    pub fallback_timeout_ms: u64,
-    #[serde(default = "RetrievalConfig::default_fallback_max_results")]
-    pub fallback_max_results: usize,
     #[serde(default = "RetrievalConfig::default_recency_half_life_days")]
     pub recency_half_life_days: u64,
     /// Route `search_memory` to only the memory types implied by the classified
@@ -173,8 +172,6 @@ impl Default for RetrievalConfig {
     fn default() -> Self {
         Self {
             default_limit: Self::default_limit(),
-            fallback_timeout_ms: Self::default_fallback_timeout_ms(),
-            fallback_max_results: Self::default_fallback_max_results(),
             recency_half_life_days: Self::default_recency_half_life_days(),
             intent_routing: Self::default_intent_routing(),
             weight_relevance: Self::default_weight_relevance(),
@@ -188,12 +185,6 @@ impl Default for RetrievalConfig {
 impl RetrievalConfig {
     fn default_limit() -> usize {
         10
-    }
-    fn default_fallback_timeout_ms() -> u64 {
-        50
-    }
-    fn default_fallback_max_results() -> usize {
-        100
     }
     fn default_recency_half_life_days() -> u64 {
         30

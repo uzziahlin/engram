@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_mcp_server() -> anyhow::Result<()> {
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load config ({e}); using defaults");
+        Config::default()
+    });
     tracing::info!(
         "Configuration loaded from {:?}",
         config.storage.database_path

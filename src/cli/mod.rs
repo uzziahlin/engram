@@ -1,4 +1,4 @@
-pub mod commands;
+mod commands;
 
 use anyhow::Result;
 

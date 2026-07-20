@@ -4,7 +4,6 @@ pub mod config;
 pub mod consolidation;
 pub mod context;
 pub mod git_integration;
-pub mod graph;
 pub mod mcp;
 pub mod models;
 pub mod reflection;

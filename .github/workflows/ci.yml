@@ -60,6 +60,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
@@ -69,3 +71,29 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
+
+  msrv:
+    name: MSRV (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: ["1.75"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      # rust-toolchain.toml pins stable for dev; override per-directory so the
+      # MSRV build actually uses the old toolchain.
+      - run: rustup override set ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+
+  audit:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features check advisories licenses bans
