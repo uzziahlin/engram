@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-20
+
 Open-source readiness pass — see `docs/开源就绪修复计划.md` for the full plan.
 
 ### Added
