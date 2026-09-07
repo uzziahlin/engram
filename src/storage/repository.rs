@@ -379,6 +379,14 @@ impl MemoryRepository {
             CREATE INDEX IF NOT EXISTS idx_episodic_project_time ON episodic_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_decision_project_time ON decision_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_procedural_project_time ON procedural_memories(project_id, created_at DESC);
+            -- Historical de-dup (idempotent): legacy DBs can carry duplicate
+            -- relations (the unique index below postdates them). Collapse them
+            -- first, or CREATE UNIQUE INDEX fails and takes startup down with it.
+            DELETE FROM graph_relations
+             WHERE rowid NOT IN (
+                 SELECT MIN(rowid) FROM graph_relations
+                 GROUP BY from_entity, to_entity, relation_type
+             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_unique_relation ON graph_relations(from_entity, to_entity, relation_type);
             CREATE INDEX IF NOT EXISTS idx_failure_project_time ON failure_memories(project_id, created_at DESC);",
         )?;
@@ -567,20 +575,178 @@ impl MemoryRepository {
             );",
         )?;
 
-        tx.execute_batch(
-            "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
-             SELECT id, summary, content, files_touched, tags FROM episodic_memories;
-             INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags)
-             SELECT id, title, context, rationale, tradeoffs, tags FROM decision_memories;
-             INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags)
-             SELECT id, incident, root_cause, fix, prevention, tags FROM failure_memories;
-             INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags)
-             SELECT id, workflow_name, steps, related_tools, tags FROM procedural_memories;",
-        )?;
+        // Backfill through Rust so text columns go through `preprocess_cjk`.
+        // A plain INSERT..SELECT copies raw text, and the unicode61 tokenizer
+        // treats consecutive CJK as one token — while the query side always
+        // preprocesses — which would make migrated CJK content permanently
+        // unsearchable.
+        Self::backfill_fts_from_main(&tx)?;
 
         tx.commit()?;
         tracing::info!("FTS5 migration complete — tags column added.");
         Ok(())
+    }
+
+    /// Rebuild all four FTS indexes from their main tables in one transaction:
+    /// removes orphan FTS rows, restores missing ones, and re-applies CJK
+    /// preprocessing (which older migrations/paths may have skipped). Safe to
+    /// run any time — it only ever makes the index match the main tables.
+    /// Returns the number of FTS rows written.
+    pub fn rebuild_fts(&self) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        for table in [
+            "episodic_memories_fts",
+            "decision_memories_fts",
+            "failure_memories_fts",
+            "procedural_memories_fts",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        let written = Self::backfill_fts_from_main(&tx)?;
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Insert one FTS row per main-table row, with the same column
+    /// preprocessing as the live write path (CJK split on text columns, raw
+    /// JSON for list columns). Runs inside the caller's transaction.
+    fn backfill_fts_from_main(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+        let mut written = 0usize;
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, summary, content, files_touched, tags FROM episodic_memories",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut ins = tx.prepare(
+                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
+                 VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for (id, summary, content, files, tags) in rows {
+                ins.execute(params![
+                    id,
+                    Self::preprocess_cjk(&summary),
+                    Self::preprocess_cjk(&content),
+                    files,
+                    tags
+                ])?;
+                written += 1;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, title, context, rationale, tradeoffs, tags FROM decision_memories",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut ins = tx.prepare(
+                "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+            )?;
+            for (id, title, context, rationale, tradeoffs, tags) in rows {
+                ins.execute(params![
+                    id,
+                    Self::preprocess_cjk(&title),
+                    Self::preprocess_cjk(&context),
+                    Self::preprocess_cjk(&rationale),
+                    Self::preprocess_cjk(&tradeoffs),
+                    tags
+                ])?;
+                written += 1;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, incident, root_cause, fix, prevention, tags FROM failure_memories",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut ins = tx.prepare(
+                "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+            )?;
+            for (id, incident, root_cause, fix, prevention, tags) in rows {
+                ins.execute(params![
+                    id,
+                    Self::preprocess_cjk(&incident),
+                    Self::preprocess_cjk(&root_cause),
+                    Self::preprocess_cjk(&fix),
+                    Self::preprocess_cjk(&prevention),
+                    tags
+                ])?;
+                written += 1;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, workflow_name, steps, related_tools, tags FROM procedural_memories",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut ins = tx.prepare(
+                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags)
+                 VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for (id, workflow_name, steps, related_tools, tags) in rows {
+                ins.execute(params![
+                    id,
+                    Self::preprocess_cjk(&workflow_name),
+                    steps,
+                    related_tools,
+                    tags
+                ])?;
+                written += 1;
+            }
+        }
+
+        Ok(written)
     }
 
     /// Add the nullable `archived_at` column to all four memory tables if missing.
@@ -764,6 +930,7 @@ impl MemoryRepository {
         mem = mem,
         tx = tx,
         row = row,
+        link_ts = link_ts,
 
         struct_type = EpisodicMemory,
         table = "episodic_memories",
@@ -841,7 +1008,7 @@ impl MemoryRepository {
             if !mem.files_touched.is_empty() {
                 Self::ensure_linked_entities(
                     &tx, &mem.project_id, &mem.id, "File", &mem.files_touched,
-                    "Touches", mem.created_at,
+                    "Touches", link_ts,
                 )?;
             }
         },
@@ -851,6 +1018,7 @@ impl MemoryRepository {
         mem = mem,
         tx = tx,
         row = row,
+        link_ts = link_ts,
 
         struct_type = DecisionMemory,
         table = "decision_memories",
@@ -924,7 +1092,7 @@ impl MemoryRepository {
             if !mem.related_files.is_empty() {
                 Self::ensure_linked_entities(
                     &tx, &mem.project_id, &mem.id, "File", &mem.related_files,
-                    "References", mem.created_at,
+                    "References", link_ts,
                 )?;
             }
         },
@@ -934,6 +1102,7 @@ impl MemoryRepository {
         mem = mem,
         tx = tx,
         row = row,
+        link_ts = link_ts,
 
         struct_type = FailureMemory,
         table = "failure_memories",
@@ -1010,6 +1179,7 @@ impl MemoryRepository {
         mem = mem,
         tx = tx,
         row = row,
+        link_ts = link_ts,
 
         struct_type = ProceduralMemory,
         table = "procedural_memories",
@@ -1080,7 +1250,7 @@ impl MemoryRepository {
             if !mem.related_tools.is_empty() {
                 Self::ensure_linked_entities(
                     &tx, &mem.project_id, &mem.id, "Tool", &mem.related_tools,
-                    "Uses", mem.created_at,
+                    "Uses", link_ts,
                 )?;
             }
         },
@@ -1301,10 +1471,14 @@ impl MemoryRepository {
     }
     /// Check which commit hashes have already been ingested as episodic memories.
     /// Returns a HashSet of already-ingested commit hashes for O(1) lookup.
+    /// Archived memories are excluded, so archiving old session memories no
+    /// longer permanently blocks re-importing their commits.
     pub fn get_ingested_commits(&self, project_id: &str) -> Result<HashSet<String>> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT related_commits FROM episodic_memories WHERE project_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT related_commits FROM episodic_memories \
+             WHERE project_id = ?1 AND archived_at IS NULL",
+        )?;
         let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         let mut hashes = HashSet::new();
         for row in rows {
@@ -1424,7 +1598,7 @@ impl MemoryRepository {
     }
 
     /// Insert a reflection proposal (status='pending'). The caller de-duplicates
-    /// via [`has_pending_suggestion`] before calling.
+    /// via [`has_suggestion_for_tag`] before calling.
     pub fn insert_reflection_suggestion(&self, row: &ReflectionSuggestionRow) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -1464,6 +1638,55 @@ impl MemoryRepository {
         Ok(exists)
     }
 
+    /// Whether ANY proposal (pending, confirmed, or rejected) exists for
+    /// `(project_id, pattern_tag)`. The reflection engine uses this so a tag
+    /// the user already decided on — either way — is never re-proposed:
+    /// rejecting must not let the same suggestion resurrect on the next
+    /// `reflect --apply`, and confirming must not re-propose the promoted rule.
+    pub fn has_suggestion_for_tag(&self, project_id: &str, pattern_tag: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reflection_suggestions \
+             WHERE project_id = ?1 AND pattern_tag = ?2)",
+            params![project_id, pattern_tag],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// All distinct project ids that have at least one memory (any kind).
+    /// Ordered for deterministic maintenance output.
+    pub fn list_projects(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT project_id FROM (
+                SELECT project_id FROM episodic_memories
+                UNION SELECT project_id FROM decision_memories
+                UNION SELECT project_id FROM failure_memories
+                UNION SELECT project_id FROM procedural_memories
+            ) ORDER BY project_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Delete `query_log` rows older than `older_than_seconds`. `query_log`
+    /// grows by one row per search and has no natural bound; maintenance
+    /// prunes it so the DB doesn't bloat indefinitely. Returns rows removed.
+    pub fn prune_query_log(&self, older_than_seconds: i64, now: i64) -> Result<usize> {
+        let threshold = now.checked_sub(older_than_seconds).unwrap_or(0);
+        let conn = self.conn()?;
+        let removed = conn.execute(
+            "DELETE FROM query_log WHERE created_at < ?1",
+            params![threshold],
+        )?;
+        Ok(removed)
+    }
+
     /// All pending proposals for a project, newest first.
     pub fn list_pending_suggestions(
         &self,
@@ -1476,46 +1699,88 @@ impl MemoryRepository {
         )
     }
 
-    /// Confirm a proposal: promote its draft into `procedural_memories` via the
-    /// standard [`create_procedural`] path (main-table INSERT + FTS5 dual-write +
-    /// entity link), then mark the proposal `confirmed` + `resolved_at`. Returns
-    /// the new procedural memory's id, or `None` if no matching pending proposal
-    /// was found (already resolved / wrong project / unknown id). The promoted
-    /// procedural id is `"{suggestion_id}-proc"`, making confirm idempotent at
-    /// the data level.
+    /// Confirm a proposal: promote its draft into `procedural_memories` and mark
+    /// the proposal `confirmed` + `resolved_at` — both inside ONE transaction on
+    /// ONE connection, so a crash can no longer leave "procedural created but
+    /// suggestion still pending". The promoted id is `"{suggestion_id}-proc"`;
+    /// if that row already exists (a previous attempt crashed after INSERT),
+    /// the insert is skipped and the suggestion is simply marked confirmed —
+    /// making confirm idempotent under retries. Returns `None` if no matching
+    /// pending proposal was found (already resolved / wrong project / unknown id).
     pub fn confirm_suggestion(
         &self,
         id: &str,
         project_id: &str,
         now: i64,
     ) -> Result<Option<String>> {
+        let conn = self.conn()?;
         // Read the pending draft first (None if already resolved / wrong project).
-        let draft = match self.get_suggestion(id, project_id)? {
+        let draft = match Self::query_suggestion(
+            &conn,
+            "WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id],
+        )? {
             Some(d) if d.status == "pending" => d,
             _ => return Ok(None),
         };
+        if draft.suggested_steps.is_empty() {
+            anyhow::bail!(
+                "suggestion '{}' has no steps; reject it instead of confirming an empty rule",
+                draft.id
+            );
+        }
 
-        // Promote into procedural_memories through the shared create path.
         let proc_id = format!("{}-proc", draft.id);
-        let memory = ProceduralMemory {
-            id: proc_id.clone(),
-            project_id: draft.project_id,
-            workflow_name: draft.suggested_workflow_name,
-            steps: draft.suggested_steps,
-            related_tools: vec![],
-            tags: draft.suggested_tags,
-            created_at: now,
-            updated_at: now,
-        };
-        self.create_procedural(&memory)?;
+        let tx = conn.unchecked_transaction()?;
 
-        // Mark the proposal confirmed.
-        let conn = self.conn()?;
-        conn.execute(
+        // Idempotent promote: skip the INSERT if a crashed earlier attempt
+        // already created the procedural memory.
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM procedural_memories WHERE id = ?1)",
+            params![proc_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute(
+                "INSERT INTO procedural_memories \
+                 (id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+                params![
+                    proc_id,
+                    draft.project_id,
+                    draft.suggested_workflow_name,
+                    serde_json::to_string(&draft.suggested_steps)?,
+                    serde_json::to_string(&Vec::<String>::new())?,
+                    serde_json::to_string(&draft.suggested_tags)?,
+                    now,
+                ],
+            )?;
+            // Mirror the standard create path's FTS dual-write (CJK-preprocessed).
+            tx.execute(
+                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags) \
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    proc_id,
+                    Self::preprocess_cjk(&draft.suggested_workflow_name),
+                    serde_json::to_string(&draft.suggested_steps)?,
+                    serde_json::to_string(&Vec::<String>::new())?,
+                    serde_json::to_string(&draft.suggested_tags)?,
+                ],
+            )?;
+        }
+
+        let confirmed = tx.execute(
             "UPDATE reflection_suggestions SET status = 'confirmed', resolved_at = ?1 \
              WHERE id = ?2 AND project_id = ?3 AND status = 'pending'",
             params![now, id, project_id],
         )?;
+        tx.commit()?;
+
+        if confirmed == 0 {
+            // Lost a race with a concurrent confirm/reject between the read and
+            // the UPDATE. Report "not pending" rather than falsely claiming success.
+            return Ok(None);
+        }
         Ok(Some(proc_id))
     }
 
@@ -1529,20 +1794,6 @@ impl MemoryRepository {
             params![now, id, project_id],
         )?;
         Ok(affected > 0)
-    }
-
-    /// Fetch a single proposal by id within a project (any status). Used by
-    /// [`confirm_suggestion`] to read the draft before promoting it.
-    fn get_suggestion(
-        &self,
-        id: &str,
-        project_id: &str,
-    ) -> Result<Option<ReflectionSuggestionRow>> {
-        Self::query_suggestion(
-            &self.conn()?,
-            "WHERE id = ?1 AND project_id = ?2",
-            params![id, project_id],
-        )
     }
 
     /// Shared row mapper for a single suggestion SELECT.
@@ -1619,8 +1870,9 @@ impl MemoryRepository {
     /// `vacuum`) so callers control when free space is actually reclaimed.
     pub fn gc_archived(&self, older_than_seconds: i64, apply: bool, now: i64) -> Result<GcReport> {
         // `<= 0` means "all archived": use a threshold nothing is below.
+        // checked_sub avoids the debug-panic / release-wrap on absurd durations.
         let threshold = if older_than_seconds > 0 {
-            now - older_than_seconds
+            now.checked_sub(older_than_seconds).unwrap_or(i64::MIN)
         } else {
             i64::MAX
         };
@@ -1630,7 +1882,7 @@ impl MemoryRepository {
 
         for kind in MemoryKind::all() {
             // Collect candidates first so we don't hold a read cursor while
-            // the per-row purge opens its own transaction.
+            // the purge transaction runs.
             let candidates: Vec<(String, String)> = {
                 let conn = self.conn()?;
                 let sql = format!(
@@ -1646,38 +1898,65 @@ impl MemoryRepository {
             };
 
             let kind_str = kind.as_str().to_string();
-            per_type.push((kind_str.clone(), candidates.len()));
+            let mut removed_rows: Vec<GcDeletedRow> = Vec::new();
 
-            // GC must NOT call the generated `delete_*` macros: those hard-delete
-            // any matching row (active or archived) — used by tests that assert
-            // deletion of ACTIVE memories. Instead GC inlines a GUARDED delete
-            // (`AND archived_at IS NOT NULL`) via `gc_purge_one`, so a memory
-            // restored (archived_at = NULL) by another process between candidate
-            // collection and physical deletion is NOT destroyed. `engram gc` is a
-            // separate CLI process sharing the DB with the live MCP server, so
-            // this guard closes a silent-data-loss race that does not need
-            // worker_threads > 1 to trigger.
-            let fts_table = match kind {
-                MemoryKind::Episodic => "episodic_memories_fts",
-                MemoryKind::Decision => "decision_memories_fts",
-                MemoryKind::Failure => "failure_memories_fts",
-                MemoryKind::Procedural => "procedural_memories_fts",
-            };
-
-            for (id, project_id) in candidates {
-                let removed = if apply {
-                    self.gc_purge_one(kind.table(), fts_table, &id, &project_id)?
-                } else {
-                    // Dry run: report every candidate as "would delete".
-                    true
-                };
-                if removed {
-                    deleted.push(GcDeletedRow {
+            if apply && !candidates.is_empty() {
+                // One transaction per kind (not per row): a batch GC commits
+                // once instead of N times. The `archived_at IS NOT NULL` guard
+                // stays in the DELETE itself, so a memory restored by another
+                // process between collection and purge is NOT destroyed —
+                // `engram gc` is a separate CLI process sharing the DB with
+                // the live MCP server, and this closes a silent-data-loss
+                // race that does not need worker_threads > 1 to trigger.
+                let fts_table = kind_fts_table(kind);
+                let conn = self.conn()?;
+                let tx = conn.unchecked_transaction()?;
+                for (id, project_id) in &candidates {
+                    let affected = tx.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE id = ?1 AND project_id = ?2 \
+                             AND archived_at IS NOT NULL",
+                            kind.table()
+                        ),
+                        params![id, project_id],
+                    )?;
+                    if affected > 0 {
+                        tx.execute(
+                            &format!("DELETE FROM {} WHERE memory_id = ?1", fts_table),
+                            params![id],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
+                            params![id],
+                        )?;
+                        tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+                        tx.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                            params![id],
+                        )?;
+                        removed_rows.push(GcDeletedRow {
+                            memory_type: kind_str.clone(),
+                            id: id.clone(),
+                        });
+                    }
+                }
+                tx.commit()?;
+            } else if !apply {
+                // Dry run: report every candidate as "would delete".
+                removed_rows = candidates
+                    .into_iter()
+                    .map(|(id, _)| GcDeletedRow {
                         memory_type: kind_str.clone(),
                         id,
-                    });
-                }
+                    })
+                    .collect();
             }
+
+            // per_type counts what was (or would be) actually removed —
+            // identical to `deleted` — rather than the candidate count, which
+            // can overcount when the restore guard skips rows.
+            per_type.push((kind_str, removed_rows.len()));
+            deleted.extend(removed_rows);
         }
 
         Ok(GcReport {
@@ -1686,48 +1965,6 @@ impl MemoryRepository {
             per_type,
             deleted,
         })
-    }
-
-    /// Physically delete one archived memory with the `archived_at IS NOT NULL`
-    /// guard, plus the same cascade (FTS / graph relations / entity / embedding)
-    /// used by the `delete_*` macros. Returns `false` (no-op) if the row is no
-    /// longer archived — e.g. restored between GC candidate collection and purge
-    /// — which is exactly what prevents GC from destroying a currently-live
-    /// memory. `table` and `fts_table` are hardcoded enum-derived literals, never
-    /// user input, so the `format!` SQL assembly is safe.
-    fn gc_purge_one(
-        &self,
-        table: &str,
-        fts_table: &str,
-        id: &str,
-        project_id: &str,
-    ) -> Result<bool> {
-        let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let affected = tx.execute(
-            &format!(
-                "DELETE FROM {} WHERE id = ?1 AND project_id = ?2 AND archived_at IS NOT NULL",
-                table
-            ),
-            params![id, project_id],
-        )?;
-        if affected > 0 {
-            tx.execute(
-                &format!("DELETE FROM {} WHERE memory_id = ?1", fts_table),
-                params![id],
-            )?;
-            tx.execute(
-                "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
-                params![id],
-            )?;
-            tx.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
-            tx.execute(
-                "DELETE FROM memory_embeddings WHERE memory_id = ?1",
-                params![id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(affected > 0)
     }
 
     /// Truncate the WAL back into the main database file. Best-effort: any
@@ -2118,7 +2355,18 @@ fn is_cjk_character(ch: char) -> bool {
         | '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
         | '\u{3040}'..='\u{309F}'   // Hiragana
         | '\u{30A0}'..='\u{30FF}'   // Katakana
+        | '\u{AC00}'..='\u{D7AF}'   // Hangul Syllables
     )
+}
+
+/// The FTS shadow table for a memory kind (enum-derived, never user input).
+fn kind_fts_table(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Episodic => "episodic_memories_fts",
+        MemoryKind::Decision => "decision_memories_fts",
+        MemoryKind::Failure => "failure_memories_fts",
+        MemoryKind::Procedural => "procedural_memories_fts",
+    }
 }
 
 #[cfg(test)]
@@ -2976,7 +3224,7 @@ mod tests {
         // deletes them. If a memory is restored (archived_at = NULL) between
         // collection and deletion, gc must NOT destroy it. Simulate the race:
         // create -> archive -> (gc would collect here) -> restore -> gc(apply).
-        // The guarded delete (archived_at IS NOT NULL) in gc_purge_one must
+        // The guarded delete (archived_at IS NOT NULL) in the GC purge must
         // leave the now-active memory intact.
         let repo = setup_repo();
         let now = now();
@@ -3333,5 +3581,178 @@ mod tests {
         let p1 = repo.embedded_ids(Some("p1"), "minilm").unwrap();
         assert_eq!(p1.len(), 1, "only m1 in p1 for minilm");
         assert!(p1.contains("m1"));
+    }
+
+    fn episodic_fixture(id: &str, summary: &str) -> EpisodicMemory {
+        EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: format!("{summary} body"),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn update_nonexistent_id_errors_and_leaves_no_orphan_fts() {
+        let repo = setup_repo();
+        let mut mem = episodic_fixture("ghost", "phantom summary");
+        mem.id = "does-not-exist".into();
+
+        let err = repo.update_episodic(&mem);
+        assert!(err.is_err(), "updating a missing id must fail");
+
+        // No orphan FTS row may survive the failed update.
+        let conn = repo.connection().unwrap();
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodic_memories_fts WHERE memory_id = 'does-not-exist'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0, "failed update must not create orphan FTS rows");
+    }
+
+    #[test]
+    fn rebuild_fts_repairs_orphans_and_missing_rows() {
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("e1", "alpha engine")).unwrap();
+        repo.create_episodic(&episodic_fixture("e2", "beta wheel")).unwrap();
+
+        {
+            let conn = repo.connection().unwrap();
+            // Corrupt the index both ways: an orphan row + a missing row.
+            conn.execute(
+                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
+                 VALUES ('ghost', 'orphan', 'orphan', '[]', '[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM episodic_memories_fts WHERE memory_id = 'e2'", [])
+                .unwrap();
+        }
+
+        let written = repo.rebuild_fts().unwrap();
+        assert_eq!(written, 2, "one FTS row per main-table row");
+
+        let orphan: i64 = {
+            let conn = repo.connection().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM episodic_memories_fts WHERE memory_id = 'ghost'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(orphan, 0, "orphan FTS rows must be purged");
+        assert!(
+            !repo.search_episodic("beta", "p", 10).unwrap().is_empty(),
+            "restored row must be searchable again"
+        );
+    }
+
+    #[test]
+    fn rebuild_fts_reapplies_cjk_preprocessing() {
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("c1", "修复认证模块"))
+            .unwrap();
+        // Simulate a legacy raw-text index (no CJK split): unreadable by the
+        // preprocessing-aware query side.
+        {
+            let conn = repo.connection().unwrap();
+            conn.execute("DELETE FROM episodic_memories_fts WHERE memory_id = 'c1'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
+                 VALUES ('c1', '修复认证模块', '修复认证模块 body', '[]', '[]')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            repo.search_episodic("认证", "p", 10).unwrap().is_empty(),
+            "raw CJK index should not match per-character queries"
+        );
+
+        repo.rebuild_fts().unwrap();
+        assert!(
+            !repo.search_episodic("认证", "p", 10).unwrap().is_empty(),
+            "rebuild must re-apply CJK preprocessing"
+        );
+    }
+
+    #[test]
+    fn get_ingested_commits_excludes_archived_memories() {
+        let repo = setup_repo();
+        let mut mem = episodic_fixture("e1", "with commit");
+        mem.related_commits = vec!["abc123".into()];
+        repo.create_episodic(&mem).unwrap();
+
+        assert!(repo.get_ingested_commits("p").unwrap().contains("abc123"));
+
+        repo.archive(MemoryKind::Episodic, "e1", "p", 200).unwrap();
+        assert!(
+            !repo.get_ingested_commits("p").unwrap().contains("abc123"),
+            "archiving a memory must release its commits for re-import"
+        );
+    }
+
+    #[test]
+    fn update_refreshes_entity_links_for_changed_files() {
+        let repo = setup_repo();
+        let mut mem = episodic_fixture("e1", "touches files");
+        mem.files_touched = vec!["old.rs".into()];
+        repo.create_episodic(&mem).unwrap();
+
+        // Change the file list: old edge must go, new edge must exist.
+        mem.files_touched = vec!["new.rs".into()];
+        mem.updated_at = 200;
+        repo.update_episodic(&mem).unwrap();
+
+        let (_, edges) = repo.related_files_for("old.rs", "p").unwrap();
+        assert!(edges.is_empty(), "stale edge to old.rs must be dropped");
+        let (_, edges) = repo.related_files_for("new.rs", "p").unwrap();
+        assert!(!edges.is_empty(), "edge to new.rs must be linked");
+    }
+
+    #[test]
+    fn prune_query_log_removes_only_old_rows() {
+        let repo = setup_repo();
+        repo.record_query("p", "old", &[], None, 100).unwrap();
+        repo.record_query("p", "new", &[], None, 10_000).unwrap();
+
+        let removed = repo.prune_query_log(500, 10_000).unwrap();
+        assert_eq!(removed, 1);
+        let stats = repo.query_stats("p", 0, 10).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].query, "new");
+    }
+
+    #[test]
+    fn list_projects_unions_all_kinds() {
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("e1", "x")).unwrap();
+        repo.create_decision(&DecisionMemory {
+            id: "d1".into(),
+            project_id: "other".into(),
+            title: "t".into(),
+            context: "c".into(),
+            rationale: "r".into(),
+            tradeoffs: "t".into(),
+            related_files: vec![],
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        assert_eq!(repo.list_projects().unwrap(), vec!["other".to_string(), "p".to_string()]);
     }
 }

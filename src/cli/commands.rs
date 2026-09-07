@@ -68,9 +68,12 @@ fn optional_str(args: &[String], name: &str) -> Option<String> {
     args.get(pos + 1).cloned()
 }
 
-/// Extract a numeric argument by name.
+/// Extract a numeric argument by name. Non-numeric, NaN, and infinite values
+/// are rejected (None) so they can't silently become a 0/usize::MAX limit.
 fn optional_num(args: &[String], name: &str) -> Option<f64> {
-    optional_str(args, name).and_then(|s| s.parse().ok())
+    optional_str(args, name)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|n| n.is_finite())
 }
 
 /// Extract a repeated argument (--tag a --tag b).
@@ -146,8 +149,16 @@ fn import_into_claude_md(dir: &Path) -> Result<ImportOutcome> {
 // ─── Commands ─────────────────────────────────────────────────────
 
 pub fn init(_args: &[String]) -> Result<()> {
-    let config = load_config();
-    let config = config.unwrap_or_default();
+    // A broken config.toml must be loud, not silently replaced by defaults —
+    // otherwise `init` builds the DB at the default path while the user's
+    // configured path (and the MCP server) point elsewhere.
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: config load failed ({e:#}); using defaults");
+            Config::default()
+        }
+    };
 
     if let Some(parent) = config.storage.database_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -220,80 +231,160 @@ pub fn init_guide(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a memory passes the `--tag`/`--before` filters (ANY-tag semantics,
+/// matching forget-batch and the MCP search filter).
+fn matches_filters(tags: &[String], created_at: i64, ftags: &[String], before: Option<i64>) -> bool {
+    (ftags.is_empty() || tags.iter().any(|t| ftags.contains(t)))
+        && before.map_or(true, |b| created_at < b)
+}
+
 pub fn search(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let query = require_str(args, "query")?;
     let memory_type = optional_str(args, "type");
     let limit = optional_num(args, "limit").unwrap_or(10.0) as usize;
+    let tags = repeated_args(args, "tag");
+    let before = optional_num(args, "before").map(|n| n as i64);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    let results = if let Some(ref mt) = memory_type {
+    // Collect (bm25 score, item) pairs so the all-types path can merge-sort
+    // across types instead of concatenating in fixed type order and letting
+    // episodic crowd out everything else at the truncate boundary.
+    let mut scored: Vec<(f64, serde_json::Value)> = if let Some(ref mt) = memory_type {
         match mt.as_str() {
-            "episodic" => {
-                let mems = repo.search_episodic(&query, &project_id, limit)?;
-                mems.iter().map(|m| serde_json::json!({
-                    "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
-                    "importance": m.memory.importance, "files": m.memory.files_touched, "created_at": m.memory.created_at,
-                })).collect()
-            }
-            "decision" => {
-                let mems = repo.search_decisions(&query, &project_id, limit)?;
-                mems.iter()
-                    .map(|m| {
+            "episodic" => repo
+                .search_episodic(&query, &project_id, limit)?
+                .into_iter()
+                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
+                .map(|m| {
+                    (
+                        m.bm25_score,
+                        serde_json::json!({
+                            "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
+                            "content": m.memory.content, "files": m.memory.files_touched,
+                            "importance": m.memory.importance, "tags": m.memory.tags,
+                            "created_at": m.memory.created_at,
+                        }),
+                    )
+                })
+                .collect(),
+            "decision" => repo
+                .search_decisions(&query, &project_id, limit)?
+                .into_iter()
+                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
+                .map(|m| {
+                    (
+                        m.bm25_score,
                         serde_json::json!({
                             "id": m.memory.id, "type": "decision", "title": m.memory.title,
-                            "rationale": m.memory.rationale, "created_at": m.memory.created_at,
-                        })
-                    })
-                    .collect()
-            }
-            "failure" => {
-                let mems = repo.search_failures(&query, &project_id, limit)?;
-                mems.iter().map(|m| serde_json::json!({
-                    "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
-                    "severity": m.memory.severity, "fix": m.memory.fix, "created_at": m.memory.created_at,
-                })).collect()
-            }
-            "procedural" => {
-                let mems = repo.search_procedural(&query, &project_id, limit)?;
-                mems.iter().map(|m| serde_json::json!({
-                    "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
-                    "steps": m.memory.steps, "created_at": m.memory.created_at,
-                })).collect()
-            }
+                            "context": m.memory.context, "rationale": m.memory.rationale,
+                            "tradeoffs": m.memory.tradeoffs, "tags": m.memory.tags,
+                            "created_at": m.memory.created_at,
+                        }),
+                    )
+                })
+                .collect(),
+            "failure" => repo
+                .search_failures(&query, &project_id, limit)?
+                .into_iter()
+                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
+                .map(|m| {
+                    (
+                        m.bm25_score,
+                        serde_json::json!({
+                            "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
+                            "root_cause": m.memory.root_cause, "fix": m.memory.fix,
+                            "prevention": m.memory.prevention, "severity": m.memory.severity,
+                            "tags": m.memory.tags, "created_at": m.memory.created_at,
+                        }),
+                    )
+                })
+                .collect(),
+            "procedural" => repo
+                .search_procedural(&query, &project_id, limit)?
+                .into_iter()
+                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
+                .map(|m| {
+                    (
+                        m.bm25_score,
+                        serde_json::json!({
+                            "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
+                            "steps": m.memory.steps, "tools": m.memory.related_tools,
+                            "tags": m.memory.tags, "created_at": m.memory.created_at,
+                        }),
+                    )
+                })
+                .collect(),
             _ => anyhow::bail!(
                 "Unknown memory type: {mt}. Use: episodic, decision, failure, procedural"
             ),
         }
     } else {
-        // Search all types
-        let mut all = Vec::new();
-
-        if let Ok(mems) = repo.search_episodic(&query, &project_id, limit) {
-            for m in &mems {
-                all.push(serde_json::json!({"id": m.memory.id, "type": "episodic", "summary": m.memory.summary, "importance": m.memory.importance, "created_at": m.memory.created_at}));
+        // Search all types — errors propagate (`?`): a DB failure must not
+        // masquerade as "no results" with exit code 0.
+        let mut all: Vec<(f64, serde_json::Value)> = Vec::new();
+        for m in repo.search_episodic(&query, &project_id, limit)? {
+            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
+                all.push((
+                    m.bm25_score,
+                    serde_json::json!({
+                        "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
+                        "content": m.memory.content, "importance": m.memory.importance,
+                        "tags": m.memory.tags, "created_at": m.memory.created_at,
+                    }),
+                ));
             }
         }
-        if let Ok(mems) = repo.search_decisions(&query, &project_id, limit) {
-            for m in &mems {
-                all.push(serde_json::json!({"id": m.memory.id, "type": "decision", "title": m.memory.title, "created_at": m.memory.created_at}));
+        for m in repo.search_decisions(&query, &project_id, limit)? {
+            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
+                all.push((
+                    m.bm25_score,
+                    serde_json::json!({
+                        "id": m.memory.id, "type": "decision", "title": m.memory.title,
+                        "rationale": m.memory.rationale, "tradeoffs": m.memory.tradeoffs,
+                        "tags": m.memory.tags, "created_at": m.memory.created_at,
+                    }),
+                ));
             }
         }
-        if let Ok(mems) = repo.search_failures(&query, &project_id, limit) {
-            for m in &mems {
-                all.push(serde_json::json!({"id": m.memory.id, "type": "failure", "incident": m.memory.incident, "severity": m.memory.severity, "created_at": m.memory.created_at}));
+        for m in repo.search_failures(&query, &project_id, limit)? {
+            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
+                all.push((
+                    m.bm25_score,
+                    serde_json::json!({
+                        "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
+                        "severity": m.memory.severity, "fix": m.memory.fix,
+                        "root_cause": m.memory.root_cause, "prevention": m.memory.prevention,
+                        "tags": m.memory.tags, "created_at": m.memory.created_at,
+                    }),
+                ));
             }
         }
-        if let Ok(mems) = repo.search_procedural(&query, &project_id, limit) {
-            for m in &mems {
-                all.push(serde_json::json!({"id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name, "created_at": m.memory.created_at}));
+        for m in repo.search_procedural(&query, &project_id, limit)? {
+            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
+                all.push((
+                    m.bm25_score,
+                    serde_json::json!({
+                        "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
+                        "steps": m.memory.steps, "tags": m.memory.tags,
+                        "created_at": m.memory.created_at,
+                    }),
+                ));
             }
         }
-        all.truncate(limit);
         all
     };
+
+    // Merge-sort by BM25 score across types, then truncate — replaces the old
+    // fixed-order concat + truncate that always favored episodic.
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let results: Vec<serde_json::Value> = scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect();
 
     // Best-effort retrieval feedback (mirrors MCP search_memory): log this
     // query + its hits so `engram queries` / MCP `query_stats` can surface
@@ -456,39 +547,43 @@ pub fn create_procedural(args: &[String]) -> Result<()> {
 pub fn ingest(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let repo_path = require_str(args, "repo")?;
-    let count = optional_num(args, "count").unwrap_or(20.0) as usize;
+    let count = (optional_num(args, "count").unwrap_or(20.0) as usize).clamp(1, 1000);
     let session_id = optional_str(args, "session").unwrap_or_else(|| "auto-ingest".into());
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
     let git = GitIntegration::new(Path::new(&repo_path))?;
-    let memories = git.process_recent_commits(&project_id, &session_id, count)?;
+    let events = git.get_recent_commits(count)?;
 
-    // Deduplicate: skip commits already ingested
+    // Dedup BEFORE generating (skip tree-diff work for known commits)…
     let ingested_hashes = repo.get_ingested_commits(&project_id)?;
-    let new_memories: Vec<_> = memories
+    let fresh: Vec<crate::git_integration::CommitEvent> = events
         .into_iter()
-        .filter(|m| {
-            m.related_commits
-                .iter()
-                .all(|c| !ingested_hashes.contains(c))
-        })
+        .filter(|e| !ingested_hashes.contains(&e.commit_hash))
         .collect();
+    let skipped = count.saturating_sub(fresh.len());
+
+    // …then distill into one memory per (type, scope) milestone — same
+    // clustering the bootstrap collector uses, instead of one noisy memory
+    // per commit.
+    let memories = crate::git_integration::milestone_memories(&project_id, &session_id, &fresh);
 
     let mut ingested = Vec::new();
-    for mem in &new_memories {
+    for mem in &memories {
         repo.create_episodic(mem)?;
         ingested.push(serde_json::json!({
             "id": mem.id,
             "summary": mem.summary,
+            "commits": mem.related_commits.len(),
             "files": mem.files_touched,
         }));
     }
 
     print_json(&serde_json::json!({
         "ingested": ingested.len(),
-        "total_commits": new_memories.len(),
+        "total_commits_scanned": count,
+        "skipped_duplicates": skipped,
         "memories": ingested,
     }));
     Ok(())
@@ -498,7 +593,7 @@ pub fn collect(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let repo_path = require_str(args, "repo")?;
     let dimensions = optional_str(args, "dimensions");
-    let max_commits = optional_num(args, "max-commits").unwrap_or(200.0) as usize;
+    let max_commits = (optional_num(args, "max-commits").unwrap_or(200.0) as usize).min(1000);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
@@ -603,7 +698,7 @@ pub fn timeline(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    let since = now_ts() - (days * 86400);
+    let since = now_ts() - days.saturating_mul(86400);
     let conn = repo.connection()?;
 
     let mut stmt = conn.prepare(
@@ -636,7 +731,7 @@ pub fn queries(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    let since = now_ts() - (days * 86400);
+    let since = now_ts() - days.saturating_mul(86400);
     let stats = repo.query_stats(&project_id, since, limit)?;
 
     print_json(&serde_json::json!({
@@ -685,7 +780,13 @@ pub fn update(args: &[String]) -> Result<()> {
             if let Some(kv) = args.get(i + 1) {
                 match kv.split_once('=') {
                     Some((k, v)) => {
-                        patch.insert(k.to_string(), serde_json::json!(v));
+                        // Parse the value as JSON when possible (numbers, bools,
+                        // arrays); fall back to a plain string. Always-string
+                        // values made `--set importance=0.9` fail type
+                        // checking against the typed model.
+                        let parsed = serde_json::from_str::<serde_json::Value>(v)
+                            .unwrap_or_else(|_| serde_json::json!(v));
+                        patch.insert(k.to_string(), parsed);
                     }
                     None => {
                         anyhow::bail!("--set expects key=value, got '{kv}' (missing '=')");
@@ -720,6 +821,9 @@ pub fn update(args: &[String]) -> Result<()> {
                 }
                 if obj.contains_key(k) {
                     obj.insert(k.clone(), v.clone());
+                } else {
+                    // A typo'd key used to vanish silently; say so.
+                    eprintln!("warning: unknown field '{k}' ignored (no such field on this memory type)");
                 }
             }
             obj.insert("updated_at".into(), serde_json::json!(now));
@@ -981,6 +1085,381 @@ pub fn reject_suggestion(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `engram get --project <id> --type <t> --id <id>` — fetch one memory's full
+/// record (CLI counterpart of the MCP get_memory tool).
+pub fn get(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let memory_type = require_str(args, "type")?;
+    let id = require_str(args, "id")?;
+    let kind = crate::storage::MemoryKind::from_type_str(&memory_type)?;
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+
+    macro_rules! fetch {
+        ($get:ident) => {{
+            let mem = repo
+                .$get(&id)?
+                .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
+            if mem.project_id != project_id {
+                anyhow::bail!("memory does not belong to project {project_id}");
+            }
+            serde_json::to_value(&mem)?
+        }};
+    }
+    use crate::storage::MemoryKind::*;
+    let memory = match kind {
+        Episodic => fetch!(get_episodic),
+        Decision => fetch!(get_decision),
+        Failure => fetch!(get_failure),
+        Procedural => fetch!(get_procedural),
+    };
+    print_json(&serde_json::json!({
+        "memory_type": kind.as_str(),
+        "memory": memory,
+    }));
+    Ok(())
+}
+
+/// `engram maintain [--project <id>] [--repo <path>] [--apply]` — one-shot
+/// memory health pass. Designed to run from a hook/cron so the store doesn't
+/// rot silently. Steps:
+///
+/// 1. consolidate: archive exact duplicates (soft-delete, reversible)
+/// 2. rebuild FTS: repair orphan/missing/mis-preprocessed index rows (always)
+/// 3. prune query_log past `[storage].query_log_retention_days` (apply only)
+/// 4. staleness report: memories whose referenced files no longer exist
+///    (read-only; requires `--repo`)
+/// 5. gc preview: how many archived rows a later `engram gc --apply` would purge
+///    (never auto-applied — physical deletion stays an explicit decision)
+pub fn maintain(args: &[String]) -> Result<()> {
+    let apply = args.iter().any(|a| a == "--apply");
+    let project = optional_str(args, "project");
+    let repo_path = optional_str(args, "repo");
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let now = now_ts();
+    let kinds = crate::storage::MemoryKind::all().to_vec();
+
+    let projects = match &project {
+        Some(p) => vec![p.clone()],
+        None => repo.list_projects()?,
+    };
+
+    // 1. Consolidate exact duplicates per project.
+    let engine = crate::consolidation::ConsolidationEngine::new();
+    let mut dup_groups = 0usize;
+    let mut dup_duplicates = 0usize;
+    for p in &projects {
+        let plans = engine.consolidate(&repo, p, &kinds, false, 0.0, apply, now)?;
+        for plan in plans {
+            dup_groups += plan.groups.len();
+            dup_duplicates += plan
+                .groups
+                .iter()
+                .map(|g| g.duplicate_ids.len())
+                .sum::<usize>();
+        }
+    }
+
+    // 2. FTS repair (idempotent — aligns the index with the main tables).
+    let fts_rows = repo.rebuild_fts()?;
+
+    // 3. query_log retention prune.
+    let retention_secs =
+        (config.storage.query_log_retention_days.saturating_mul(86_400)) as i64;
+    let pruned = if apply {
+        repo.prune_query_log(retention_secs, now)?
+    } else {
+        0
+    };
+
+    // 4. Staleness report (read-only).
+    let stale = match &repo_path {
+        Some(rp) => report_stale_memories(&repo, &projects, Path::new(rp))?,
+        None => serde_json::json!({ "skipped": "pass --repo <path> to check file staleness" }),
+    };
+
+    // 5. GC preview (dry-run only; physical delete stays explicit).
+    let gc_report = repo.gc_archived(0, false, now)?;
+
+    print_json(&serde_json::json!({
+        "applied": apply,
+        "projects": projects,
+        "consolidate": {
+            "duplicate_groups": dup_groups,
+            "duplicates": dup_duplicates,
+            "action": if apply { "archived (restore with `engram restore`)" } else { "dry-run — pass --apply to archive" },
+        },
+        "fts_rebuilt_rows": fts_rows,
+        "query_log_pruned": pruned,
+        "stale": stale,
+        "gc_preview": {
+            "archived_eligible_for_gc": gc_report.deleted.len(),
+            "note": "run `engram gc --older-than <dur> --apply` to physically purge",
+        },
+    }));
+    Ok(())
+}
+
+/// Read-only staleness pass: flag active memories whose referenced files have
+/// all disappeared from the working tree (deleted/renamed modules etc.).
+/// Conservative — a memory with ANY surviving file is not reported.
+fn report_stale_memories(
+    repo: &MemoryRepository,
+    projects: &[String],
+    root: &Path,
+) -> Result<serde_json::Value> {
+    const MAX_REPORTED: usize = 100;
+
+    let file_exists = |f: &str| {
+        let p = Path::new(f);
+        (p.is_absolute() && p.exists()) || root.join(p).exists()
+    };
+
+    let mut out = serde_json::Map::new();
+    for p in projects {
+        let mut stale = Vec::new();
+        let mut total_checked = 0usize;
+
+        let mut check = |memory_type: &str,
+                         id: &str,
+                         label: &str,
+                         files: &[String],
+                         stale: &mut Vec<serde_json::Value>| {
+            if files.is_empty() {
+                return; // no file references → nothing to check
+            }
+            total_checked += 1;
+            let missing: Vec<&String> = files.iter().filter(|f| !file_exists(f)).collect();
+            if missing.len() == files.len() {
+                stale.push(serde_json::json!({
+                    "memory_type": memory_type,
+                    "id": id,
+                    "label": label,
+                    "files": files,
+                }));
+            }
+        };
+
+        for m in repo.list_active_episodic(Some(p))? {
+            check("episodic", &m.id, &m.summary, &m.files_touched, &mut stale);
+        }
+        for m in repo.list_active_decision(Some(p))? {
+            check("decision", &m.id, &m.title, &m.related_files, &mut stale);
+        }
+
+        let total_stale = stale.len();
+        stale.truncate(MAX_REPORTED);
+        out.insert(
+            p.clone(),
+            serde_json::json!({
+                "memories_with_file_refs": total_checked,
+                "stale": stale,
+                "stale_total": total_stale,
+                "truncated": total_stale > stale.len(),
+            }),
+        );
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// `engram session-import --project <id> --transcript <path> [--session <sid>]
+/// [--dry-run]` — distill a Claude Code session transcript (JSONL) into one
+/// episodic memory. Meant to be wired to a SessionEnd/Stop hook so memories
+/// form without depending on the agent remembering to write them.
+pub fn session_import(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let transcript = require_str(args, "transcript")?;
+    let session_id =
+        optional_str(args, "session").unwrap_or_else(|| session_id_from_path(&transcript));
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    let path = Path::new(&transcript);
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let digest = parse_transcript(&text);
+
+    if digest.user_prompts.is_empty() && digest.files.is_empty() {
+        anyhow::bail!(
+            "transcript yielded no usable signal (no user prompts, no file edits); \
+             not writing an empty memory"
+        );
+    }
+
+    let now = now_ts();
+    let first_prompt = digest
+        .user_prompts
+        .first()
+        .map(|p| p.replace('\n', " "))
+        .unwrap_or_else(|| format!("session {session_id}"));
+    let summary: String = first_prompt.chars().take(160).collect();
+
+    let mut content = String::new();
+    content.push_str("User prompts:\n");
+    for p in digest.user_prompts.iter().take(10) {
+        let line: String = p.chars().take(400).collect();
+        content.push_str(&format!("- {line}\n"));
+    }
+    content.push_str("\nAssistant conclusions (latest last):\n");
+    for a in digest.assistant_texts.iter().rev().take(5).rev() {
+        let line: String = a.chars().take(600).collect();
+        content.push_str(&format!("- {line}\n"));
+    }
+    if !digest.files.is_empty() {
+        content.push_str(&format!("\nFiles touched ({}):\n", digest.files.len()));
+        content.push_str(&digest.files.iter().take(50).cloned().collect::<Vec<_>>().join(", "));
+    }
+    let content: String = content.chars().take(4000).collect();
+
+    let memory = EpisodicMemory {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id: project_id.clone(),
+        session_id: session_id.clone(),
+        summary,
+        content,
+        files_touched: digest.files.iter().take(50).cloned().collect(),
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec!["session-import".into()],
+        created_at: now,
+        updated_at: now,
+    };
+
+    if dry_run {
+        print_json(&serde_json::json!({
+            "dry_run": true,
+            "would_create": serde_json::to_value(&memory)?,
+        }));
+        return Ok(());
+    }
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    repo.create_episodic(&memory)?;
+    print_json(&serde_json::json!({
+        "id": memory.id,
+        "status": "created",
+        "session_id": session_id,
+        "files": memory.files_touched.len(),
+        "created_at": now,
+    }));
+    Ok(())
+}
+
+fn session_id_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "session".into())
+}
+
+/// What `parse_transcript` extracted from a session JSONL.
+#[derive(Debug, Default)]
+struct SessionDigest {
+    user_prompts: Vec<String>,
+    assistant_texts: Vec<String>,
+    files: Vec<String>,
+}
+
+/// Parse a Claude Code transcript (JSONL, one message object per line).
+/// Tolerant of schema drift: unknown line shapes are skipped, never fatal.
+/// Tool-result payloads are ignored (noise); only real user prompts, visible
+/// assistant text, and tool_use file targets are kept.
+fn parse_transcript(text: &str) -> SessionDigest {
+    let mut digest = SessionDigest::default();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // malformed line → skip, don't abort the whole import
+        };
+        // Claude Code marks injected/meta user messages; skip them.
+        if v.get("isMeta").and_then(|m| m.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(message) = v.get("message") else {
+            // "summary" lines carry session titles — useful as a prompt stand-in.
+            if ty == "summary" {
+                if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
+                    if !s.trim().is_empty() && digest.user_prompts.is_empty() {
+                        digest.user_prompts.push(format!("[session] {s}"));
+                    }
+                }
+            }
+            continue;
+        };
+        let content = message.get("content");
+
+        match ty {
+            "user" => match content {
+                Some(serde_json::Value::String(s)) => {
+                    let t = s.trim();
+                    // Skip command-ish/meta wrappers Claude Code injects.
+                    if !t.is_empty() && !t.starts_with('<') {
+                        push_unique(&mut digest.user_prompts, t);
+                    }
+                }
+                Some(serde_json::Value::Array(items)) => {
+                    for item in items {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                let t = t.trim();
+                                if !t.is_empty() && !t.starts_with('<') {
+                                    push_unique(&mut digest.user_prompts, t);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            "assistant" => {
+                if let Some(serde_json::Value::Array(items)) = content {
+                    for item in items {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                let t = t.trim();
+                                if !t.is_empty() {
+                                    push_unique(&mut digest.assistant_texts, t);
+                                }
+                            }
+                        }
+                        // Collect edited/read file targets from tool calls.
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            if let Some(input) = item.get("input") {
+                                for key in ["file_path", "path", "notebook_path"] {
+                                    if let Some(f) = input.get(key).and_then(|f| f.as_str()) {
+                                        let f = f.trim();
+                                        if !f.is_empty() {
+                                            push_unique(&mut digest.files, f);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    digest
+}
+
+fn push_unique(list: &mut Vec<String>, item: &str) {
+    if !list.iter().any(|s| s == item) {
+        list.push(item.to_string());
+    }
+}
+
 /// `engram reindex [--project <id>] [--force] [--dry-run]` — backfill embeddings
 /// for active memories. Requires a binary built with `--features semantic`.
 pub fn reindex(args: &[String]) -> Result<()> {
@@ -1131,6 +1610,55 @@ mod tests {
             msg.contains("--set") && msg.contains('='),
             "expected clear --set error mentioning '=', got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_transcript_extracts_prompts_text_and_files() {
+        let jsonl = r#"
+{"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: injected"}}
+{"type":"user","message":{"role":"user","content":"fix the auth middleware bug"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"Root cause was a stale token."},{"type":"tool_use","name":"Edit","input":{"file_path":"/src/auth.rs"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Fixed and verified."},{"type":"tool_use","name":"Read","input":{"path":"/src/main.rs"}}]}}
+{"type":"summary","summary":"Auth middleware fix"}
+not json at all
+"#;
+        let d = parse_transcript(jsonl);
+        assert_eq!(d.user_prompts, vec!["fix the auth middleware bug".to_string()]);
+        assert_eq!(d.assistant_texts.len(), 2);
+        assert!(d.assistant_texts.contains(&"Root cause was a stale token.".to_string()));
+        assert!(d.files.contains(&"/src/auth.rs".to_string()));
+        assert!(d.files.contains(&"/src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_transcript_skips_command_wrappers_and_malformed() {
+        let jsonl = r#"
+{broken json}
+{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
+"#;
+        let d = parse_transcript(jsonl);
+        assert!(d.user_prompts.is_empty());
+        assert!(d.files.is_empty());
+    }
+
+    #[test]
+    fn session_import_dry_run_writes_nothing_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"add rate limiting\"}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Done\"},{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{\"file_path\":\"api/rate.rs\"}}]}}\n",
+        )
+        .unwrap();
+        let args = vec![
+            "--project".to_string(),
+            "p".to_string(),
+            "--transcript".to_string(),
+            transcript.to_string_lossy().to_string(),
+            "--dry-run".to_string(),
+        ];
+        session_import(&args).unwrap(); // must not panic; writes nothing (dry-run)
     }
 
     #[test]

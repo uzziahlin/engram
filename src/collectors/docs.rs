@@ -110,8 +110,13 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<DocsCollection
         if ext == "md" || ext == "markdown" {
             if documents.len() < MAX_DOCUMENTS {
                 if let Ok(src) = FileSource::from_path(path, repo_path, opts.max_file_bytes) {
+                    // Classify on the repo-relative path (forward-slashed):
+                    // an absolute path let the checkout location leak in —
+                    // under /work/decisions/repo every md became a
+                    // "decision-record" and skewed the agent's priorities.
+                    let rel = src.path.replace('\\', "/");
                     documents.push(DocumentExcerpt {
-                        kind: doc_kind(path).to_string(),
+                        kind: doc_kind(&rel, name).to_string(),
                         path: src.path,
                         content: src.content,
                         truncated: src.truncated,
@@ -136,21 +141,25 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<DocsCollection
 }
 
 /// Classify a markdown file by its role so the agent can prioritize.
-fn doc_kind(path: &Path) -> &'static str {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let s = path.to_string_lossy();
+/// `rel` is the repo-relative, forward-slashed path; `name` its file name.
+fn doc_kind(rel: &str, name: &str) -> &'static str {
     match name {
         "README.md" | "README.markdown" => "readme",
         "CLAUDE.md" | "AGENTS.md" | "GEMINI.md" | "COPILOT.md" => "agent-guidelines",
         "DECISIONS.md" | "DECISION.md" => "decision-record",
         "CONTRIBUTING.md" => "contributing",
         "ARCHITECTURE.md" => "architecture",
-        _ if s.contains("/ADR/") || s.contains("/adr/") || s.contains("/decisions/") => {
-            "decision-record"
-        }
-        _ if s.contains("/docs/") => "docs",
+        _ if in_subdir(rel, &["ADR", "adr", "decisions"]) => "decision-record",
+        _ if in_subdir(rel, &["docs"]) => "docs",
         _ => "markdown",
     }
+}
+
+/// Whether `rel` lies inside any of the given top-level-or-nested directories.
+fn in_subdir(rel: &str, dirs: &[&str]) -> bool {
+    dirs.iter().any(|d| {
+        rel.contains(&format!("/{d}/")) || rel.starts_with(&format!("{d}/"))
+    })
 }
 
 /// Scan a source file for decision-flavored comments and module docs.

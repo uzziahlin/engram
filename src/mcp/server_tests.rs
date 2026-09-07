@@ -71,7 +71,9 @@ fn semantic_recall_finds_lexically_disjoint_match() {
             project_id: PROJECT.into(),
             query: query.into(),
             memory_type: None,
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert!(
@@ -86,7 +88,9 @@ fn semantic_recall_finds_lexically_disjoint_match() {
             project_id: PROJECT.into(),
             query: query.into(),
             memory_type: None,
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert!(
@@ -138,7 +142,9 @@ fn reindex_backfills_then_recalls() {
                 project_id: P.into(),
                 query: query.into(),
                 memory_type: None,
-                limit: 10,
+                limit: Some(10),
+                before: None,
+                tags: vec![],
             })
             .unwrap();
         v["results"]
@@ -179,10 +185,11 @@ fn reindex_backfills_then_recalls() {
 #[test]
 fn test_list_tools() {
     let tools = McpServer::list_tools();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"search_memory"));
+    assert!(names.contains(&"get_memory"));
     assert!(names.contains(&"related_files"));
     assert!(names.contains(&"timeline"));
     assert!(names.contains(&"recent_failures"));
@@ -228,6 +235,21 @@ fn test_handle_initialize() {
     assert!(response.error.is_none());
     let result = response.result.unwrap();
     assert_eq!(result["serverInfo"]["name"], "engram");
+    // serverInfo.version must track Cargo.toml (was hardcoded 0.1.0).
+    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn test_handle_ping_returns_empty_result() {
+    let server = McpServer::new();
+    let response = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(9)),
+        method: "ping".into(),
+        params: None,
+    });
+    assert!(response.error.is_none(), "ping must not error");
+    assert!(response.result.is_some(), "ping must answer with a result");
 }
 
 #[test]
@@ -243,7 +265,7 @@ fn test_handle_tools_list() {
     assert!(response.result.is_some());
     let result = response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
 }
 
 #[test]
@@ -277,7 +299,9 @@ fn test_create_episodic_with_provider() {
             project_id: "test-project".into(),
             query: "OAuth refresh".into(),
             memory_type: None,
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
 
@@ -351,7 +375,9 @@ fn search_output_includes_importance() {
             project_id: "p".into(),
             query: "OAuth refresh".into(),
             memory_type: Some("episodic".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
 
@@ -401,7 +427,9 @@ fn test_create_decision_with_provider() {
             project_id: "test-project".into(),
             query: "Redis".into(),
             memory_type: Some("decision".into()),
-            limit: 5,
+            limit: Some(5),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(search["results"].as_array().unwrap().len(), 1);
@@ -523,7 +551,9 @@ fn test_reflection_reflect_list_confirm_closed_loop() {
             project_id: project.into(),
             query: "auth".into(),
             memory_type: Some("procedural".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(search_before["results"].as_array().unwrap().len(), 0);
@@ -542,7 +572,9 @@ fn test_reflection_reflect_list_confirm_closed_loop() {
             project_id: project.into(),
             query: "auth".into(),
             memory_type: Some("procedural".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(search_after["results"].as_array().unwrap().len(), 1);
@@ -610,7 +642,9 @@ fn test_reflection_reject_drops_pending() {
             project_id: project.into(),
             query: "auth".into(),
             memory_type: Some("procedural".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(search["results"].as_array().unwrap().len(), 0);
@@ -1126,7 +1160,9 @@ fn test_update_memory_patches_fields_and_guards_project() {
             project_id: "p".into(),
             query: "new".into(),
             memory_type: Some("episodic".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(hit_new["results"].as_array().unwrap().len(), 1);
@@ -1175,7 +1211,9 @@ fn test_forget_and_restore_memory_tools() {
             project_id: "p".into(),
             query: "forget".into(),
             memory_type: Some("episodic".into()),
-            limit: 10,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(s["results"].as_array().unwrap().len(), 0);
@@ -1226,7 +1264,7 @@ fn test_forget_batch_dry_run_then_apply_and_list() {
             .list_archived(ListArchivedInput {
                 project_id: "p".into(),
                 memory_type: Some("episodic".into()),
-                limit: 10
+                limit: Some(10)
             })
             .unwrap()["archived"]
             .as_array()
@@ -1250,7 +1288,7 @@ fn test_forget_batch_dry_run_then_apply_and_list() {
         .list_archived(ListArchivedInput {
             project_id: "p".into(),
             memory_type: Some("episodic".into()),
-            limit: 10,
+            limit: Some(10),
         })
         .unwrap();
     assert_eq!(listed["archived"].as_array().unwrap().len(), 2);
@@ -1296,7 +1334,9 @@ fn test_consolidate_memories_tool_dry_run() {
                 project_id: "p".into(),
                 query: "dup".into(),
                 memory_type: Some("episodic".into()),
-                limit: 10
+                limit: Some(10),
+                before: None,
+                tags: vec![],
             })
             .unwrap()["results"]
             .as_array()
@@ -1364,4 +1404,110 @@ fn concurrent_handle_request_is_safe() {
     for h in handles {
         h.join().expect("worker thread panicked");
     }
+}
+
+#[test]
+fn get_memory_returns_full_failure_record() {
+    let repo = MemoryRepository::new_in_memory().unwrap();
+    repo.initialize_schema().unwrap();
+    let config = Config::default();
+    let provider = DefaultMemoryProvider::new(repo, config);
+
+    let created = provider
+        .create_failure(CreateFailureInput {
+            project_id: "p".into(),
+            incident: "auth outage".into(),
+            root_cause: "stale token cache".into(),
+            fix: "invalidate on refresh".into(),
+            prevention: "cache TTL < token TTL".into(),
+            severity: 4,
+            tags: vec!["auth".into()],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let fetched = provider
+        .get_memory(GetMemoryInput {
+            project_id: "p".into(),
+            memory_type: "failure".into(),
+            id: id.clone(),
+        })
+        .unwrap();
+    assert_eq!(fetched["memory_type"], "failure");
+    assert_eq!(fetched["memory"]["root_cause"], "stale token cache");
+    assert_eq!(fetched["memory"]["prevention"], "cache TTL < token TTL");
+
+    // Wrong project must be rejected.
+    assert!(provider
+        .get_memory(GetMemoryInput {
+            project_id: "other".into(),
+            memory_type: "failure".into(),
+            id,
+        })
+        .is_err());
+}
+
+#[test]
+fn search_memory_carries_full_detail_and_supports_tag_filter() {
+    let repo = MemoryRepository::new_in_memory().unwrap();
+    repo.initialize_schema().unwrap();
+    let config = Config::default();
+    let provider = DefaultMemoryProvider::new(repo, config);
+
+    provider
+        .create_failure(CreateFailureInput {
+            project_id: "p".into(),
+            incident: "crash on startup".into(),
+            root_cause: "null config".into(),
+            fix: "guard clause".into(),
+            prevention: "tests for config paths".into(),
+            severity: 3,
+            tags: vec!["bootstrap".into()],
+        })
+        .unwrap();
+    provider
+        .create_failure(CreateFailureInput {
+            project_id: "p".into(),
+            incident: "crash on shutdown".into(),
+            root_cause: "double free".into(),
+            fix: "drop order".into(),
+            prevention: "miri".into(),
+            severity: 2,
+            tags: vec!["lifecycle".into()],
+        })
+        .unwrap();
+
+    // No filter: full payload on every hit.
+    let res = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "crash".into(),
+            memory_type: None,
+            limit: Some(10),
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    assert_eq!(res["results"].as_array().unwrap().len(), 2);
+    for r in res["results"].as_array().unwrap() {
+        assert!(
+            r.get("root_cause").is_some() && r.get("fix").is_some(),
+            "search results must carry full structured fields: {r}"
+        );
+    }
+
+    // Tag filter narrows to the tagged memory only.
+    let res = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "crash".into(),
+            memory_type: None,
+            limit: Some(10),
+            tags: vec!["bootstrap".into()],
+            before: None,
+        })
+        .unwrap();
+    let arr = res["results"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["summary"], "crash on startup");
 }

@@ -220,7 +220,8 @@ All tools require a `project_id` parameter for multi-project isolation.
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `search_memory` | Full-text search across all memory types | `query`, `limit`, `memory_type` |
+| `search_memory` | Full-text search across all memory types — results carry each memory's full payload (root_cause/fix, rationale/tradeoffs, steps…) | `query`, `limit`, `memory_type`, `tags`, `before` |
+| `get_memory` | Fetch one memory's complete record by id | `memory_type`, `id` |
 | `related_files` | Find entities related to a file via relationship graph | `file`, `project_id` |
 | `timeline` | Get a timeline of memory events for the past N days | `days`, `project_id` |
 | `recent_failures` | List recent failure/incident memories | `limit`, `project_id` |
@@ -235,7 +236,7 @@ All tools require a `project_id` parameter for multi-project isolation.
 | `create_decision` | Record an architectural or design decision | `title`, `context`, `rationale`, `tradeoffs`, `related_files` |
 | `create_failure` | Record an incident with root cause analysis | `incident`, `root_cause`, `fix`, `prevention`, `severity` |
 | `create_procedural` | Record a workflow or convention | `workflow_name`, `steps`, `related_tools` |
-| `ingest_commits` | Auto-generate episodic memories from git history | `repo_path`, `count`, `project_id` |
+| `ingest_commits` | Distill git history into one episodic memory per (type, scope) milestone | `repo_path`, `count`, `project_id` |
 | `collect_sources` | Gather structured evidence from a project for bootstrap (no writes) | `repo_path`, `dimensions`, `max_commits`, `project_id` |
 
 ### Lifecycle Tools
@@ -266,12 +267,12 @@ Engram works with zero configuration. Optionally create `~/.engram/config.toml`:
 ```toml
 [storage]
 database_path = "~/.engram/memory.db"  # SQLite database location
-wal_mode = true                          # Write-Ahead Logging for performance
+query_log_retention_days = 90            # `engram maintain` prunes older query_log rows
 
 [retrieval]
-default_limit = 10                       # Default search result count
+default_limit = 10                       # Default result count when a tool omits `limit`
 recency_half_life_days = 30              # Recency decay half-life (days) for reranking
-intent_routing = true                    # Route search to only the memory types implied by intent (General searches all four); off = always query every type
+intent_routing = true                    # Intent keywords adjust ranking weights (soft); every memory type is always searched
 weight_relevance = 0.4                   # BM25 score weight in the final ranking
 weight_recency = 0.2                     # Base recency-decay weight (intents may raise it via max)
 weight_importance = 0.4                  # Base per-record importance weight (intents may raise it via max)
@@ -279,9 +280,6 @@ weight_type = 0.4                        # Base memory-type prior weight (intent
 [context]
 context_window_tokens = 200000           # LLM context window size
 memory_budget_percent = 15               # % of context for memories
-
-[graph]
-max_nodes = 10000                        # Max graph nodes per project
 
 [mcp]
 worker_threads = 1                       # Concurrent request handlers (default 1 = FIFO sequential; raise only if your client pipelines independent requests)
@@ -307,7 +305,7 @@ Data is stored in `~/.engram/memory.db` by default.
 └──────────────────────────┬──────────────────────────────────┘
                            │ JSON-RPC
 ┌──────────────────────────▼──────────────────────────────────┐
-│                      MCP Server (22 tools)                   │
+│                      MCP Server (23 tools)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   MemoryToolProvider trait                    │
 ├─────────────┬─────────────────┬─────────────────────────────┤
@@ -349,8 +347,17 @@ engram create-decision --project myproj --title "Use SQLite" --context "local-fi
 engram create-failure --project myproj --incident "FTS5 crash" --root-cause "..." --fix "..." --prevention "..." --severity 4
 engram create-procedural --project myproj --name "deploy" --steps "test,build,push"
 
-# Ingest git history
+# Ingest git history (one memory per type/scope milestone)
 engram ingest --project myproj --repo .
+
+# Fetch one memory's full record by id
+engram get --project myproj --type failure --id <id>
+
+# Distill a Claude Code session transcript into a memory (wire to a Stop/SessionEnd hook)
+engram session-import --project myproj --transcript ~/.claude/projects/.../session.jsonl --dry-run
+
+# One-shot health pass: dedup + FTS repair + query-log prune + staleness report
+engram maintain --apply
 
 # View history
 engram timeline --project myproj --days 7

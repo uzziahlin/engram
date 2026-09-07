@@ -29,7 +29,9 @@ impl GitIntegration {
     /// Unlike libgit2's `Sort::TIME`, gix's rev-walk is not chronological, so we
     /// collect every reachable commit, sort by commit time descending, then
     /// truncate. `ingest` is an explicit, non-hot-path command, so walking the
-    /// full history is acceptable.
+    /// full history is acceptable. The loaded commit handles are KEPT after the
+    /// time pass and reused for the newest N — a separate second `find_commit`
+    /// pass (as this function once did) re-decoded the same objects.
     pub fn get_recent_commits(&self, count: usize) -> Result<Vec<CommitEvent>> {
         let head_id = self.repo.head_id().context("failed to resolve HEAD")?;
 
@@ -40,24 +42,20 @@ impl GitIntegration {
             ids.push(step?.id);
         }
 
-        // Phase 2: resolve each id's commit time and sort newest-first.
-        let mut entries: Vec<(gix::ObjectId, i64)> = Vec::with_capacity(ids.len());
+        // Phase 2: load each commit once (needed for its time anyway), sort
+        // newest-first, and reuse the handles for Phase 3.
+        let mut commits: Vec<gix::Commit<'_>> = Vec::with_capacity(ids.len());
         for id in ids {
-            let time_secs = self
-                .repo
-                .find_commit(id)
-                .ok()
-                .and_then(|c| c.time().ok())
-                .map(|t| t.seconds)
-                .unwrap_or(0);
-            entries.push((id, time_secs));
+            if let Ok(c) = self.repo.find_commit(id) {
+                commits.push(c);
+            }
         }
-        entries.sort_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+        commits.sort_by_key(|c| std::cmp::Reverse(c.time().map(|t| t.seconds).unwrap_or(0)));
 
         // Phase 3: build the event list for the newest `count` commits.
-        let mut commits = Vec::with_capacity(entries.len().min(count));
-        for (id, ts) in entries.into_iter().take(count) {
-            let commit = self.repo.find_commit(id)?;
+        let mut events = Vec::with_capacity(commits.len().min(count));
+        for commit in commits.into_iter().take(count) {
+            let ts = commit.time().ok().map(|t| t.seconds).unwrap_or(0);
 
             // gix's message_raw() keeps the trailing newline that git appends;
             // libgit2's Commit::message() trims it. Trim to match that behavior
@@ -70,15 +68,15 @@ impl GitIntegration {
 
             let files_changed = self.commit_files_changed(&commit)?;
 
-            commits.push(CommitEvent {
-                commit_hash: id.to_string(),
+            events.push(CommitEvent {
+                commit_hash: commit.id().to_string(),
                 message,
                 files_changed,
                 timestamp: ts,
             });
         }
 
-        Ok(commits)
+        Ok(events)
     }
 
     /// Files touched by a commit relative to its first parent (or the empty
@@ -173,6 +171,108 @@ impl GitIntegration {
     }
 }
 
+/// Distill (already deduped) commit events into ONE episodic memory per
+/// Conventional-Commit (type, scope) milestone — the clustering
+/// `collectors::git_collector` uses for bootstrap. Replaces the old per-commit
+/// ingest output, which produced N low-value memories (one per commit) that
+/// git_collector's own module docs call out as noise. Deterministic, no LLM:
+/// the milestone theme becomes the summary, commit subjects the content.
+pub fn milestone_memories(
+    project_id: &str,
+    session_id: &str,
+    events: &[CommitEvent],
+) -> Vec<EpisodicMemory> {
+    // cap = usize::MAX so `commits` carries every hash — related_commits is
+    // the dedup key for re-ingest, so dropping hashes would break idempotency.
+    let event_refs: Vec<&CommitEvent> = events.iter().collect();
+    let milestones =
+        crate::collectors::git_collector::cluster_by_theme(&event_refs, usize::MAX);
+    let now = chrono::Utc::now().timestamp();
+
+    const MAX_FILES: usize = 50;
+    const MAX_SUBJECTS: usize = 30;
+    const MAX_SUMMARY: usize = 200;
+
+    milestones
+        .into_iter()
+        .map(|m| {
+            let hashes: Vec<String> = m.commits.iter().map(|c| c.hash.clone()).collect();
+
+            let mut files: Vec<String> = Vec::new();
+            for c in &m.commits {
+                for f in &c.files {
+                    if !files.contains(f) && files.len() < MAX_FILES {
+                        files.push(f.clone());
+                    }
+                }
+            }
+
+            let subjects: Vec<&str> = m
+                .commits
+                .iter()
+                .map(|c| c.message.lines().next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty())
+                .take(MAX_SUBJECTS)
+                .collect();
+
+            let first_subject = subjects.first().copied().unwrap_or("");
+            let mut summary = format!("{}: {} commits — {}", m.theme, m.commit_count, first_subject);
+            if summary.chars().count() > MAX_SUMMARY {
+                summary = summary.chars().take(MAX_SUMMARY).collect();
+            }
+
+            let content = format!(
+                "Milestone {} ({} commit(s), first {} last {}){}\n\nFiles: {}",
+                m.theme,
+                m.commit_count,
+                m.first_ts,
+                m.last_ts,
+                if m.has_breaking { " [BREAKING]" } else { "" },
+                files.join(", "),
+            ) + &subjects
+                .iter()
+                .map(|s| format!("\n- {s}"))
+                .collect::<String>();
+
+            let mut tags = vec![m.commit_type.clone()];
+            if let Some(scope) = &m.scope {
+                if !scope.is_empty() {
+                    tags.push(scope.clone());
+                }
+            }
+            tags.push("source:ingest".into());
+
+            EpisodicMemory {
+                id: uuid::Uuid::new_v4().to_string(),
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                summary,
+                content,
+                files_touched: files,
+                related_commits: hashes,
+                importance: milestone_importance(&m.commit_type, m.has_breaking),
+                tags,
+                created_at: now,
+                updated_at: now,
+            }
+        })
+        .collect()
+}
+
+/// Importance by milestone type — mirrors the old per-commit keyword scale,
+/// decided once per theme instead of per commit message substring.
+fn milestone_importance(commit_type: &str, has_breaking: bool) -> f32 {
+    if has_breaking {
+        return 0.9;
+    }
+    match commit_type {
+        "feat" | "fix" => 0.7,
+        "perf" | "refactor" => 0.6,
+        "docs" => 0.3,
+        _ => 0.4,
+    }
+}
+
 /// Push a non-empty repo-relative path into `files`, de-duplicating.
 /// `location` is a `gix::bstr::BString` (owned bytes).
 fn push_path(files: &mut Vec<String>, location: &gix::bstr::BString) {
@@ -188,23 +288,24 @@ fn push_path(files: &mut Vec<String>, location: &gix::bstr::BString) {
 /// Estimate importance of a commit based on message keywords.
 /// Uses max-score strategy instead of sequential override to avoid
 /// "fix: update docs" being classified as docs (0.2) instead of fix (0.7).
+/// Keywords match on word boundaries so "fixture" ≠ "fix", "perfect" ≠ "perf".
 fn estimate_importance(message: &str) -> f32 {
     let lower = message.to_lowercase();
     let mut max_score: f32 = 0.3;
 
-    if lower.contains("fix") || lower.contains("bug") || lower.contains("patch") {
+    if has_word(&lower, "fix") || has_word(&lower, "bug") || has_word(&lower, "patch") {
         max_score = max_score.max(0.7);
     }
-    if lower.contains("refactor") || lower.contains("rewrite") {
+    if has_word(&lower, "refactor") || has_word(&lower, "rewrite") {
         max_score = max_score.max(0.6);
     }
-    if lower.contains("breaking") || lower.contains("migration") {
+    if lower.contains("breaking") || has_word(&lower, "migration") {
         max_score = max_score.max(0.9);
     }
-    if lower.contains("docs") || lower.contains("comment") {
+    if has_word(&lower, "docs") || has_word(&lower, "comment") {
         max_score = max_score.max(0.2);
     }
-    if lower.contains("test") {
+    if has_word(&lower, "test") {
         max_score = max_score.max(0.4);
     }
 
@@ -212,36 +313,48 @@ fn estimate_importance(message: &str) -> f32 {
 }
 
 /// Extract tags from a commit message based on common prefixes.
+/// Word-boundary matching: "docker" must not produce a docs tag via "doc".
 fn extract_tags(message: &str) -> Vec<String> {
-    let mut tags = Vec::new();
     let lower = message.to_lowercase();
+    let mut tags = Vec::new();
 
-    if lower.contains("fix") || lower.contains("bug") {
+    if has_word(&lower, "fix") || has_word(&lower, "bug") {
         tags.push("bugfix".into());
     }
-    if lower.contains("feat") || lower.contains("feature") {
+    if has_word(&lower, "feat") || has_word(&lower, "feature") {
         tags.push("feature".into());
     }
-    if lower.contains("refactor") {
+    if has_word(&lower, "refactor") {
         tags.push("refactor".into());
     }
-    if lower.contains("perf") || lower.contains("performance") {
+    if has_word(&lower, "perf") || has_word(&lower, "performance") {
         tags.push("performance".into());
     }
-    if lower.contains("security") || lower.contains("cve") {
+    if has_word(&lower, "security") || has_word(&lower, "cve") {
         tags.push("security".into());
     }
-    if lower.contains("doc") {
+    if has_word(&lower, "doc") || has_word(&lower, "docs") {
         tags.push("docs".into());
     }
-    if lower.contains("test") {
+    if has_word(&lower, "test") {
         tags.push("test".into());
     }
-    if lower.contains("deploy") || lower.contains("release") {
+    if has_word(&lower, "deploy") || has_word(&lower, "release") {
         tags.push("deployment".into());
     }
 
     tags
+}
+
+/// Case-folded whole-word containment on a lowercased haystack.
+fn has_word(haystack_lower: &str, word: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    haystack_lower.match_indices(word).any(|(i, _)| {
+        let end = i + word.len();
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphabetic();
+        before_ok && after_ok
+    })
 }
 
 #[cfg(test)]

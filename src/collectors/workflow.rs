@@ -67,7 +67,12 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<WorkflowCollec
             continue;
         }
 
-        let Some(cat) = classify(&path, &name) else {
+        // Classify on the REPO-RELATIVE path (forward-slashed for portability):
+        // matching on the absolute path let the repo's location leak in — a
+        // checkout under /home/u/scripts/ classified every source file as a
+        // script and flooded the bucket cap.
+        let rel = super::relpath(&path, repo_path).replace('\\', "/");
+        let Some(cat) = classify(&rel, &name) else {
             continue;
         };
 
@@ -92,11 +97,10 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<WorkflowCollec
     })
 }
 
-fn classify(path: &Path, name_lower: &str) -> Option<Category> {
-    let s = path.to_string_lossy().to_lowercase();
-
+/// `rel` is the repo-relative, forward-slashed path.
+fn classify(rel: &str, name_lower: &str) -> Option<Category> {
     // CI pipelines.
-    if s.contains(".github/workflows/") && has_ext(path, &["yml", "yaml"]) {
+    if rel.contains(".github/workflows/") && name_has_ci_ext(rel) {
         return Some(Category::Ci);
     }
     if matches!(
@@ -109,7 +113,7 @@ fn classify(path: &Path, name_lower: &str) -> Option<Category> {
     ) {
         return Some(Category::Ci);
     }
-    if s.contains("/.circleci/") || s.contains("/.buildkite/") {
+    if rel.contains("/.circleci/") || rel.contains("/.buildkite/") {
         return Some(Category::Ci);
     }
 
@@ -126,8 +130,8 @@ fn classify(path: &Path, name_lower: &str) -> Option<Category> {
     ) {
         return Some(Category::Script);
     }
-    if (s.contains("/scripts/") || s.starts_with("scripts/"))
-        && has_ext(path, &["sh", "bash", "zsh", "ps1", "py", "rb", "js", "ts"])
+    if (rel.contains("/scripts/") || rel.starts_with("scripts/"))
+        && name_has_script_ext(rel)
     {
         return Some(Category::Script);
     }
@@ -165,22 +169,21 @@ fn classify(path: &Path, name_lower: &str) -> Option<Category> {
             | ".flake8"
             | "pylintrc"
             | ".pylintrc"
-            | "go.sum"
     ) {
-        // go.sum excluded below; keep the lint ones.
-        if name_lower != "go.sum" {
-            return Some(Category::Convention);
-        }
+        return Some(Category::Convention);
     }
 
     None
 }
 
-fn has_ext(path: &Path, exts: &[&str]) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| exts.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+fn name_has_ci_ext(rel: &str) -> bool {
+    rel.ends_with(".yml") || rel.ends_with(".yaml")
+}
+
+fn name_has_script_ext(rel: &str) -> bool {
+    ["sh", "bash", "zsh", "ps1", "py", "rb", "js", "ts"]
+        .iter()
+        .any(|e| rel.ends_with(&format!(".{e}")))
 }
 
 fn parse_package_scripts(path: &Path, root: &Path) -> Vec<PackageScript> {

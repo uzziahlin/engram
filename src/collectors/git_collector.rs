@@ -78,10 +78,17 @@ impl From<&CommitEvent> for CommitRef {
 pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<GitCollection> {
     let git = GitIntegration::new(repo_path)?;
     let events = git.get_recent_commits(opts.max_commits)?;
+    Ok(collect_from_events(&events, opts))
+}
 
+/// Collect git evidence from pre-walked commit events. The orchestrating
+/// `collect()` walks the history ONCE and shares the events between the git
+/// and failures dimensions — two independent walks doubled the full-history
+/// traversal cost.
+pub fn collect_from_events(events: &[CommitEvent], opts: &CollectOptions) -> GitCollection {
     let mut skipped = 0usize;
-    let fresh: Vec<CommitEvent> = events
-        .into_iter()
+    let fresh: Vec<&CommitEvent> = events
+        .iter()
         .filter(|e| {
             if opts.ingested_commit_hashes.contains(&e.commit_hash) {
                 skipped += 1;
@@ -95,24 +102,25 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<GitCollection>
     let migrations: Vec<CommitRef> = fresh
         .iter()
         .filter(|e| looks_like_migration(&e.message))
-        .map(CommitRef::from)
+        .map(|e| CommitRef::from(*e))
         .collect();
 
     let milestones = cluster_by_theme(&fresh, opts.max_commits_per_milestone);
 
-    let recent_commits: Vec<CommitRef> = fresh.iter().map(CommitRef::from).collect();
+    let recent_commits: Vec<CommitRef> = fresh.iter().map(|e| CommitRef::from(*e)).collect();
 
-    Ok(GitCollection {
+    GitCollection {
         milestones,
         migrations,
         recent_commits,
         skipped_ingested: skipped,
-    })
+    }
 }
 
 /// Group commits by Conventional-Commit `(type, scope)`. Commits that don't
 /// follow the convention land in an `"other"` bucket so nothing is lost.
-fn cluster_by_theme(commits: &[CommitEvent], cap: usize) -> Vec<GitMilestone> {
+/// `pub(crate)`: `ingest_commits` reuses this to build one memory per theme.
+pub(crate) fn cluster_by_theme(commits: &[&CommitEvent], cap: usize) -> Vec<GitMilestone> {
     let mut groups: BTreeMap<(String, Option<String>), Vec<&CommitEvent>> = BTreeMap::new();
     for c in commits {
         let (typ, scope) = parse_conventional(&c.message);

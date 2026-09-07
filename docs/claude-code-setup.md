@@ -30,20 +30,21 @@ cargo build --release
 ```toml
 [storage]
 database_path = "~/.engram/memory.db"
-wal_mode = true
+# query_log 保留天数，`engram maintain` 会清理超期行（默认 90）
+query_log_retention_days = 90
 
 [retrieval]
+# 省略 limit 时工具使用的默认值
 default_limit = 10
-fallback_timeout_ms = 50
+# 意图关键词只调整排序权重，不会缩小检索的记忆类型
+intent_routing = true
 
 [context]
 memory_budget_percent = 15
 
-[graph]
-max_nodes = 10000
-
 [mcp]
-transport = "stdio"
+# stdio 是唯一传输方式；请求处理线程数（1 = 顺序处理，最安全）
+worker_threads = 1
 ```
 
 ## 4. 添加 CLAUDE.md 指令
@@ -91,11 +92,40 @@ Claude Code 会自动调用 `create_decision` 工具记录这个决策。
 
 Claude Code 会调用 `recent_failures` 工具查找相关故障记忆。
 
+## 7. 自动记忆闭环（推荐）：Claude Code hooks
+
+依赖 agent "自觉" 写记忆不可靠。用 Claude Code 的 hooks 在会话结束时自动蒸馏记忆：
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.transcript_path // empty' | xargs -r -I{} ~/.engram/bin/engram session-import --project my-project --transcript {}"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+说明：
+- `Stop` 事件在 Claude Code 主回复结束时触发，stdin 收到含 `transcript_path` 的 JSON。
+- `engram session-import` 会从会话 JSONL 提取用户需求、结论和改动文件，蒸馏成一条 episodic 记忆（`--dry-run` 可预览）。
+- 也可以用 `SessionEnd` 事件（整个会话结束时触发一次）代替 `Stop`（每次回复结束都触发，频率更高）。
+- 想更省心，可配合 cron 定期跑维护：`engram maintain --apply`（去重 + FTS 修复 + query_log 清理 + 过期报告）。
+
 ## 可用工具一览
 
 | 工具 | 类型 | 必填参数 | 说明 |
 |------|------|----------|------|
-| `search_memory` | 读 | project_id, query | 全文搜索记忆 |
+| `search_memory` | 读 | project_id, query | 全文搜索记忆（结果含完整字段，支持 tags/before 过滤） |
+| `get_memory` | 读 | project_id, memory_type, id | 按 id 读取一条记忆的完整记录 |
 | `related_files` | 读 | project_id, file | 查看文件关联拓扑 |
 | `timeline` | 读 | project_id | 项目时间线 |
 | `recent_failures` | 读 | project_id | 最近故障记录 |

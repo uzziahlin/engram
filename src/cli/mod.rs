@@ -25,6 +25,7 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "search" => commands::search(cmd_args),
+        "get" => commands::get(cmd_args),
         "create-episodic" => commands::create_episodic(cmd_args),
         "create-decision" => commands::create_decision(cmd_args),
         "create-failure" => commands::create_failure(cmd_args),
@@ -47,6 +48,8 @@ pub fn run(args: &[String]) -> Result<()> {
         "confirm-suggestion" => commands::confirm_suggestion(cmd_args),
         "reject-suggestion" => commands::reject_suggestion(cmd_args),
         "reindex" => commands::reindex(cmd_args),
+        "maintain" => commands::maintain(cmd_args),
+        "session-import" => commands::session_import(cmd_args),
         "init" => commands::init(cmd_args),
         "init-guide" => commands::init_guide(cmd_args),
         _ => anyhow::bail!("Unknown command: {command}\nRun 'engram help' for usage."),

@@ -19,18 +19,21 @@ macro_rules! row_get_json {
 /// Produces 5 public methods on the implementing type:
 /// - `$create_fn(&self, mem: &Struct) -> Result<()>`
 /// - `$get_fn(&self, id: &str) -> Result<Option<Struct>>`
-/// - `$update_fn(&self, mem: &Struct) -> Result<()>`
+/// - `$update_fn(&self, mem: &Struct) -> Result<()>` (errors if no row matched)
 /// - `$delete_fn(&self, id: &str) -> Result<bool>`
 /// - `$search_fn(&self, query, project_id, limit) -> Result<Vec<ScoredMemory<Struct>>>`
 ///
-/// `mem`, `tx`, and `row` are passed as ident parameters to preserve
+/// `mem`, `tx`, `row`, and `link_ts` are passed as ident parameters to preserve
 /// macro hygiene — the invocation-site tokens reference these same names.
+/// `link_ts` is the timestamp handed to the entity-linking block: the memory's
+/// `created_at` on create, `updated_at` on update.
 macro_rules! impl_memory_crud {
     (
         // Parameter names — from invocation scope for hygiene
         mem = $mem:ident,
         tx = $tx:ident,
         row = $row:ident,
+        link_ts = $link_ts:ident,
 
         struct_type = $Struct:ident,
         table = $table:literal,
@@ -61,6 +64,8 @@ macro_rules! impl_memory_crud {
         pub fn $create_fn(&self, $mem: &$Struct) -> Result<()> {
             let conn = self.conn()?;
             let $tx = conn.unchecked_transaction()?;
+            #[allow(unused_variables)]
+            let $link_ts = $mem.created_at;
             $tx.execute($insert_sql, $($insert_params)*)?;
             $tx.execute($fts_insert_sql, $($fts_params)*)?;
             $($entity_link)*
@@ -84,13 +89,34 @@ macro_rules! impl_memory_crud {
         pub fn $update_fn(&self, $mem: &$Struct) -> Result<()> {
             let conn = self.conn()?;
             let $tx = conn.unchecked_transaction()?;
-            $tx.execute($update_sql, $($update_params)*)?;
+            #[allow(unused_variables)]
+            let $link_ts = $mem.updated_at;
+            let affected = $tx.execute($update_sql, $($update_params)*)?;
+            if affected == 0 {
+                // No row matched. Failing here (before any FTS write) prevents
+                // the orphan-index bug: previously the delete-then-insert below
+                // ran unconditionally, leaving FTS rows for nonexistent ids.
+                // The uncommitted transaction rolls back on drop.
+                anyhow::bail!(
+                    "update failed: no row with id {} in {}",
+                    $mem.id,
+                    $table
+                );
+            }
             // FTS5: delete-then-insert
             $tx.execute(
                 concat!("DELETE FROM ", $fts_table, " WHERE memory_id = ?1"),
                 params![$mem.id],
             )?;
             $tx.execute($fts_insert_sql, $($fts_params)*)?;
+            // Refresh graph edges: files/tools may have changed since create,
+            // so stale relations are dropped before re-linking (ON CONFLICT
+            // DO NOTHING alone can't remove edges for removed names).
+            $tx.execute(
+                "DELETE FROM graph_relations WHERE from_entity = ?1",
+                params![$mem.id],
+            )?;
+            $($entity_link)*
             $tx.commit()?;
             Ok(())
         }

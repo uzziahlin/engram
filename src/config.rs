@@ -11,8 +11,6 @@ pub struct Config {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
-    pub graph: GraphConfig,
-    #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
     pub semantic: SemanticConfig,
@@ -24,15 +22,17 @@ pub struct Config {
 pub struct StorageConfig {
     #[serde(default = "StorageConfig::default_database_path")]
     pub database_path: PathBuf,
-    #[serde(default = "StorageConfig::default_wal_mode")]
-    pub wal_mode: bool,
+    /// query_log rows older than this are pruned by `engram maintain`.
+    /// query_log grows by one row per search and has no natural bound.
+    #[serde(default = "StorageConfig::default_query_log_retention_days")]
+    pub query_log_retention_days: u64,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             database_path: Self::default_database_path(),
-            wal_mode: Self::default_wal_mode(),
+            query_log_retention_days: Self::default_query_log_retention_days(),
         }
     }
 }
@@ -45,8 +45,8 @@ impl StorageConfig {
             .join("memory.db")
     }
 
-    fn default_wal_mode() -> bool {
-        true
+    fn default_query_log_retention_days() -> u64 {
+        90
     }
 }
 
@@ -142,16 +142,14 @@ mod tests {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalConfig {
-    /// Note: the MCP server currently applies a protocol default of 10 when a
-    /// client omits `limit`; this field is reserved for wiring the configured
-    /// value into the server. It IS used for config validation.
+    /// Default `limit` for search/list tools when the caller omits it.
     #[serde(default = "RetrievalConfig::default_limit")]
     pub default_limit: usize,
     #[serde(default = "RetrievalConfig::default_recency_half_life_days")]
     pub recency_half_life_days: u64,
-    /// Route `search_memory` to only the memory types implied by the classified
-    /// intent (General intent still searches all four). Turn off to always query
-    /// every type regardless of intent.
+    /// Intent-aware ranking: classified intent keywords adjust the reranker's
+    /// type/recency/importance weights. Every type is always searched — routing
+    /// is soft, it never narrows the sources (recall first).
     #[serde(default = "RetrievalConfig::default_intent_routing")]
     pub intent_routing: bool,
     /// Global ranking-signal weights. Defaults reproduce the pre-config
@@ -232,36 +230,11 @@ impl ContextConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphConfig {
-    #[serde(default = "GraphConfig::default_max_nodes")]
-    pub max_nodes: usize,
-    #[serde(default = "GraphConfig::default_lazy_loading_threshold")]
-    pub lazy_loading_threshold: usize,
-}
-
-impl Default for GraphConfig {
-    fn default() -> Self {
-        Self {
-            max_nodes: Self::default_max_nodes(),
-            lazy_loading_threshold: Self::default_lazy_loading_threshold(),
-        }
-    }
-}
-
-impl GraphConfig {
-    fn default_max_nodes() -> usize {
-        10_000
-    }
-    fn default_lazy_loading_threshold() -> usize {
-        100_000
-    }
-}
-
+/// MCP server config. stdio is the only transport implemented; `transport`
+/// was removed after lingering as a dead knob — re-add it together with an
+/// actual HTTP transport, not before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
-    #[serde(default = "McpConfig::default_transport")]
-    pub transport: String,
     #[serde(default = "McpConfig::default_worker_threads")]
     pub worker_threads: usize,
 }
@@ -269,16 +242,12 @@ pub struct McpConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            transport: Self::default_transport(),
             worker_threads: Self::default_worker_threads(),
         }
     }
 }
 
 impl McpConfig {
-    fn default_transport() -> String {
-        "stdio".to_string()
-    }
     fn default_worker_threads() -> usize {
         1
     }
@@ -395,8 +364,11 @@ impl Config {
                 self.retrieval.default_limit
             );
         }
-        if self.graph.max_nodes == 0 {
-            anyhow::bail!("graph.max_nodes must be > 0, got {}", self.graph.max_nodes);
+        if self.mcp.worker_threads == 0 || self.mcp.worker_threads > 64 {
+            anyhow::bail!(
+                "mcp.worker_threads must be between 1 and 64, got {}",
+                self.mcp.worker_threads
+            );
         }
         Ok(())
     }

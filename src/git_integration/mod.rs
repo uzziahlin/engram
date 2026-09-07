@@ -2,6 +2,7 @@ pub mod listener;
 
 pub use listener::CommitEvent;
 pub use listener::GitIntegration;
+pub use listener::milestone_memories;
 
 /// Configured `git` invocation against `repo_path` with a fixed identity and
 /// deterministic commit dates, for building throwaway repos in tests.

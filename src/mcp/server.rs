@@ -47,12 +47,23 @@ pub struct SearchMemoryInput {
     query: String,
     #[serde(default)]
     memory_type: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    /// None → `[retrieval].default_limit` from config.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// If non-empty, only memories carrying at least one of these tags.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// If set, only memories created before this unix timestamp.
+    #[serde(default)]
+    before: Option<i64>,
 }
 
-fn default_limit() -> usize {
-    10
+/// get_memory tool input — fetch one memory's full record by id.
+#[derive(Debug, Deserialize)]
+pub struct GetMemoryInput {
+    project_id: String,
+    memory_type: String,
+    id: String,
 }
 
 /// related_files tool input.
@@ -80,8 +91,9 @@ pub struct RecentFailuresInput {
     project_id: String,
     #[serde(default)]
     service: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    /// None → `[retrieval].default_limit` from config.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// architectural_decisions tool input.
@@ -90,8 +102,9 @@ pub struct ArchitecturalDecisionsInput {
     project_id: String,
     #[serde(default)]
     topic: Option<String>,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    /// None → `[retrieval].default_limit` from config.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// query_stats tool input — retrieval feedback aggregated by query string.
@@ -100,8 +113,9 @@ pub struct QueryStatsInput {
     project_id: String,
     #[serde(default = "default_days")]
     days: i64,
-    #[serde(default = "default_limit")]
-    limit: usize,
+    /// None → `[retrieval].default_limit` from config.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// reflect tool input — scan a project's active failures for recurring tags and
@@ -274,8 +288,9 @@ pub struct ListArchivedInput {
     pub project_id: String,
     #[serde(default)]
     pub memory_type: Option<String>,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
+    /// None → `[retrieval].default_limit` from config.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// consolidate_memories tool input — dedup. Dry-run by default.
@@ -307,6 +322,7 @@ pub struct ToolDefinition {
 pub trait MemoryToolProvider: Send + Sync {
     // Read tools
     fn search_memory(&self, input: SearchMemoryInput) -> Result<serde_json::Value>;
+    fn get_memory(&self, input: GetMemoryInput) -> Result<serde_json::Value>;
     fn related_files(&self, input: RelatedFilesInput) -> Result<serde_json::Value>;
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value>;
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value>;
@@ -404,26 +420,42 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let reranker = &self.reranker;
         let composer = &self.composer;
 
-        let intents = classifier.classify(&input.query);
+        let limit = input
+            .limit
+            .unwrap_or(self.config.retrieval.default_limit)
+            .max(1);
+
+        // Intent routing is SOFT: it adjusts ranking weights (type/recency/
+        // importance boosts in the plan below) but never narrows the memory
+        // types searched. Hard source-narrowing cost recall — e.g. a Workflow
+        // query could no longer surface a decision record about test design.
+        let intents = if self.config.retrieval.intent_routing {
+            classifier.classify(&input.query)
+        } else {
+            vec![MemoryIntent::General]
+        };
         let plan = planner.plan(&intents);
         let now_ts = chrono::Utc::now().timestamp();
 
+        // Filters shrink the candidate set post-retrieval, so over-fetch when
+        // any is present to keep result counts useful, then truncate to limit.
+        let has_filters = !input.tags.is_empty() || input.before.is_some();
+        let fetch_limit = if has_filters { (limit * 3).min(100) } else { limit };
+
         let mut results = if let Some(ref mt) = input.memory_type {
-            // Explicit type filter takes precedence over intent routing.
-            BM25Retriever::search_by_type(repo, &input.query, &input.project_id, mt, input.limit)?
-        } else if self.config.retrieval.intent_routing {
-            // Route to only the memory types implied by the classified intent
-            // (General intent expands to all four, matching the old search_all).
-            BM25Retriever::search_by_types(
-                repo,
-                &input.query,
-                &input.project_id,
-                &plan.sources,
-                input.limit,
-            )?
+            BM25Retriever::search_by_type(repo, &input.query, &input.project_id, mt, fetch_limit)?
         } else {
-            BM25Retriever::search_all(repo, &input.query, &input.project_id, input.limit)?
+            BM25Retriever::search_all(repo, &input.query, &input.project_id, fetch_limit)?
         };
+
+        if has_filters {
+            results.retain(|r| {
+                let tags_ok =
+                    input.tags.is_empty() || r.tags.iter().any(|t| input.tags.contains(t));
+                let before_ok = input.before.map_or(true, |b| r.created_at < b);
+                tags_ok && before_ok
+            });
+        }
 
         // Semantic fusion: when an embedder is present, blend vector top-K with
         // the BM25 candidates via RRF via the embedding service. Vector-only
@@ -445,6 +477,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         reranker.deduplicate(&mut results);
         let half_life_seconds = (self.config.retrieval.recency_half_life_days as f32) * 86400.0;
         reranker.rerank(&mut results, &plan, now_ts, half_life_seconds);
+        results.truncate(limit);
 
         let budget = ContextBudget::new(
             self.config.context.context_window_tokens,
@@ -452,17 +485,27 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         );
         let context = composer.compose_context(&results, &budget);
 
+        // Results carry each memory's full type-specific payload (root_cause/
+        // fix/prevention, context/tradeoffs, steps, content…): search is the
+        // agents' only read path, so a teaser summary is not enough.
         let result_items: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "id": r.id,
                     "memory_type": r.memory_type,
                     "summary": r.summary,
+                    "tags": r.tags,
                     "relevance_score": (r.relevance_score.clamp(0.0, 1.0) * 100.0).round() / 100.0,
                     "importance": (r.importance * 100.0).round() / 100.0,
                     "created_at": r.created_at,
-                })
+                });
+                if let (Some(obj), Some(detail)) = (item.as_object_mut(), r.detail.as_object()) {
+                    for (k, v) in detail {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+                item
             })
             .collect();
 
@@ -484,6 +527,32 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             "results": result_items,
             "total": result_items.len(),
             "context": context,
+        }))
+    }
+
+    fn get_memory(&self, input: GetMemoryInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let kind = MemoryKind::from_type_str(&input.memory_type)?;
+        macro_rules! fetch {
+            ($get:ident) => {{
+                let mem = repo
+                    .$get(&input.id)?
+                    .ok_or_else(|| anyhow::anyhow!("memory not found: {}", input.id))?;
+                if mem.project_id != input.project_id {
+                    anyhow::bail!("memory does not belong to project {}", input.project_id);
+                }
+                serde_json::to_value(&mem)?
+            }};
+        }
+        let memory = match kind {
+            MemoryKind::Episodic => fetch!(get_episodic),
+            MemoryKind::Decision => fetch!(get_decision),
+            MemoryKind::Failure => fetch!(get_failure),
+            MemoryKind::Procedural => fetch!(get_procedural),
+        };
+        Ok(serde_json::json!({
+            "memory_type": kind.as_str(),
+            "memory": memory,
         }))
     }
 
@@ -529,8 +598,12 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
+        let limit = input
+            .limit
+            .unwrap_or(self.config.retrieval.default_limit)
+            .max(1);
         let since = chrono::Utc::now().timestamp() - (input.days.saturating_mul(86400));
-        let rows = repo.query_stats(&input.project_id, since, input.limit)?;
+        let rows = repo.query_stats(&input.project_id, since, limit)?;
         let queries: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
@@ -547,9 +620,13 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
+        let limit = input
+            .limit
+            .unwrap_or(self.config.retrieval.default_limit)
+            .max(1);
         let query = input.service.as_deref().unwrap_or("");
         let results = if query.is_empty() {
-            repo.list_recent_failures(&input.project_id, input.limit)?
+            repo.list_recent_failures(&input.project_id, limit)?
                 .into_iter()
                 .map(|m| ScoredMemory {
                     memory: m,
@@ -557,15 +634,22 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                 })
                 .collect()
         } else {
-            repo.search_failures(query, &input.project_id, input.limit)?
+            repo.search_failures(query, &input.project_id, limit)?
         };
+        // Full failure record: the root-cause analysis is the whole point of
+        // a failure memory — hiding it behind a follow-up call that doesn't
+        // exist made stored knowledge unreadable.
         let failures: Vec<serde_json::Value> = results
             .iter()
             .map(|f| {
                 serde_json::json!({
                     "id": f.memory.id,
                     "incident": f.memory.incident,
+                    "root_cause": f.memory.root_cause,
+                    "fix": f.memory.fix,
+                    "prevention": f.memory.prevention,
                     "severity": f.memory.severity,
+                    "tags": f.memory.tags,
                     "created_at": f.memory.created_at,
                 })
             })
@@ -579,9 +663,13 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         input: ArchitecturalDecisionsInput,
     ) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
+        let limit = input
+            .limit
+            .unwrap_or(self.config.retrieval.default_limit)
+            .max(1);
         let query = input.topic.as_deref().unwrap_or("");
         let results = if query.is_empty() {
-            repo.list_recent_decisions(&input.project_id, input.limit)?
+            repo.list_recent_decisions(&input.project_id, limit)?
                 .into_iter()
                 .map(|m| ScoredMemory {
                     memory: m,
@@ -589,7 +677,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                 })
                 .collect()
         } else {
-            repo.search_decisions(query, &input.project_id, input.limit)?
+            repo.search_decisions(query, &input.project_id, limit)?
         };
         let decisions: Vec<serde_json::Value> = results
             .iter()
@@ -597,7 +685,11 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                 serde_json::json!({
                     "id": d.memory.id,
                     "title": d.memory.title,
+                    "context": d.memory.context,
                     "rationale": d.memory.rationale,
+                    "tradeoffs": d.memory.tradeoffs,
+                    "related_files": d.memory.related_files,
+                    "tags": d.memory.tags,
                     "created_at": d.memory.created_at,
                 })
             })
@@ -822,42 +914,45 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn ingest_commits(&self, input: IngestCommitsInput) -> Result<serde_json::Value> {
+        let count = input.count.clamp(1, 1000);
         let repo_path = std::path::Path::new(&input.repo_path);
         let git = GitIntegration::new(repo_path)?;
         let session_id = input.session_id.unwrap_or_else(|| "auto-ingest".into());
 
-        let memories =
-            git.process_recent_commits(&input.project_id, &session_id, input.count.min(1000))?;
-
+        let events = git.get_recent_commits(count)?;
         let repo = self.lock_repo();
 
-        // Deduplicate: skip commits already ingested
+        // Dedup BEFORE generating: the old path built a full memory (with
+        // tree-diff-derived files) for every commit and threw most away.
         let ingested_hashes = repo.get_ingested_commits(&input.project_id)?;
-        let total_before_dedup = memories.len();
-        let new_memories: Vec<_> = memories
+        let fresh: Vec<crate::git_integration::CommitEvent> = events
             .into_iter()
-            .filter(|m| {
-                m.related_commits
-                    .iter()
-                    .all(|c| !ingested_hashes.contains(c))
-            })
+            .filter(|e| !ingested_hashes.contains(&e.commit_hash))
             .collect();
+        let skipped = count.saturating_sub(fresh.len());
+
+        // One memory per (type, scope) milestone instead of one per commit —
+        // the distillation git_collector's bootstrap path always intended.
+        let memories = crate::git_integration::milestone_memories(
+            &input.project_id,
+            &session_id,
+            &fresh,
+        );
 
         let mut ingested = Vec::new();
-        for mem in &new_memories {
+        for mem in &memories {
             repo.create_episodic(mem)?;
             ingested.push(serde_json::json!({
                 "id": mem.id,
                 "summary": mem.summary,
+                "commits": mem.related_commits.len(),
                 "files_touched": mem.files_touched,
             }));
         }
 
-        let skipped = total_before_dedup - new_memories.len();
-
         Ok(serde_json::json!({
             "ingested": ingested.len(),
-            "total_commits_scanned": input.count,
+            "total_commits_scanned": count,
             "skipped_duplicates": skipped,
             "memories": ingested,
         }))
@@ -985,9 +1080,13 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     fn list_archived(&self, input: ListArchivedInput) -> Result<serde_json::Value> {
         let kinds = resolve_kinds(&input.memory_type)?;
         let repo = self.lock_repo();
+        let limit = input
+            .limit
+            .unwrap_or(self.config.retrieval.default_limit)
+            .max(1);
         let mut archived: Vec<serde_json::Value> = Vec::new();
         for kind in kinds {
-            for row in repo.list_archived(kind, &input.project_id, input.limit)? {
+            for row in repo.list_archived(kind, &input.project_id, limit)? {
                 archived.push(serde_json::to_value(&row)?);
             }
         }
@@ -1103,6 +1202,7 @@ impl McpServer {
         impl MemoryToolProvider for NoopProvider {
             noop_stubs! {
                 search_memory, SearchMemoryInput, {"results": [], "total": 0};
+                get_memory, GetMemoryInput, {"memory": null};
                 related_files, RelatedFilesInput, {"entities": []};
                 timeline, TimelineInput, {"events": []};
                 recent_failures, RecentFailuresInput, {"failures": []};
@@ -1155,16 +1255,31 @@ impl McpServer {
         vec![
             ToolDefinition {
                 name: "search_memory".into(),
-                description: "Search across all memory types using BM25 full-text search".into(),
+                description: "Search all memory types via BM25 full-text search. Results carry each memory's full payload (e.g. a failure's root_cause/fix/prevention) — no follow-up fetch needed. Ranking blends relevance, recency, importance, and type priors; intent keywords adjust weights but never exclude types.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "query": { "type": "string", "description": "Search query" },
                         "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"], "description": "Filter by memory type" },
-                        "limit": { "type": "integer", "description": "Max results", "default": 10 },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying any of these tags" },
+                        "before": { "type": "integer", "description": "Only memories created before this unix timestamp" },
+                        "limit": { "type": "integer", "description": "Max results (default: retrieval.default_limit)" },
                     },
                     "required": ["project_id", "query"],
+                }),
+            },
+            ToolDefinition {
+                name: "get_memory".into(),
+                description: "Fetch one memory's complete record by id and type — every stored field, including archived-relevant metadata and full structured content.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"] },
+                        "id": { "type": "string", "description": "Memory id (from search_memory results)" },
+                    },
+                    "required": ["project_id", "memory_type", "id"],
                 }),
             },
             ToolDefinition {
@@ -1473,8 +1588,21 @@ impl McpServer {
                 result: Some(serde_json::json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": { "tools": {}, "prompts": {} },
-                    "serverInfo": { "name": "engram", "version": "0.1.0" },
+                    "serverInfo": {
+                        "name": "engram",
+                        // Keep in lockstep with Cargo.toml — a stale hardcoded
+                        // version here made clients see 0.1.0 in 0.2.0 builds.
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
                 })),
+                error: None,
+            },
+            // MCP liveness probe: clients may ping to check connection health;
+            // answering with an empty result is required by the spec.
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(serde_json::json!({})),
                 error: None,
             },
             "tools/list" => JsonRpcResponse {
@@ -1555,6 +1683,9 @@ impl McpServer {
                 ) = match tool_name {
                     "search_memory" => {
                         dispatch_tool!(arguments, SearchMemoryInput, self.provider, search_memory)
+                    }
+                    "get_memory" => {
+                        dispatch_tool!(arguments, GetMemoryInput, self.provider, get_memory)
                     }
                     "related_files" => {
                         dispatch_tool!(arguments, RelatedFilesInput, self.provider, related_files)

@@ -13,6 +13,7 @@
 //! bootstrap material — the understanding happens in the agent, the
 //! gathering happens here.
 
+use crate::git_integration::GitIntegration;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -161,16 +162,38 @@ pub fn collect(
     let mut failures = None;
     let mut workflow = None;
 
+    // One shared git walk for every dimension that needs commit history (git
+    // AND failures). Each walk traverses the full history with per-commit tree
+    // diffs — doing it twice doubled the most expensive part of collection.
+    let shared_events = if dimensions
+        .iter()
+        .any(|d| matches!(d, Dimension::Git | Dimension::Failures))
+    {
+        match GitIntegration::new(repo_path).and_then(|g| g.get_recent_commits(opts.max_commits))
+        {
+            Ok(events) => Some(events),
+            Err(e) => {
+                summary.notes.push(format!("git history unavailable: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     for &dim in dimensions {
         match dim {
-            Dimension::Git => match git_collector::collect(repo_path, opts) {
-                Ok(c) => {
+            Dimension::Git => match &shared_events {
+                Some(events) => {
+                    let c = git_collector::collect_from_events(events, opts);
                     summary.skipped_ingested_commits = c.skipped_ingested;
                     let items = c.item_count();
                     summary.git_items = items;
                     git = Some(c);
                 }
-                Err(e) => summary.notes.push(format!("git dimension skipped: {e}")),
+                None => summary
+                    .notes
+                    .push("git dimension skipped: no git history available".into()),
             },
             Dimension::Decisions => match docs::collect(repo_path, opts) {
                 Ok(c) => {
@@ -182,7 +205,8 @@ pub fn collect(
                     .notes
                     .push(format!("decisions dimension skipped: {e}")),
             },
-            Dimension::Failures => match failures::collect(repo_path, opts) {
+            Dimension::Failures => match failures::collect(repo_path, shared_events.as_deref(), opts)
+            {
                 Ok(c) => {
                     let items = c.item_count();
                     summary.failure_items = items;

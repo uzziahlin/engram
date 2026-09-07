@@ -41,6 +41,17 @@ pub trait RequestHandler: Send + Sync {
     fn handle(&self, req: JsonRpcRequest) -> JsonRpcResponse;
 }
 
+/// Render a caught panic payload as a best-effort string for logging.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 /// Run the JSON-RPC stdio transport: read frames from stdin, dispatch to a
 /// bounded worker pool, write responses (id-correlated, order-independent)
 /// under a stdout lock. `worker_threads=1` degenerates to sequential processing.
@@ -72,7 +83,30 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
                     Err(_) => break, // channel closed → drain done
                 }
             };
-            let response = handler.handle(req);
+            // Panic isolation: one bad request must not take down the whole
+            // MCP server (the release profile uses panic=unwind for exactly
+            // this). The id is cloned out first so the error response can be
+            // correlated even though the handler consumed the request.
+            let response = {
+                let id = req.id.clone();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req))) {
+                    Ok(resp) => resp,
+                    Err(panic) => {
+                        let msg = panic_message(&panic);
+                        tracing::error!("request handler panicked: {msg}");
+                        JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32603,
+                                message: "Internal error: request handler panicked".into(),
+                                data: Some(serde_json::json!({ "panic": msg })),
+                            }),
+                        }
+                    }
+                }
+            };
             if let Ok(s) = serde_json::to_string(&response) {
                 let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
                 let written = writeln!(out, "{s}").and_then(|_| out.flush());
@@ -82,6 +116,9 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
                         // instead of silently looping on a broken pipe.
                         break;
                     }
+                    // Non-BrokenPipe write failures drop the response; log so
+                    // the loss is at least observable.
+                    tracing::warn!("response write failed: {e}");
                 }
             }
         }));

@@ -106,6 +106,8 @@ mod tests {
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "2".into(),
@@ -114,6 +116,8 @@ mod tests {
                 relevance_score: 0.2,
                 importance: 0.5,
                 created_at: 2000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
         ];
 
@@ -134,6 +138,8 @@ mod tests {
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "1".into(),
@@ -142,6 +148,8 @@ mod tests {
                 relevance_score: 0.8,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "2".into(),
@@ -150,6 +158,8 @@ mod tests {
                 relevance_score: 0.7,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
         ];
 
@@ -167,6 +177,8 @@ mod tests {
             relevance_score: rel,
             importance: imp,
             created_at,
+            tags: vec![],
+            detail: serde_json::Value::Null,
         }
     }
 

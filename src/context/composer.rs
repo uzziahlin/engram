@@ -101,20 +101,20 @@ impl ContextComposer {
     }
 
     /// Compose context from search results within a token budget.
-    /// Priority: failures > decisions > recent episodic > procedural.
+    ///
+    /// Results arrive already ranked by the reranker (which blends type priors
+    /// into the score), so the composer preserves that order — an earlier
+    /// version re-sorted by a fixed type priority here, producing a context
+    /// order inconsistent with the `results` array in the same response.
     pub fn compose_context(&self, results: &[SearchResult], budget: &ContextBudget) -> String {
         let mut context_parts = Vec::new();
         let mut tokens_used = 0;
         let token_limit = budget.reserved_for_memory;
 
-        // Sort by priority: failure > decision > episodic > procedural
-        let mut sorted = results.to_vec();
-        sort_by_priority(&mut sorted);
-
-        // Deduplicate by ID
+        // Deduplicate by ID, preserving the caller's ranking.
         let mut seen_ids = HashSet::new();
         let mut deduped = Vec::new();
-        for result in sorted {
+        for result in results {
             if seen_ids.insert(result.id.clone()) {
                 deduped.push(result);
             }
@@ -162,29 +162,6 @@ fn is_chinese_char(ch: char) -> bool {
         | '\u{F900}'..='\u{FAFF}'
         | '\u{2F800}'..='\u{2FA1F}'
     )
-}
-
-/// Sort results by priority: failure > decision > episodic > procedural.
-fn sort_by_priority(results: &mut [SearchResult]) {
-    results.sort_by(|a, b| {
-        let pa = memory_type_priority(&a.memory_type);
-        let pb = memory_type_priority(&b.memory_type);
-        pa.cmp(&pb).then_with(|| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-}
-
-fn memory_type_priority(mt: &str) -> u8 {
-    match mt {
-        "failure" => 0,
-        "decision" => 1,
-        "episodic" => 2,
-        "procedural" => 3,
-        _ => 4,
-    }
 }
 
 /// Format a Unix timestamp as a human-readable date.
@@ -260,6 +237,8 @@ mod tests {
                 relevance_score: 0.5 + (i as f32 * 0.02),
                 importance: 0.5,
                 created_at: 1716940800 + i as i64 * 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             })
             .collect();
 
@@ -270,7 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_context_priority_ordering() {
+    fn test_compose_context_preserves_reranker_order() {
+        // The composer must NOT re-sort by type priority: results arrive already
+        // ranked by the reranker, and the context order must match the results
+        // order the caller sees (an earlier version re-sorted here, making the
+        // two disagree within a single search_memory response).
         let composer = ContextComposer::new();
         let budget = ContextBudget::new(100000, 50);
 
@@ -278,36 +261,41 @@ mod tests {
             SearchResult {
                 id: "1".into(),
                 memory_type: "procedural".into(),
-                summary: "deployment workflow".into(),
+                summary: "AAA deployment workflow".into(),
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "2".into(),
                 memory_type: "failure".into(),
-                summary: "auth outage".into(),
+                summary: "BBB auth outage".into(),
                 relevance_score: 0.5,
                 importance: 0.5,
                 created_at: 2000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "3".into(),
                 memory_type: "decision".into(),
-                summary: "use redis".into(),
+                summary: "CCC use redis".into(),
                 relevance_score: 0.7,
                 importance: 0.5,
                 created_at: 1500,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
         ];
 
         let context = composer.compose_context(&results, &budget);
-        // Failure should come first
-        let failure_pos = context.find("failure").unwrap();
-        let decision_pos = context.find("decision").unwrap();
-        let procedural_pos = context.find("procedural").unwrap();
-        assert!(failure_pos < decision_pos);
-        assert!(decision_pos < procedural_pos);
+        // Input order preserved verbatim — no type-priority re-sorting.
+        let a = context.find("AAA").unwrap();
+        let b = context.find("BBB").unwrap();
+        let c = context.find("CCC").unwrap();
+        assert!(a < b && b < c, "context must preserve the caller's ranking");
     }
 
     #[test]
@@ -323,6 +311,8 @@ mod tests {
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "dup".into(),
@@ -331,6 +321,8 @@ mod tests {
                 relevance_score: 0.8,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "unique".into(),
@@ -339,6 +331,8 @@ mod tests {
                 relevance_score: 0.7,
                 importance: 0.5,
                 created_at: 2000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
         ];
 
@@ -381,6 +375,8 @@ mod tests {
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             })
             .collect();
         let context = composer.compose_context(&results, &budget);
@@ -400,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_context_same_type_orders_by_score_desc() {
+    fn test_compose_context_same_type_preserves_input_order() {
         // 同类型（均为 failure，priority 相同）内应按 relevance_score 降序：
         // 覆盖 sort_by_priority 的 then 分支。高分条目应在低分条目之前出现。
         let composer = ContextComposer::new();
@@ -413,6 +409,8 @@ mod tests {
                 relevance_score: 0.3,
                 importance: 0.5,
                 created_at: 1000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
             SearchResult {
                 id: "high".into(),
@@ -421,14 +419,16 @@ mod tests {
                 relevance_score: 0.9,
                 importance: 0.5,
                 created_at: 2000,
+                tags: vec![],
+                detail: serde_json::Value::Null,
             },
         ];
         let context = composer.compose_context(&results, &budget);
         let high_pos = context.find("HIGH").expect("HIGH 应出现");
         let low_pos = context.find("LOW").expect("LOW 应出现");
         assert!(
-            high_pos < low_pos,
-            "同类型内高分应排在低分之前 (high={high_pos}, low={low_pos})"
+            high_pos > low_pos,
+            "composer 不再重排：保持调用方(reranker)顺序，输入 LOW 在前则输出 LOW 在前 (high={high_pos}, low={low_pos})"
         );
     }
 
@@ -445,6 +445,8 @@ mod tests {
             relevance_score: 1.5,
             importance: 0.5,
             created_at: 1000,
+            tags: vec![],
+            detail: serde_json::Value::Null,
         }];
         let context = composer.compose_context(&results, &budget);
         assert!(

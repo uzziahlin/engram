@@ -6,7 +6,7 @@
 //! and *prevention* (often from the changed files) to write a `failure`
 //! memory — that interpretation is explicitly left to the agent.
 
-use crate::git_integration::GitIntegration;
+use crate::git_integration::CommitEvent;
 use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
@@ -48,23 +48,29 @@ pub struct ChangelogFixedEntry {
     pub entry: String,
 }
 
-pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<FailuresCollection> {
+/// `events` carries the commit history pre-walked (and shared) by the
+/// orchestrating `collect()`; `None` means the walk failed or wasn't needed —
+/// the fix-commit section simply comes up empty and the other evidence
+/// (CHANGELOG, test files) still applies.
+pub fn collect(
+    repo_path: &Path,
+    events: Option<&[CommitEvent]>,
+    opts: &CollectOptions,
+) -> Result<FailuresCollection> {
     let mut fix_commits = Vec::new();
 
-    if let Ok(git) = GitIntegration::new(repo_path) {
-        if let Ok(events) = git.get_recent_commits(opts.max_commits) {
-            for e in events {
-                if opts.ingested_commit_hashes.contains(&e.commit_hash) {
-                    continue;
-                }
-                if is_fix_message(&e.message) && fix_commits.len() < MAX_FIX_COMMITS {
-                    fix_commits.push(FixCommit {
-                        hash: e.commit_hash.clone(),
-                        message: e.message.clone(),
-                        files: e.files_changed.clone(),
-                        timestamp: e.timestamp,
-                    });
-                }
+    if let Some(events) = events {
+        for e in events {
+            if opts.ingested_commit_hashes.contains(&e.commit_hash) {
+                continue;
+            }
+            if is_fix_message(&e.message) && fix_commits.len() < MAX_FIX_COMMITS {
+                fix_commits.push(FixCommit {
+                    hash: e.commit_hash.clone(),
+                    message: e.message.clone(),
+                    files: e.files_changed.clone(),
+                    timestamp: e.timestamp,
+                });
             }
         }
     }
@@ -93,13 +99,18 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<FailuresCollec
 }
 
 /// Does a commit message describe a fix? Conventional `fix:` / `hotfix:` /
-/// `revert:` are the strongest signal; fall back to keyword presence.
+/// `revert:` heads are the strongest signal (exact type match, so `fixture:`
+/// is NOT a fix); otherwise fall back to whole-word keywords (so "dispatch"
+/// doesn't match "patch" and "debugger" doesn't match "bug").
 fn is_fix_message(msg: &str) -> bool {
-    let first = msg.lines().next().unwrap_or("").trim().to_lowercase();
-    if first.starts_with("fix") || first.starts_with("hotfix") || first.starts_with("revert") {
-        return true;
-    }
     let lower = msg.to_lowercase();
+    let first = lower.lines().next().unwrap_or("").trim();
+    if let Some((head, _)) = first.split_once(':') {
+        let ty = head.split('(').next().unwrap_or("").trim();
+        if matches!(ty, "fix" | "hotfix" | "revert" | "bugfix") {
+            return true;
+        }
+    }
     let keywords = [
         "bug",
         "bugfix",
@@ -109,8 +120,21 @@ fn is_fix_message(msg: &str) -> bool {
         "hotfix",
         "broken",
         "leak",
+        "fix",
     ];
-    keywords.iter().any(|k| lower.contains(k))
+    keywords.iter().any(|k| contains_word(&lower, k))
+}
+
+/// Case-folded whole-word containment: both sides of the match must be a
+/// non-letter (or the string edge).
+fn contains_word(haystack_lower: &str, word: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    haystack_lower.match_indices(word).any(|(i, _)| {
+        let end = i + word.len();
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphabetic();
+        before_ok && after_ok
+    })
 }
 
 /// Parse `## Fixed` / `### Bug Fixes` style sections out of a CHANGELOG,
@@ -178,7 +202,11 @@ mod tests {
         assert!(is_fix_message("hotfix: patch the leak"));
         assert!(is_fix_message("revert: bad config"));
         assert!(is_fix_message("Handle crash on startup"));
+        assert!(is_fix_message("fix the login flow")); // bare verb, not conventional
         assert!(!is_fix_message("feat: add login screen"));
+        assert!(!is_fix_message("feat(auth): dispatch handler")); // no "patch" word
+        assert!(!is_fix_message("chore: update debugger config")); // no "bug" word
+        assert!(!is_fix_message("feat: fixture for tests")); // "fixture" is not "fix:"
     }
 
     #[test]
@@ -206,7 +234,9 @@ mod tests {
         add_commit(root, "a.txt", "2", "fix: crash on empty");
         add_commit(root, "a.txt", "3", "docs: readme");
 
-        let col = collect(root, &CollectOptions::default()).unwrap();
+        let git = crate::git_integration::GitIntegration::new(root).unwrap();
+        let events = git.get_recent_commits(50).unwrap();
+        let col = collect(root, Some(&events), &CollectOptions::default()).unwrap();
         assert_eq!(col.fix_commits.len(), 1);
         assert!(col.fix_commits[0].message.contains("crash"));
     }

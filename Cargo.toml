@@ -1,6 +1,6 @@
 [package]
 name = "engram"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "A local-first memory system for AI coding agents — persistent engineering knowledge via MCP"
@@ -49,9 +49,19 @@ hf-hub = { version = "0.5.0", optional = true }
 [dev-dependencies]
 tempfile = "3"
 
+# Full debuginfo makes test artifacts GB-scale and can exhaust disk; line
+# tables keep backtraces resolvable at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# unwind (not abort): the stdio transport catches worker panics and returns
+# a JSON-RPC internal-error instead of killing the whole MCP server process.
+panic = "unwind"

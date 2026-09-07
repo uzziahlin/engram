@@ -12,6 +12,13 @@ pub struct SearchResult {
     pub relevance_score: f32,
     pub importance: f32,
     pub created_at: i64,
+    /// The memory's tags — lets callers (e.g. the MCP search filter) match
+    /// without a second DB round-trip.
+    pub tags: Vec<String>,
+    /// Type-specific full fields (root_cause/fix/prevention, context/tradeoffs,
+    /// steps, content…). Search is the *only* read path agents have, so results
+    /// must carry the full payload, not just a teaser summary.
+    pub detail: serde_json::Value,
 }
 
 /// Trait for extracting searchable fields from memory types.
@@ -20,6 +27,8 @@ trait Searchable {
     fn search_summary(&self) -> &str;
     fn search_created_at(&self) -> i64;
     fn search_importance(&self) -> f32;
+    fn search_tags(&self) -> Vec<String>;
+    fn search_detail(&self) -> serde_json::Value;
 }
 
 impl Searchable for EpisodicMemory {
@@ -34,6 +43,16 @@ impl Searchable for EpisodicMemory {
     }
     fn search_importance(&self) -> f32 {
         self.importance.clamp(0.0, 1.0)
+    }
+    fn search_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+    fn search_detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "content": self.content,
+            "files_touched": self.files_touched,
+            "related_commits": self.related_commits,
+        })
     }
 }
 
@@ -50,6 +69,17 @@ impl Searchable for DecisionMemory {
     fn search_importance(&self) -> f32 {
         0.5
     }
+    fn search_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+    fn search_detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "context": self.context,
+            "rationale": self.rationale,
+            "tradeoffs": self.tradeoffs,
+            "related_files": self.related_files,
+        })
+    }
 }
 
 impl Searchable for FailureMemory {
@@ -65,6 +95,17 @@ impl Searchable for FailureMemory {
     fn search_importance(&self) -> f32 {
         (self.severity as f32 / 5.0).clamp(0.0, 1.0)
     }
+    fn search_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+    fn search_detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "root_cause": self.root_cause,
+            "fix": self.fix,
+            "prevention": self.prevention,
+            "severity": self.severity,
+        })
+    }
 }
 
 impl Searchable for ProceduralMemory {
@@ -79,6 +120,15 @@ impl Searchable for ProceduralMemory {
     }
     fn search_importance(&self) -> f32 {
         0.5
+    }
+    fn search_tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+    fn search_detail(&self) -> serde_json::Value {
+        serde_json::json!({
+            "steps": self.steps,
+            "related_tools": self.related_tools,
+        })
     }
 }
 
@@ -122,6 +172,8 @@ impl BM25Retriever {
                 relevance_score: Self::normalize_bm25(scored.bm25_score),
                 importance: scored.memory.search_importance(),
                 created_at: scored.memory.search_created_at(),
+                tags: scored.memory.search_tags(),
+                detail: scored.memory.search_detail(),
             })
             .collect()
     }

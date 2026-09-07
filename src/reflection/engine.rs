@@ -96,6 +96,11 @@ impl ReflectionEngine {
             let source_failure_ids: Vec<String> = group.iter().map(|f| f.id.clone()).collect();
             let source_preventions =
                 dedup_preserve_order(group.iter().map(|f| f.prevention.clone()));
+            // A rule with no steps is unconfirmable — skip rather than persist
+            // a proposal that can only be rejected.
+            if source_preventions.is_empty() {
+                continue;
+            }
             let rule = SuggestedRule {
                 pattern_tag: tag.to_string(),
                 occurrence_count: group.len(),
@@ -110,7 +115,10 @@ impl ReflectionEngine {
                 source_preventions,
             };
 
-            if apply && !repo.has_pending_suggestion(project_id, &rule.pattern_tag)? {
+            // Block on ANY prior proposal for this tag — pending, confirmed, or
+            // rejected. Checking only 'pending' let rejected suggestions
+            // resurrect on the next run and confirmed rules be re-proposed.
+            if apply && !repo.has_suggestion_for_tag(project_id, &rule.pattern_tag)? {
                 let row = ReflectionSuggestionRow {
                     id: uuid::Uuid::new_v4().to_string(),
                     project_id: project_id.to_string(),
@@ -294,5 +302,64 @@ mod tests {
             .reflect(&repo, "p", false, 100)
             .unwrap();
         assert!(plan.suggestions.is_empty());
+    }
+
+    #[test]
+    fn rejected_suggestions_do_not_resurrect() {
+        // Regression: `has_pending_suggestion` only blocked pending rows, so a
+        // rejected proposal came back on the very next `reflect --apply`.
+        let repo = setup();
+        for i in 1..=3 {
+            failure(&repo, &format!("f{i}"), "fts5", "sanitize query");
+        }
+        ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 100)
+            .unwrap();
+        let pending = repo.list_pending_suggestions("p").unwrap();
+        assert_eq!(pending.len(), 1);
+        repo.reject_suggestion(&pending[0].id, "p", 200).unwrap();
+
+        let again = ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 300)
+            .unwrap();
+        assert_eq!(again.created, 0, "rejected suggestion must not resurrect");
+        assert!(
+            repo.list_pending_suggestions("p").unwrap().is_empty(),
+            "no new pending proposal after rejection"
+        );
+    }
+
+    #[test]
+    fn confirmed_suggestions_are_not_reproposed() {
+        let repo = setup();
+        for i in 1..=3 {
+            failure(&repo, &format!("f{i}"), "fts5", "sanitize query");
+        }
+        ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 100)
+            .unwrap();
+        let pending = repo.list_pending_suggestions("p").unwrap();
+        repo.confirm_suggestion(&pending[0].id, "p", 200)
+            .unwrap();
+
+        let again = ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 300)
+            .unwrap();
+        assert_eq!(again.created, 0, "confirmed rule must not be re-proposed");
+    }
+
+    #[test]
+    fn group_with_only_empty_preventions_is_skipped() {
+        let repo = setup();
+        for i in 1..=3 {
+            failure(&repo, &format!("f{i}"), "fts5", "   ");
+        }
+        let plan = ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", false, 100)
+            .unwrap();
+        assert!(
+            plan.suggestions.is_empty(),
+            "whitespace-only preventions must not yield a rule"
+        );
     }
 }
