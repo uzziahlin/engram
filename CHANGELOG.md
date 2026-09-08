@@ -31,6 +31,7 @@ Iteration round 2 — feedback loop, write quality, ops, and engineering-debt pa
 - Semantic: the embedding model loads lazily on first use (the ~90 MB first-run download no longer blocks the MCP initialize handshake), and vectors are cached per project with write-time invalidation (was: full reload + deserialize on every query).
 
 ### Engineering debt
+- **MSRV bumped 1.75 → 1.85**: the dependency tree (candle/tokenizers/jieba → rand 0.9/0.10) now pulls edition-2024 manifests that cargo 1.75 cannot even parse under `--locked`; pinning dozens of transitive crates was judged unmaintainable. 1.85 is the first edition-2024-capable stable.
 - `repository.rs` split into `schema.rs` (DDL/migrations/tokenization), `graph.rs` (entities/relations/neighbors), `embeddings.rs` (vector store) — 4,600 lines down to 3,200 in the core file.
 - Composer dead code removed (`ContentType`/`detect_content_type`).
 - CI: new `test-features` job runs the jieba + semantic test suites.

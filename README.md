@@ -8,7 +8,7 @@ A local-first memory system that gives your AI coding assistant persistent engin
 
 [![CI](https://github.com/uzziahlin/engram/actions/workflows/ci.yml/badge.svg)](https://github.com/uzziahlin/engram/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
 [Installation](#-installation) · [Integration](#-integration) · [Tools Reference](#-tools-reference) · [Configuration](#-configuration) · [Architecture](#-architecture)
 
@@ -93,7 +93,7 @@ cargo build --release --features semantic   # opt-in: local embedding semantic s
 cargo build --release --features jieba      # opt-in: word-level Chinese tokenization (jieba dictionary, ~5 MB)
 ```
 
-Requires Rust 1.75+ and a C compiler (only for the bundled SQLite via `rusqlite`; the git layer is pure-Rust `gix`). No external databases or services needed.
+Requires Rust 1.85+ and a C compiler (only for the bundled SQLite via `rusqlite`; the git layer is pure-Rust `gix`). No external databases or services needed.
 
 ### Verify
 

@@ -2,7 +2,7 @@
 name = "engram"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "A local-first memory system for AI coding agents — persistent engineering knowledge via MCP"
 license = "MIT"
 readme = "README.md"
