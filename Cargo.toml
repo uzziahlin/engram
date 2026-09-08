@@ -37,7 +37,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
-dirs = "5"
+dirs = "6"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.24"
 candle-core = { version = "0.10.2", optional = true }
