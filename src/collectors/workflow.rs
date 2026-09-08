@@ -99,8 +99,11 @@ pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<WorkflowCollec
 
 /// `rel` is the repo-relative, forward-slashed path.
 fn classify(rel: &str, name_lower: &str) -> Option<Category> {
-    // CI pipelines.
-    if rel.contains(".github/workflows/") && name_has_ci_ext(rel) {
+    // CI pipelines. Root-level dirs must match without a leading slash —
+    // `contains("/.circleci/")` alone silently missed repo-root configs.
+    if (rel.starts_with(".github/workflows/") || rel.contains("/.github/workflows/"))
+        && name_has_ci_ext(rel)
+    {
         return Some(Category::Ci);
     }
     if matches!(
@@ -113,7 +116,10 @@ fn classify(rel: &str, name_lower: &str) -> Option<Category> {
     ) {
         return Some(Category::Ci);
     }
-    if rel.contains("/.circleci/") || rel.contains("/.buildkite/") {
+    if ["circleci", "buildkite"]
+        .iter()
+        .any(|dir| rel.starts_with(&format!(".{dir}/")) || rel.contains(&format!("/{dir}/")))
+    {
         return Some(Category::Ci);
     }
 
@@ -130,9 +136,7 @@ fn classify(rel: &str, name_lower: &str) -> Option<Category> {
     ) {
         return Some(Category::Script);
     }
-    if (rel.contains("/scripts/") || rel.starts_with("scripts/"))
-        && name_has_script_ext(rel)
-    {
+    if (rel.contains("/scripts/") || rel.starts_with("scripts/")) && name_has_script_ext(rel) {
         return Some(Category::Script);
     }
     if matches!(name_lower, "pyproject.toml" | "setup.py" | "tox.ini") {

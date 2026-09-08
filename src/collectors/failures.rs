@@ -122,7 +122,10 @@ fn is_fix_message(msg: &str) -> bool {
         "leak",
         "fix",
     ];
-    keywords.iter().any(|k| contains_word(&lower, k))
+    // Keyword fallback inspects the SUBJECT line only: commit bodies are
+    // prose ("docs: memory leak benchmark" has "leak" in the body context
+    // but is not a fix) and previously caused systematic false positives.
+    keywords.iter().any(|k| contains_word(first, k))
 }
 
 /// Case-folded whole-word containment: both sides of the match must be a
@@ -152,7 +155,7 @@ fn parse_changelog_fixed(path: &Path, root: &Path) -> Vec<ChangelogFixedEntry> {
         let t = line.trim();
         if t.starts_with('#') {
             let heading = t.trim_start_matches('#').trim().to_lowercase();
-            in_fixed = heading.contains("fix") || heading.contains("bug");
+            in_fixed = is_fixed_section_heading(&heading);
             if in_fixed {
                 section = t.trim_start_matches('#').trim().to_string();
             }
@@ -178,6 +181,19 @@ fn parse_changelog_fixed(path: &Path, root: &Path) -> Vec<ChangelogFixedEntry> {
         }
     }
     entries
+}
+
+/// Whether a CHANGELOG heading names a fixes section. Exact-word matching —
+/// the old `contains("fix") || contains("bug")` also matched "Prefix
+/// conventions" and "Debugging guide" and swallowed their bullets.
+fn is_fixed_section_heading(heading: &str) -> bool {
+    let lower = heading.to_lowercase();
+    lower.split_whitespace().any(|w| {
+        matches!(
+            w,
+            "fixed" | "fixes" | "bugfix" | "bugfixes" | "bug" | "bugs"
+        )
+    })
 }
 
 /// Heuristic: does a filename suggest it pins down an error/edge case?
@@ -207,6 +223,19 @@ mod tests {
         assert!(!is_fix_message("feat(auth): dispatch handler")); // no "patch" word
         assert!(!is_fix_message("chore: update debugger config")); // no "bug" word
         assert!(!is_fix_message("feat: fixture for tests")); // "fixture" is not "fix:"
+                                                             // Body prose must not trigger the keyword fallback — only subjects.
+        assert!(!is_fix_message(
+            "docs: benchmark notes\n\nmeasures memory leak rates"
+        ));
+    }
+
+    #[test]
+    fn changelog_section_headings_match_exact_words() {
+        assert!(is_fixed_section_heading("fixed"));
+        assert!(is_fixed_section_heading("bug fixes"));
+        assert!(is_fixed_section_heading("Bugfixes"));
+        assert!(!is_fixed_section_heading("prefix conventions"));
+        assert!(!is_fixed_section_heading("debugging guide"));
     }
 
     #[test]

@@ -25,10 +25,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_mcp_server() -> anyhow::Result<()> {
-    let config = Config::load().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config ({e}); using defaults");
-        Config::default()
-    });
+    // Broken config is fatal, not a silent default fallback: with the old
+    // warn-and-continue, the server wrote to the default database while the
+    // CLI (which fails hard on broken config) read another — user data got
+    // split across two stores. Failing fast on startup matches the CLI and
+    // surfaces the config error to the client immediately.
+    let config = Config::load()?;
     tracing::info!(
         "Configuration loaded from {:?}",
         config.storage.database_path

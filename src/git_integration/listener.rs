@@ -19,42 +19,59 @@ pub struct GitIntegration {
 
 impl GitIntegration {
     /// Open a git repository at the given path (searching upward for `.git`).
+    ///
+    /// The user's home directory is rejected: a dotfiles-managed `$HOME`
+    /// contains a `.git`, and `discover` walking up from `~` would silently
+    /// bind that repo — exposing unrelated commit history through
+    /// agent-callable tools. Project subdirectories still discover their
+    /// parent repo as before.
     pub fn new(repo_path: &Path) -> Result<Self> {
+        let canonical = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf());
+        if let Some(home) = dirs::home_dir() {
+            if let Ok(home_canon) = home.canonicalize() {
+                if canonical == home_canon {
+                    anyhow::bail!(
+                        "repo_path {:?} is the user's home directory — point at a \
+                         project directory instead",
+                        canonical
+                    );
+                }
+            }
+        }
+        if canonical == Path::new("/") {
+            anyhow::bail!("repo_path / (filesystem root) is not allowed");
+        }
         let repo = gix::discover(repo_path).context("failed to discover git repository")?;
         Ok(Self { repo })
     }
 
     /// Get the N most recent commits (newest first by commit time).
     ///
-    /// Unlike libgit2's `Sort::TIME`, gix's rev-walk is not chronological, so we
-    /// collect every reachable commit, sort by commit time descending, then
-    /// truncate. `ingest` is an explicit, non-hot-path command, so walking the
-    /// full history is acceptable. The loaded commit handles are KEPT after the
-    /// time pass and reused for the newest N — a separate second `find_commit`
-    /// pass (as this function once did) re-decoded the same objects.
+    /// The rev-walk runs with a commit-time-newest-first priority queue and
+    /// stops after `count` commits — only the N needed commit objects are
+    /// decoded. (The previous implementation collected and decoded *every*
+    /// reachable commit before sorting and truncating, which cost minutes on
+    /// 100k+-commit monorepos for a `count` as small as 1.)
     pub fn get_recent_commits(&self, count: usize) -> Result<Vec<CommitEvent>> {
+        use gix::revision::walk::Sorting;
+        use gix::traverse::commit::simple::CommitTimeOrder;
+
         let head_id = self.repo.head_id().context("failed to resolve HEAD")?;
 
-        // Phase 1: collect all reachable commit ids. The walk borrows the repo,
-        // so we finish it before touching commits individually below.
-        let mut ids = Vec::new();
-        for step in self.repo.rev_walk([head_id]).all()? {
-            ids.push(step?.id);
-        }
+        let walk = self
+            .repo
+            .rev_walk([head_id])
+            .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+            .all()?;
 
-        // Phase 2: load each commit once (needed for its time anyway), sort
-        // newest-first, and reuse the handles for Phase 3.
-        let mut commits: Vec<gix::Commit<'_>> = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Ok(c) = self.repo.find_commit(id) {
-                commits.push(c);
-            }
-        }
-        commits.sort_by_key(|c| std::cmp::Reverse(c.time().map(|t| t.seconds).unwrap_or(0)));
-
-        // Phase 3: build the event list for the newest `count` commits.
-        let mut events = Vec::with_capacity(commits.len().min(count));
-        for commit in commits.into_iter().take(count) {
+        let mut events = Vec::new();
+        for step in walk.take(count) {
+            let commit = self
+                .repo
+                .find_commit(step.context("rev walk step failed")?.id)
+                .context("failed to load commit")?;
             let ts = commit.time().ok().map(|t| t.seconds).unwrap_or(0);
 
             // gix's message_raw() keeps the trailing newline that git appends;
@@ -185,8 +202,7 @@ pub fn milestone_memories(
     // cap = usize::MAX so `commits` carries every hash — related_commits is
     // the dedup key for re-ingest, so dropping hashes would break idempotency.
     let event_refs: Vec<&CommitEvent> = events.iter().collect();
-    let milestones =
-        crate::collectors::git_collector::cluster_by_theme(&event_refs, usize::MAX);
+    let milestones = crate::collectors::git_collector::cluster_by_theme(&event_refs, usize::MAX);
     let now = chrono::Utc::now().timestamp();
 
     const MAX_FILES: usize = 50;
@@ -216,7 +232,10 @@ pub fn milestone_memories(
                 .collect();
 
             let first_subject = subjects.first().copied().unwrap_or("");
-            let mut summary = format!("{}: {} commits — {}", m.theme, m.commit_count, first_subject);
+            let mut summary = format!(
+                "{}: {} commits — {}",
+                m.theme, m.commit_count, first_subject
+            );
             if summary.chars().count() > MAX_SUMMARY {
                 summary = summary.chars().take(MAX_SUMMARY).collect();
             }

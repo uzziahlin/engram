@@ -131,16 +131,38 @@ pub(crate) fn cluster_by_theme(commits: &[&CommitEvent], cap: usize) -> Vec<GitM
         groups.entry(key).or_default().push(c);
     }
 
-    // Most populous themes first — the agent should see the big threads early.
-    // Type inferred from `groups` — an explicit annotation trips clippy's
-    // type_complexity, and the local usage is short enough to stay readable.
-    let mut sorted = groups.into_iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|(_, evs)| std::cmp::Reverse(evs.len()));
+    // Split each theme where consecutive commits are more than
+    /// MAX_THEME_GAP apart: without the window, years-apart commits merged
+    /// into one "milestone" whose count and file list meant nothing.
+    const MAX_THEME_GAP_SECS: i64 = 30 * 24 * 3600;
 
-    sorted
-        .into_iter()
-        .map(|((typ, scope), evs)| build_milestone(typ.as_str(), scope, &evs, cap))
-        .collect()
+    let mut out = Vec::new();
+    for ((typ, scope), mut evs) in groups {
+        // Newest first (input order is newest-first from the rev walk; sort
+        // explicitly so the invariant doesn't depend on the caller).
+        evs.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        let mut run: Vec<&CommitEvent> = Vec::new();
+        let flush = |run: &mut Vec<&CommitEvent>, out: &mut Vec<GitMilestone>| {
+            if !run.is_empty() {
+                out.push(build_milestone(typ.as_str(), scope.clone(), run, cap));
+            }
+            run.clear();
+        };
+        let mut prev_ts: Option<i64> = None;
+        for e in evs {
+            if let Some(p) = prev_ts {
+                if p - e.timestamp > MAX_THEME_GAP_SECS {
+                    flush(&mut run, &mut out);
+                }
+            }
+            run.push(e);
+            prev_ts = Some(e.timestamp);
+        }
+        flush(&mut run, &mut out);
+    }
+    // Most populous themes first — the agent should see the big threads early.
+    out.sort_by_key(|m| std::cmp::Reverse(m.commit_count));
+    out
 }
 
 fn build_milestone(
@@ -154,10 +176,15 @@ fn build_milestone(
     let mut ts_min = i64::MAX;
     let mut ts_max = 0i64;
     let mut commits = Vec::new();
+    // Cap the file list: a huge theme's evidence JSON previously embedded
+    // thousands of paths (overflow is still counted via commit_count).
+    const MAX_FILES: usize = 50;
 
     for e in evs {
         for f in &e.files_changed {
-            files.insert(f.as_str());
+            if files.len() < MAX_FILES {
+                files.insert(f.as_str());
+            }
         }
         if looks_like_migration(&e.message) {
             has_breaking = true;
@@ -196,6 +223,14 @@ fn format_theme(typ: &str, scope: Option<&str>) -> String {
 /// Hand-rolled rather than regex to avoid pulling in a regex dependency —
 /// the grammar is tiny and this keeps engram's dep set minimal.
 fn parse_conventional(msg: &str) -> (Option<&str>, Option<&str>) {
+    /// Known Conventional-Commit types. Without the whitelist any
+    /// lowercase-word-before-a-colon became a "type" ("http: fix url",
+    /// "wip: stuff"), exploding the theme count with junk buckets.
+    const KNOWN_TYPES: &[&str] = &[
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert", "hotfix", "bugfix", "wip", "release", "merge",
+    ];
+
     let first = match msg.lines().next() {
         Some(l) => l.trim(),
         None => return (None, None),
@@ -212,13 +247,22 @@ fn parse_conventional(msg: &str) -> (Option<&str>, Option<&str>) {
     }
 
     if let Some(open) = head.find('(') {
-        let typ = &head[..open];
+        // Unclosed paren (e.g. "fix(auth") is malformed — treat as no-scope
+        // rather than leaking "fix(auth" into the theme key.
         if let Some(close) = head[open..].find(')') {
-            let scope = &head[open + 1..open + close];
-            return (Some(typ), Some(scope));
+            let typ = &head[..open];
+            if KNOWN_TYPES.contains(&typ) {
+                let scope = &head[open + 1..open + close];
+                return (Some(typ), Some(scope));
+            }
+            return (None, None);
         }
+        return (None, None);
     }
-    (Some(head), None)
+    if KNOWN_TYPES.contains(&head) {
+        return (Some(head), None);
+    }
+    (None, None)
 }
 
 /// Heuristic: does this commit message describe a migration or breaking
@@ -234,10 +278,10 @@ fn looks_like_migration(message: &str) -> bool {
             return true;
         }
     }
-    lower.contains("migration")
-        || lower.contains("migrate")
-        || lower.contains("rewrite")
-        || lower.contains("deprecat")
+    // "rewrite" alone was removed: "refactor: rewrite parser loop" is not a
+    // breaking change — only the explicit `rewrite!` / "rewrite:" conventional
+    // breaking markers count.
+    lower.contains("migration") || lower.contains("migrate") || lower.contains("deprecat")
 }
 
 #[cfg(test)]
@@ -263,6 +307,51 @@ mod tests {
         assert_eq!(parse_conventional("Update the README"), (None, None));
         assert_eq!(parse_conventional("Merge branch x"), (None, None));
         assert_eq!(parse_conventional(""), (None, None));
+    }
+
+    #[test]
+    fn cluster_splits_themes_across_time_gaps() {
+        // Two `fix` clusters 2 years apart must become TWO milestones —
+        // the old (type, scope)-only key merged years of history into one.
+        let mk = |ts: i64, subject: &str| crate::git_integration::CommitEvent {
+            commit_hash: format!("h{ts}"),
+            message: subject.into(),
+            files_changed: vec![],
+            timestamp: ts,
+        };
+        let y = 365 * 24 * 3600;
+        let events = [
+            mk(0, "fix: early crash"),
+            mk(3600, "fix: early leak"),
+            mk(2 * y, "fix: modern panic"),
+            mk(2 * y + 3600, "fix: modern race"),
+        ];
+        let refs: Vec<&_> = events.iter().collect();
+        let milestones = cluster_by_theme(&refs, 15);
+        assert_eq!(milestones.len(), 2, "gap > 30 days must split the theme");
+        assert_eq!(milestones[0].commit_count, 2);
+        assert_eq!(milestones[1].commit_count, 2);
+        assert!(milestones[0].first_ts > milestones[1].first_ts);
+    }
+
+    #[test]
+    fn parse_conventional_whitelist_rejects_junk_heads() {
+        // Arbitrary word-before-colon is not a conventional type.
+        assert_eq!(parse_conventional("http: fix url"), (None, None));
+        assert_eq!(parse_conventional("v2: the big release"), (None, None));
+        // Unclosed paren is malformed, not a scoped type.
+        assert_eq!(parse_conventional("fix(auth: thing"), (None, None));
+        // Real types still parse.
+        let (t, s) = parse_conventional("fix(auth): token refresh");
+        assert_eq!(t, Some("fix"));
+        assert_eq!(s, Some("auth"));
+    }
+
+    #[test]
+    fn rewrite_alone_is_not_breaking() {
+        assert!(!looks_like_migration("refactor: rewrite parser loop"));
+        assert!(looks_like_migration("refactor!: rewrite parser loop"));
+        assert!(looks_like_migration("feat: migrate storage to SQLite"));
     }
 
     #[test]

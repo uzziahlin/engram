@@ -271,11 +271,20 @@ impl EmbeddingService {
         Ok(report)
     }
 
-    /// Semantic fusion: when an embedder is present, blend vector top-K with
-    /// the BM25 candidates via RRF. Vector-only hits are materialized so they
-    /// can surface even when BM25 missed them entirely. Returns `bm25`
-    /// unchanged when the embedder is absent or embedding fails.
+    /// Semantic fusion: blend vector top-K with the BM25 candidates via RRF.
+    /// Vector-only hits are materialized so they can surface even when BM25
+    /// missed them entirely.
+    ///
+    /// Two invariants fixed in the 2026-09 review:
+    /// - the caller's explicit filters (`memory_type`/`tags`/`before`) apply
+    ///   to vector-only candidates too — the vector path must not bypass them;
+    /// - the cosine score is injected into `relevance_score` (max with the
+    ///   normalized BM25 score) instead of being discarded, so a strong
+    ///   semantic match actually influences the final ranking.
+    ///
+    /// Returns `bm25` unchanged when the embedder is absent or embedding fails.
     #[cfg(feature = "semantic")]
+    #[allow(clippy::too_many_arguments)]
     pub fn fuse(
         &self,
         repo: &MemoryRepository,
@@ -284,39 +293,79 @@ impl EmbeddingService {
         bm25: Vec<SearchResult>,
         top_k: usize,
         rrf_k: f32,
+        memory_type: Option<&str>,
+        tags: &[String],
+        before: Option<i64>,
     ) -> Result<Vec<SearchResult>> {
-        if let Some(e) = self.embedder.as_ref() {
-            if let Ok(mut qv) = e.embed(&[query]) {
-                if !qv.is_empty() {
-                    let qvec = qv.remove(0);
-                    let loaded = repo.load_active_embeddings(project_id, e.model_id())?;
-                    let type_of: std::collections::HashMap<String, String> = loaded
-                        .iter()
-                        .map(|(id, ty, _)| (id.clone(), ty.clone()))
-                        .collect();
-                    let cands: Vec<(String, Vec<f32>)> =
-                        loaded.into_iter().map(|(id, _, v)| (id, v)).collect();
-                    let vec_ids = crate::retrieval::vector::top_k_cosine(&qvec, &cands, top_k);
-                    let bm25_ids: Vec<String> = bm25.iter().map(|r| r.id.clone()).collect();
-                    let fused = crate::retrieval::fusion::rrf_fuse(&[bm25_ids, vec_ids], rrf_k);
-                    let mut by_id: std::collections::HashMap<String, SearchResult> =
-                        bm25.into_iter().map(|r| (r.id.clone(), r)).collect();
-                    let missing: Vec<(String, String)> = fused
-                        .iter()
-                        .filter(|id| !by_id.contains_key(*id))
-                        .filter_map(|id| type_of.get(id).map(|ty| (ty.clone(), id.clone())))
-                        .collect();
-                    for sr in crate::retrieval::bm25::BM25Retriever::fetch_by_ids(repo, &missing)? {
-                        by_id.entry(sr.id.clone()).or_insert(sr);
-                    }
-                    return Ok(fused
-                        .into_iter()
-                        .filter_map(|id| by_id.remove(&id))
-                        .collect());
-                }
+        use std::collections::HashMap;
+
+        let Some(embedder) = self.embedder.as_ref() else {
+            return Ok(bm25);
+        };
+        let query_vec = match embedder.embed(&[query]) {
+            Ok(mut v) if !v.is_empty() => v.remove(0),
+            Ok(_) => return Ok(bm25),
+            Err(err) => {
+                // Degradation must be observable, not a silent BM25-only path.
+                tracing::warn!("semantic query embed failed, BM25-only fallback: {err}");
+                return Ok(bm25);
+            }
+        };
+
+        let loaded = repo.load_active_embeddings(project_id, embedder.model_id())?;
+        if loaded.is_empty() {
+            // Likely a model_id change stranded all vectors: tell the user
+            // how to recover instead of silently degrading to BM25.
+            tracing::warn!(
+                "semantic active but project {project_id:?} has no embeddings for model {}; \
+                 run `engram reindex` to (re)build them",
+                embedder.model_id()
+            );
+            return Ok(bm25);
+        }
+        let type_of: HashMap<String, String> = loaded
+            .iter()
+            .map(|(id, ty, _)| (id.clone(), ty.clone()))
+            .collect();
+        let cands: Vec<(String, Vec<f32>)> = loaded.into_iter().map(|(id, _, v)| (id, v)).collect();
+        let cosine_of: HashMap<String, f32> =
+            crate::retrieval::vector::top_k_cosine(&query_vec, &cands, top_k)
+                .into_iter()
+                .collect();
+
+        // Materialize vector-only candidates that survive the caller's
+        // explicit filters, exactly like the BM25 side did.
+        let bm25_ids: Vec<String> = bm25.iter().map(|r| r.id.clone()).collect();
+        let mut by_id: HashMap<String, SearchResult> =
+            bm25.into_iter().map(|r| (r.id.clone(), r)).collect();
+        let missing: Vec<(String, String)> = cosine_of
+            .keys()
+            .filter(|id| !by_id.contains_key(*id))
+            .filter_map(|id| type_of.get(id).map(|ty| (ty.clone(), id.clone())))
+            .collect();
+        for sr in crate::retrieval::bm25::BM25Retriever::fetch_by_ids(repo, &missing, project_id)? {
+            let type_ok = memory_type.map_or(true, |mt| sr.memory_type == mt);
+            let tags_ok = tags.is_empty() || sr.tags.iter().any(|t| tags.contains(t));
+            let before_ok = before.map_or(true, |b| sr.created_at < b);
+            if type_ok && tags_ok && before_ok {
+                by_id.entry(sr.id.clone()).or_insert(sr);
             }
         }
-        Ok(bm25)
+
+        // Inject cosine into relevance: take the max with the normalized BM25
+        // score so either signal at full strength carries the result.
+        for (id, cosine) in &cosine_of {
+            if let Some(r) = by_id.get_mut(id) {
+                r.relevance_score = r.relevance_score.max(cosine.clamp(0.0, 1.0));
+            }
+        }
+
+        let vec_ids: Vec<String> = cosine_of.into_keys().collect();
+        let fused = crate::retrieval::fusion::rrf_fuse(&[bm25_ids, vec_ids], rrf_k);
+        Ok(fused
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect())
     }
 
     #[cfg(feature = "semantic")]

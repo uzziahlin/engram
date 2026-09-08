@@ -100,6 +100,9 @@ pub struct CollectOptions {
     /// Cap on commits listed inside a single themed milestone — keeps each
     /// milestone digestible; overflow commits are still counted.
     pub max_commits_per_milestone: usize,
+    /// `[security] allowed_roots` from config — when non-empty, `repo_path`
+    /// must fall under one of these roots (see src/path_guard.rs).
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 impl Default for CollectOptions {
@@ -109,6 +112,7 @@ impl Default for CollectOptions {
             ingested_commit_hashes: HashSet::new(),
             max_file_bytes: 16_000,
             max_commits_per_milestone: 15,
+            allowed_roots: Vec::new(),
         }
     }
 }
@@ -156,6 +160,11 @@ pub fn collect(
     dimensions: &[Dimension],
     opts: &CollectOptions,
 ) -> Result<CollectedSources> {
+    // Central guard: home dir / FS root / outside-allowlist paths are
+    // rejected before any file is read (see src/path_guard.rs).
+    let repo_path = crate::path_guard::validate_repo_path(repo_path, &opts.allowed_roots)?;
+    let repo_path = repo_path.as_path();
+
     let mut summary = CollectionSummary::default();
     let mut git = None;
     let mut decisions = None;
@@ -169,8 +178,7 @@ pub fn collect(
         .iter()
         .any(|d| matches!(d, Dimension::Git | Dimension::Failures))
     {
-        match GitIntegration::new(repo_path).and_then(|g| g.get_recent_commits(opts.max_commits))
-        {
+        match GitIntegration::new(repo_path).and_then(|g| g.get_recent_commits(opts.max_commits)) {
             Ok(events) => Some(events),
             Err(e) => {
                 summary.notes.push(format!("git history unavailable: {e}"));
@@ -205,17 +213,18 @@ pub fn collect(
                     .notes
                     .push(format!("decisions dimension skipped: {e}")),
             },
-            Dimension::Failures => match failures::collect(repo_path, shared_events.as_deref(), opts)
-            {
-                Ok(c) => {
-                    let items = c.item_count();
-                    summary.failure_items = items;
-                    failures = Some(c);
+            Dimension::Failures => {
+                match failures::collect(repo_path, shared_events.as_deref(), opts) {
+                    Ok(c) => {
+                        let items = c.item_count();
+                        summary.failure_items = items;
+                        failures = Some(c);
+                    }
+                    Err(e) => summary
+                        .notes
+                        .push(format!("failures dimension skipped: {e}")),
                 }
-                Err(e) => summary
-                    .notes
-                    .push(format!("failures dimension skipped: {e}")),
-            },
+            }
             Dimension::Workflow => match workflow::collect(repo_path, opts) {
                 Ok(c) => {
                     let items = c.item_count();
@@ -269,19 +278,78 @@ const IGNORED_DIRS: &[&str] = &[
     "vendor",
 ];
 
+/// Hard caps bounding a single collection walk. A hostile or mistyped
+/// `repo_path` (e.g. `~/Library`, reachable via prompt injection through the
+/// MCP `collect_sources` tool) must not turn into an unbounded disk scan.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkBudget {
+    /// Total entries (directories + files) visited before the walk stops.
+    pub max_entries: usize,
+    /// Maximum directory nesting depth.
+    pub max_depth: usize,
+    /// Soft wall-clock deadline; checked once per directory.
+    pub max_duration: std::time::Duration,
+}
+
+impl Default for WalkBudget {
+    fn default() -> Self {
+        Self {
+            max_entries: 50_000,
+            max_depth: 48,
+            max_duration: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
 /// Walk a directory tree yielding every file path not under an ignored dir.
 /// Symlinks and unreadable entries are skipped rather than fatal.
+///
+/// The walk is capped by `budget` (stops silently with a warning — a partial
+/// result beats an OOM) and deterministic: `read_dir` order is arbitrary, so
+/// entries are sorted by name and results are reproducible across runs
+/// (previously which files filled the per-collector caps depended on FS order).
 pub fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    walk_inner(root, &mut out);
+    let budget = WalkBudget::default();
+    let deadline = std::time::Instant::now() + budget.max_duration;
+    let mut visited = 0usize;
+    let stopped = walk_inner(root, &mut out, &budget, deadline, &mut visited, 0);
+    if let Some(reason) = stopped {
+        tracing::warn!(
+            "collection walk of {} stopped early ({reason}); returning {} files",
+            root.display(),
+            out.len()
+        );
+    }
     out
 }
 
-fn walk_inner(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Returns Some(reason) when the walk was cut short by the budget.
+fn walk_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    budget: &WalkBudget,
+    deadline: std::time::Instant,
+    visited: &mut usize,
+    depth: usize,
+) -> Option<&'static str> {
+    if depth > budget.max_depth {
+        return Some("max depth exceeded");
+    }
+    if std::time::Instant::now() > deadline {
+        return Some("time budget exceeded");
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return None;
     };
-    for entry in entries.flatten() {
+    // Deterministic order regardless of filesystem enumeration order.
+    let mut names: Vec<std::fs::DirEntry> = entries.flatten().collect();
+    names.sort_by_key(|a| a.file_name());
+    for entry in names {
+        *visited += 1;
+        if *visited > budget.max_entries {
+            return Some("entry budget exceeded");
+        }
         let path = entry.path();
         let Ok(ft) = entry.file_type() else {
             continue;
@@ -292,22 +360,38 @@ fn walk_inner(dir: &Path, out: &mut Vec<PathBuf>) {
                     continue;
                 }
             }
-            walk_inner(&path, out);
+            // NOTE: symlinks are skipped by the is_dir()/is_file() checks on
+            // entry.file_type() (which does not follow links) — a symlink is
+            // neither, so it never descends nor reads.
+            if let Some(reason) = walk_inner(&path, out, budget, deadline, visited, depth + 1) {
+                return Some(reason);
+            }
         } else if ft.is_file() {
             out.push(path);
         }
     }
+    None
 }
 
 /// Read a file as UTF-8 text, truncating to `max_bytes` with a marker if it
 /// exceeds the cap. Lossy decoding keeps collection robust against binary
 /// files that happen to match an extension filter.
+///
+/// Streams with `File::take(max_bytes + 1)`: only the cap plus one byte is
+/// ever read, so a multi-GB file cannot OOM the process before truncation
+/// (the old `fs::read` slurped the whole file first).
 pub fn read_bounded(path: &Path, max_bytes: usize) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024) + 1);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
     if bytes.len() <= max_bytes {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     } else {
-        let mut s = String::from_utf8_lossy(&bytes[..max_bytes]).into_owned();
+        bytes.truncate(max_bytes);
+        let mut s = String::from_utf8_lossy(&bytes).into_owned();
         s.push_str("\n…[truncated]");
         Ok(s)
     }
@@ -324,12 +408,21 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// Streams at most `max_bytes + 1` from the file — a giant artifact cannot
+    /// OOM the process before truncation applies. `bytes` reports the capped
+    /// read length (the file's true size is deliberately not stat'd/kept).
     pub fn from_path(path: &Path, root: &Path, max_bytes: usize) -> Result<Self> {
-        let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        use std::io::Read;
+        let file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+        let mut raw = Vec::with_capacity(max_bytes.min(64 * 1024) + 1);
+        file.take(max_bytes as u64 + 1)
+            .read_to_end(&mut raw)
+            .with_context(|| format!("read {}", path.display()))?;
+        let truncated = raw.len() > max_bytes;
         let bytes = raw.len();
-        let truncated = bytes > max_bytes;
         let content = if truncated {
-            let mut s = String::from_utf8_lossy(&raw[..max_bytes]).into_owned();
+            raw.truncate(max_bytes);
+            let mut s = String::from_utf8_lossy(&raw).into_owned();
             s.push_str("\n…[truncated]");
             s
         } else {

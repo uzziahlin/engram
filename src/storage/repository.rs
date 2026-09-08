@@ -175,7 +175,49 @@ impl MemoryKind {
 /// migration runs on a fresh DB — the CREATE statements already encode it).
 /// Bump this whenever a new migration is appended to
 /// [`MemoryRepository::migrations`].
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
+
+/// DDL for the four FTS5 shadow tables. Shared by `initialize_schema` (fresh
+/// DBs) and the v2 rebuild migration so the two cannot drift.
+const FTS_TABLES_DDL: &str = "
+    CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memories_fts USING fts5(
+        memory_id UNINDEXED,
+        summary,
+        content,
+        files_touched,
+        tags,
+        tokenize='porter unicode61'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS decision_memories_fts USING fts5(
+        memory_id UNINDEXED,
+        title,
+        context,
+        rationale,
+        tradeoffs,
+        tags,
+        tokenize='porter unicode61'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS failure_memories_fts USING fts5(
+        memory_id UNINDEXED,
+        incident,
+        root_cause,
+        fix,
+        prevention,
+        tags,
+        tokenize='porter unicode61'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS procedural_memories_fts USING fts5(
+        memory_id UNINDEXED,
+        workflow_name,
+        steps,
+        related_tools,
+        tags,
+        tokenize='porter unicode61'
+    );
+";
 
 /// A single registered migration: receives the repository and either succeeds
 /// or returns an error. Factored into a type alias to keep `migrations()`'s
@@ -304,45 +346,7 @@ impl MemoryRepository {
         )?;
 
         // --- FTS5 virtual tables ---
-        tx.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memories_fts USING fts5(
-                memory_id UNINDEXED,
-                summary,
-                content,
-                files_touched,
-                tags,
-                tokenize='porter unicode61'
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS decision_memories_fts USING fts5(
-                memory_id UNINDEXED,
-                title,
-                context,
-                rationale,
-                tradeoffs,
-                tags,
-                tokenize='porter unicode61'
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS failure_memories_fts USING fts5(
-                memory_id UNINDEXED,
-                incident,
-                root_cause,
-                fix,
-                prevention,
-                tags,
-                tokenize='porter unicode61'
-            );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS procedural_memories_fts USING fts5(
-                memory_id UNINDEXED,
-                workflow_name,
-                steps,
-                related_tools,
-                tags,
-                tokenize='porter unicode61'
-            );",
-        )?;
+        tx.execute_batch(FTS_TABLES_DDL)?;
 
         // --- Entity + Graph tables ---
         tx.execute_batch(
@@ -371,6 +375,21 @@ impl MemoryRepository {
         )?;
 
         // --- Indexes ---
+        // Historical de-dup (ONE-TIME): legacy DBs can carry duplicate graph
+        // relations / pending suggestions that would make the unique indexes
+        // below fail. These probes are skipped once the indexes exist — the
+        // old unconditional DELETE/UPDATE pair ran two full-table writes on
+        // EVERY `initialize_schema` call (i.e. every CLI command).
+        if !Self::index_exists(&tx, "idx_graph_unique_relation")? {
+            tx.execute(
+                "DELETE FROM graph_relations
+                 WHERE rowid NOT IN (
+                     SELECT MIN(rowid) FROM graph_relations
+                     GROUP BY from_entity, to_entity, relation_type
+                 )",
+                [],
+            )?;
+        }
         tx.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project_id);
             CREATE INDEX IF NOT EXISTS idx_graph_project ON graph_relations(project_id);
@@ -379,14 +398,6 @@ impl MemoryRepository {
             CREATE INDEX IF NOT EXISTS idx_episodic_project_time ON episodic_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_decision_project_time ON decision_memories(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_procedural_project_time ON procedural_memories(project_id, created_at DESC);
-            -- Historical de-dup (idempotent): legacy DBs can carry duplicate
-            -- relations (the unique index below postdates them). Collapse them
-            -- first, or CREATE UNIQUE INDEX fails and takes startup down with it.
-            DELETE FROM graph_relations
-             WHERE rowid NOT IN (
-                 SELECT MIN(rowid) FROM graph_relations
-                 GROUP BY from_entity, to_entity, relation_type
-             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_unique_relation ON graph_relations(from_entity, to_entity, relation_type);
             CREATE INDEX IF NOT EXISTS idx_failure_project_time ON failure_memories(project_id, created_at DESC);",
         )?;
@@ -449,22 +460,28 @@ impl MemoryRepository {
                 resolved_at             INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_reflection_pending
-                ON reflection_suggestions(project_id, status, created_at DESC);
-            -- Historical de-dup (idempotent): before the partial unique index below
-            -- can be created on a pre-existing DB, collapse duplicate pending rows
-            -- per (project_id, pattern_tag) to a single survivor (earliest inserted,
-            -- via MIN(rowid)) and reject the rest. Re-runnable: each group ends up
-            -- with exactly one pending row, so subsequent runs update nothing.
-            UPDATE reflection_suggestions
-                SET status = 'rejected',
-                    resolved_at = CAST(strftime('%s','now') AS INTEGER)
-                WHERE status = 'pending'
-                  AND rowid NOT IN (
-                      SELECT MIN(rowid) FROM reflection_suggestions
-                      WHERE status = 'pending'
-                      GROUP BY project_id, pattern_tag
-                  );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_reflection_pending_unique
+                ON reflection_suggestions(project_id, status, created_at DESC);",
+        )?;
+
+        // Same one-time guard as the graph dedup above — see its comment.
+        // Legacy DBs can carry duplicate pending rows per (project_id,
+        // pattern_tag), which would make the partial unique index below fail.
+        if !Self::index_exists(&tx, "idx_reflection_pending_unique")? {
+            tx.execute(
+                "UPDATE reflection_suggestions
+                 SET status = 'rejected',
+                     resolved_at = CAST(strftime('%s','now') AS INTEGER)
+                 WHERE status = 'pending'
+                   AND rowid NOT IN (
+                       SELECT MIN(rowid) FROM reflection_suggestions
+                       WHERE status = 'pending'
+                       GROUP BY project_id, pattern_tag
+                   )",
+                [],
+            )?;
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reflection_pending_unique
                 ON reflection_suggestions(project_id, pattern_tag)
                 WHERE status = 'pending';",
         )?;
@@ -479,11 +496,14 @@ impl MemoryRepository {
         Ok(())
     }
 
-    /// Preprocess text for FTS5 by inserting spaces between consecutive CJK characters.
-    /// FTS5 unicode61 tokenizer treats consecutive CJK characters as a single token,
-    /// which prevents substring matching. By inserting spaces, each CJK character
-    /// becomes its own token, enabling character-level matching.
-    /// Used for both indexing (FTS5 INSERT) and querying (FTS5 MATCH).
+    /// Preprocess text for FTS5 so CJK content is searchable.
+    ///
+    /// The unicode61 tokenizer treats consecutive CJK characters AND any
+    /// adjacent alphanumeric run as a single token, so `修复auth模块` or
+    /// `用Rust写` index as one opaque token that no sub-query can match.
+    /// Inserting spaces at every script boundary (CJK↔CJK and CJK↔alnum)
+    /// makes each CJK character and each latin word its own token.
+    /// Used for both indexing (FTS5 INSERT) and querying (FTS MATCH).
     fn preprocess_cjk(text: &str) -> String {
         let has_cjk = text.chars().any(is_cjk_character);
         if !has_cjk {
@@ -492,19 +512,26 @@ impl MemoryRepository {
 
         // Estimate capacity: original length + space for CJK separators (worst case ~50% extra)
         let mut result = String::with_capacity(text.len() + text.len() / 2);
-        let mut prev_was_cjk = false;
+        let mut prev_cjk = false;
+        let mut prev_alnum = false;
 
         for ch in text.chars() {
-            if is_cjk_character(ch) {
-                if prev_was_cjk {
-                    result.push(' ');
-                }
-                result.push(ch);
-                prev_was_cjk = true;
-            } else {
-                result.push(ch);
-                prev_was_cjk = false;
+            let is_cjk = is_cjk_character(ch);
+            // Non-CJK alphanumeric (latin/greek/digits…): a token character on
+            // the other side of a CJK boundary.
+            let is_alnum = !is_cjk && ch.is_alphanumeric();
+            let needs_split = match (prev_cjk, prev_alnum, is_cjk, is_alnum) {
+                // CJK after any token character, or a token character after
+                // CJK — the two scripts must not fuse into one token.
+                (true, _, true, _) | (true, _, _, true) | (_, true, true, _) => true,
+                _ => false,
+            };
+            if needs_split {
+                result.push(' ');
             }
+            result.push(ch);
+            prev_cjk = is_cjk;
+            prev_alnum = is_alnum;
         }
 
         result
@@ -512,15 +539,20 @@ impl MemoryRepository {
 
     /// Sanitize a user query for safe use in FTS5 MATCH expressions.
     /// Splits the query into tokens, wraps each in double quotes (to escape
-    /// FTS5 operators like AND/OR/NOT), and joins them with ` OR` so that
-    /// each token is matched independently instead of as an exact phrase.
+    /// FTS5 operators like AND/OR/NOT), and joins them with `AND` or `OR` so
+    /// that each token is matched independently instead of as an exact phrase.
     /// Must be called AFTER preprocess_cjk for CJK support.
-    fn sanitize_fts_query(query: &str) -> String {
+    ///
+    /// `require_all = true` produces an AND query (all tokens must match —
+    /// precision); `false` produces OR (any token matches — recall). The
+    /// search paths try AND first and fall back to OR on an empty result.
+    fn sanitize_fts_query(query: &str, require_all: bool) -> String {
         let processed = Self::preprocess_cjk(query);
         let tokens: Vec<&str> = processed.split_whitespace().collect();
         if tokens.is_empty() {
             return "\"\"".to_string();
         }
+        let joiner = if require_all { " AND " } else { " OR " };
         tokens
             .into_iter()
             .map(|t| {
@@ -528,7 +560,16 @@ impl MemoryRepository {
                 format!("\"{}\"", escaped)
             })
             .collect::<Vec<_>>()
-            .join(" OR ")
+            .join(joiner)
+    }
+
+    /// Serialize a list column (tags/files/steps…) for FTS indexing with the
+    /// same CJK preprocessing as text columns. Without it the JSON blob
+    /// `["认证","auth"]` indexes CJK tags as one opaque token that no
+    /// split-character query can ever match — an index/query asymmetry that
+    /// silently made Chinese tags and file names unsearchable.
+    fn fts_json<T: serde::Serialize>(v: &T) -> Result<String> {
+        Ok(Self::preprocess_cjk(&serde_json::to_string(v)?))
     }
 
     /// Migrate FTS5 tables to include tags column.
@@ -615,66 +656,24 @@ impl MemoryRepository {
         let mut written = 0usize;
 
         {
+            // Streams row-by-row instead of materializing the whole table:
+            // the old collect() peaked at the full text of every memory.
             let mut stmt = tx.prepare(
-                "SELECT id, summary, content, files_touched, tags FROM episodic_memories",
+                "SELECT rowid, id, summary, content, files_touched, tags FROM episodic_memories",
             )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
+            let mut rows = stmt.query([])?;
             let mut ins = tx.prepare(
-                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
-                 VALUES (?1,?2,?3,?4,?5)",
-            )?;
-            for (id, summary, content, files, tags) in rows {
-                ins.execute(params![
-                    id,
-                    Self::preprocess_cjk(&summary),
-                    Self::preprocess_cjk(&content),
-                    files,
-                    tags
-                ])?;
-                written += 1;
-            }
-        }
-
-        {
-            let mut stmt = tx.prepare(
-                "SELECT id, title, context, rationale, tradeoffs, tags FROM decision_memories",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
-            let mut ins = tx.prepare(
-                "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags)
+                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags, rowid)
                  VALUES (?1,?2,?3,?4,?5,?6)",
             )?;
-            for (id, title, context, rationale, tradeoffs, tags) in rows {
+            while let Some(row) = rows.next()? {
                 ins.execute(params![
-                    id,
-                    Self::preprocess_cjk(&title),
-                    Self::preprocess_cjk(&context),
-                    Self::preprocess_cjk(&rationale),
-                    Self::preprocess_cjk(&tradeoffs),
-                    tags
+                    row.get::<_, String>(1)?,
+                    Self::preprocess_cjk(&row.get::<_, String>(2)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(3)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(4)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(5)?),
+                    row.get::<_, i64>(0)?,
                 ])?;
                 written += 1;
             }
@@ -682,65 +681,67 @@ impl MemoryRepository {
 
         {
             let mut stmt = tx.prepare(
-                "SELECT id, incident, root_cause, fix, prevention, tags FROM failure_memories",
+                "SELECT rowid, id, title, context, rationale, tradeoffs, tags FROM decision_memories",
             )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
+            let mut rows = stmt.query([])?;
             let mut ins = tx.prepare(
-                "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags)
+                "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags, rowid)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            while let Some(row) = rows.next()? {
+                ins.execute(params![
+                    row.get::<_, String>(1)?,
+                    Self::preprocess_cjk(&row.get::<_, String>(2)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(3)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(4)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(5)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(6)?),
+                    row.get::<_, i64>(0)?,
+                ])?;
+                written += 1;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, id, incident, root_cause, fix, prevention, tags FROM failure_memories",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut ins = tx.prepare(
+                "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags, rowid)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            while let Some(row) = rows.next()? {
+                ins.execute(params![
+                    row.get::<_, String>(1)?,
+                    Self::preprocess_cjk(&row.get::<_, String>(2)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(3)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(4)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(5)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(6)?),
+                    row.get::<_, i64>(0)?,
+                ])?;
+                written += 1;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, id, workflow_name, steps, related_tools, tags FROM procedural_memories",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut ins = tx.prepare(
+                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags, rowid)
                  VALUES (?1,?2,?3,?4,?5,?6)",
             )?;
-            for (id, incident, root_cause, fix, prevention, tags) in rows {
+            while let Some(row) = rows.next()? {
                 ins.execute(params![
-                    id,
-                    Self::preprocess_cjk(&incident),
-                    Self::preprocess_cjk(&root_cause),
-                    Self::preprocess_cjk(&fix),
-                    Self::preprocess_cjk(&prevention),
-                    tags
-                ])?;
-                written += 1;
-            }
-        }
-
-        {
-            let mut stmt = tx.prepare(
-                "SELECT id, workflow_name, steps, related_tools, tags FROM procedural_memories",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            drop(stmt);
-            let mut ins = tx.prepare(
-                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags)
-                 VALUES (?1,?2,?3,?4,?5)",
-            )?;
-            for (id, workflow_name, steps, related_tools, tags) in rows {
-                ins.execute(params![
-                    id,
-                    Self::preprocess_cjk(&workflow_name),
-                    steps,
-                    related_tools,
-                    tags
+                    row.get::<_, String>(1)?,
+                    Self::preprocess_cjk(&row.get::<_, String>(2)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(3)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(4)?),
+                    Self::preprocess_cjk(&row.get::<_, String>(5)?),
+                    row.get::<_, i64>(0)?,
                 ])?;
                 written += 1;
             }
@@ -793,12 +794,60 @@ impl MemoryRepository {
     /// `CURRENT_SCHEMA_VERSION`; the FTS rebuild only fires when the `tags`
     /// column is actually missing.
     fn migrations() -> &'static [(i32, MigrationFn)] {
-        // Empty for now: CURRENT_SCHEMA_VERSION == 1 corresponds to the schema
-        // as built by initialize_schema. Append future migrations here, e.g.:
-        //     static REG: [(i32, MigrationFn); 1] =
-        //         [(2, Self::migrate_add_something)];
-        //     &REG
-        &[]
+        static REG: [(i32, MigrationFn); 2] = [
+            (2, MemoryRepository::migrate_v2_fts_rowid),
+            (3, MemoryRepository::migrate_v3_reflection_rearm),
+        ];
+        &REG
+    }
+
+    /// v3 — reflection re-arm bookkeeping: `rejected_occurrence_count`
+    /// records how much evidence had accumulated when a proposal was
+    /// rejected, so a tag can be re-proposed once *new* evidence arrives
+    /// (previously a single rejection silenced the tag forever).
+    fn migrate_v3_reflection_rearm(&self) -> Result<()> {
+        let conn = self.conn()?;
+        let has_col = conn
+            .prepare("SELECT rejected_occurrence_count FROM reflection_suggestions LIMIT 0")
+            .is_ok();
+        if !has_col {
+            conn.execute_batch(
+                "ALTER TABLE reflection_suggestions \
+                 ADD COLUMN rejected_occurrence_count INTEGER;",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v2 — rebuild all FTS5 shadow tables. Two reasons, one rebuild:
+    ///
+    /// 1. **Rowid alignment**: pre-v2 FTS rows carried auto-assigned rowids;
+    ///    the write path now keeps the FTS rowid in lockstep with the main
+    ///    table's rowid so deletes/updates address FTS rows in O(log n). The
+    ///    old `WHERE memory_id = ?` delete on the UNINDEXED column was a full
+    ///    FTS scan per update/delete/GC row (verified via EXPLAIN QUERY PLAN).
+    /// 2. **Tokenizer preprocessing refresh**: CJK↔latin boundaries are now
+    ///    split and tags/files columns are preprocessed, so mixed-script
+    ///    content indexed before v2 is searchable.
+    ///
+    /// Drop + recreate + streaming backfill in one transaction. Idempotent by
+    /// construction (rebuilding from the main tables).
+    fn migrate_v2_fts_rowid(&self) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        for table in [
+            "episodic_memories_fts",
+            "decision_memories_fts",
+            "failure_memories_fts",
+            "procedural_memories_fts",
+        ] {
+            tx.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+        }
+        tx.execute_batch(FTS_TABLES_DDL)?;
+        let written = Self::backfill_fts_from_main(&tx)?;
+        tx.commit()?;
+        tracing::info!("migration v2: FTS rebuilt rowid-aligned ({written} rows)");
+        Ok(())
     }
 
     /// Advance the database schema to [`CURRENT_SCHEMA_VERSION`].
@@ -837,11 +886,18 @@ impl MemoryRepository {
                 );
                 self.migrate_add_archived_at()?;
                 self.migrate_fts5_add_tags()?;
+                // Stamp to v1 (the world those probes produced), then fall
+                // through to the registered-migration loop below so legacy
+                // DBs also receive later rebuilds (v2 rowid alignment).
+                self.set_user_version(1)?;
             } else {
+                // Fresh DB: initialize_schema already created the current
+                // schema (FTS tables empty; rows will be written by the
+                // rowid-aligned code path). No rebuild needed.
                 tracing::info!("schema migration: fresh DB; stamping to v{CURRENT_SCHEMA_VERSION}");
+                self.set_user_version(CURRENT_SCHEMA_VERSION)?;
+                return Ok(());
             }
-            self.set_user_version(CURRENT_SCHEMA_VERSION)?;
-            return Ok(());
         }
 
         for &(target, migrate_fn) in Self::migrations() {
@@ -867,6 +923,16 @@ impl MemoryRepository {
         let conn = self.conn()?;
         conn.execute_batch(&format!("PRAGMA user_version = {v};"))?;
         Ok(())
+    }
+
+    /// Whether a named index exists (checked against sqlite_master).
+    fn index_exists(conn: &rusqlite::Connection, name: &str) -> Result<bool> {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Whether the legacy memory tables exist (heuristic for "was this DB
@@ -931,6 +997,7 @@ impl MemoryRepository {
         tx = tx,
         row = row,
         link_ts = link_ts,
+        fts_rowid = fts_rowid,
 
         struct_type = EpisodicMemory,
         table = "episodic_memories",
@@ -948,9 +1015,9 @@ impl MemoryRepository {
 
         insert_sql = "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
 
-        fts_insert_sql = "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags) VALUES (?1,?2,?3,?4,?5)",
+        fts_insert_sql = "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6)",
 
-        update_sql = "UPDATE episodic_memories SET project_id=?2, session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10 WHERE id=?1",
+        update_sql = "UPDATE episodic_memories SET session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10 WHERE id=?1 AND project_id=?2",
 
         score_col_idx = 11,
 
@@ -971,8 +1038,9 @@ impl MemoryRepository {
                 mem.id,
                 Self::preprocess_cjk(&mem.summary),
                 Self::preprocess_cjk(&mem.content),
-                serde_json::to_string(&mem.files_touched)?,
-                serde_json::to_string(&mem.tags)?,
+                Self::fts_json(&mem.files_touched)?,
+                Self::fts_json(&mem.tags)?,
+                fts_rowid,
             ]
         },
 
@@ -1019,6 +1087,7 @@ impl MemoryRepository {
         tx = tx,
         row = row,
         link_ts = link_ts,
+        fts_rowid = fts_rowid,
 
         struct_type = DecisionMemory,
         table = "decision_memories",
@@ -1036,9 +1105,9 @@ impl MemoryRepository {
 
         insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
 
-        fts_insert_sql = "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags) VALUES (?1,?2,?3,?4,?5,?6)",
+        fts_insert_sql = "INSERT INTO decision_memories_fts (memory_id, title, context, rationale, tradeoffs, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6,?7)",
 
-        update_sql = "UPDATE decision_memories SET project_id=?2, title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, updated_at=?9 WHERE id=?1",
+        update_sql = "UPDATE decision_memories SET title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, updated_at=?9 WHERE id=?1 AND project_id=?2",
 
         score_col_idx = 10,
 
@@ -1059,7 +1128,8 @@ impl MemoryRepository {
                 Self::preprocess_cjk(&mem.context),
                 Self::preprocess_cjk(&mem.rationale),
                 Self::preprocess_cjk(&mem.tradeoffs),
-                serde_json::to_string(&mem.tags)?,
+                Self::fts_json(&mem.tags)?,
+                fts_rowid,
             ]
         },
 
@@ -1103,6 +1173,7 @@ impl MemoryRepository {
         tx = tx,
         row = row,
         link_ts = link_ts,
+        fts_rowid = fts_rowid,
 
         struct_type = FailureMemory,
         table = "failure_memories",
@@ -1120,9 +1191,9 @@ impl MemoryRepository {
 
         insert_sql = "INSERT INTO failure_memories (id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
 
-        fts_insert_sql = "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags) VALUES (?1,?2,?3,?4,?5,?6)",
+        fts_insert_sql = "INSERT INTO failure_memories_fts (memory_id, incident, root_cause, fix, prevention, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6,?7)",
 
-        update_sql = "UPDATE failure_memories SET project_id=?2, incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9 WHERE id=?1",
+        update_sql = "UPDATE failure_memories SET incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9 WHERE id=?1 AND project_id=?2",
 
         score_col_idx = 10,
 
@@ -1143,7 +1214,8 @@ impl MemoryRepository {
                 Self::preprocess_cjk(&mem.root_cause),
                 Self::preprocess_cjk(&mem.fix),
                 Self::preprocess_cjk(&mem.prevention),
-                serde_json::to_string(&mem.tags)?,
+                Self::fts_json(&mem.tags)?,
+                fts_rowid,
             ]
         },
 
@@ -1180,6 +1252,7 @@ impl MemoryRepository {
         tx = tx,
         row = row,
         link_ts = link_ts,
+        fts_rowid = fts_rowid,
 
         struct_type = ProceduralMemory,
         table = "procedural_memories",
@@ -1197,9 +1270,9 @@ impl MemoryRepository {
 
         insert_sql = "INSERT INTO procedural_memories (id, project_id, workflow_name, steps, related_tools, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
 
-        fts_insert_sql = "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags) VALUES (?1,?2,?3,?4,?5)",
+        fts_insert_sql = "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6)",
 
-        update_sql = "UPDATE procedural_memories SET project_id=?2, workflow_name=?3, steps=?4, related_tools=?5, tags=?6, updated_at=?7 WHERE id=?1",
+        update_sql = "UPDATE procedural_memories SET workflow_name=?3, steps=?4, related_tools=?5, tags=?6, updated_at=?7 WHERE id=?1 AND project_id=?2",
 
         score_col_idx = 8,
 
@@ -1217,9 +1290,10 @@ impl MemoryRepository {
             params![
                 mem.id,
                 Self::preprocess_cjk(&mem.workflow_name),
-                serde_json::to_string(&mem.steps)?,
-                serde_json::to_string(&mem.related_tools)?,
-                serde_json::to_string(&mem.tags)?,
+                Self::fts_json(&mem.steps)?,
+                Self::fts_json(&mem.related_tools)?,
+                Self::fts_json(&mem.tags)?,
+                fts_rowid,
             ]
         },
 
@@ -1643,15 +1717,32 @@ impl MemoryRepository {
     /// the user already decided on — either way — is never re-proposed:
     /// rejecting must not let the same suggestion resurrect on the next
     /// `reflect --apply`, and confirming must not re-propose the promoted rule.
-    pub fn has_suggestion_for_tag(&self, project_id: &str, pattern_tag: &str) -> Result<bool> {
+    pub fn has_suggestion_for_tag(
+        &self,
+        project_id: &str,
+        pattern_tag: &str,
+        current_occurrences: i64,
+        min_occurrences: i64,
+    ) -> Result<bool> {
         let conn = self.conn()?;
-        let exists: bool = conn.query_row(
+        // pending/confirmed proposals always block a duplicate. A REJECTED
+        // proposal blocks only until enough NEW evidence accumulates: the
+        // reject stamped the occurrence count it saw; once failures have
+        // grown by another `min_occurrences`, the pattern is re-armable.
+        let blocked: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM reflection_suggestions \
-             WHERE project_id = ?1 AND pattern_tag = ?2)",
-            params![project_id, pattern_tag],
+             WHERE project_id = ?1 AND pattern_tag = ?2 \
+               AND (status != 'rejected' \
+                    OR COALESCE(rejected_occurrence_count, occurrence_count) + ?3 > ?4))",
+            params![
+                project_id,
+                pattern_tag,
+                min_occurrences,
+                current_occurrences
+            ],
             |row| row.get(0),
         )?;
-        Ok(exists)
+        Ok(blocked)
     }
 
     /// All distinct project ids that have at least one memory (any kind).
@@ -1755,16 +1846,20 @@ impl MemoryRepository {
                     now,
                 ],
             )?;
-            // Mirror the standard create path's FTS dual-write (CJK-preprocessed).
+            // Mirror the standard create path's FTS dual-write: same
+            // preprocessing AND rowid alignment, so this hand-rolled path
+            // stays consistent with the macro-generated one.
+            let fts_rowid: i64 = tx.last_insert_rowid();
             tx.execute(
-                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags) \
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO procedural_memories_fts (memory_id, workflow_name, steps, related_tools, tags, rowid) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     proc_id,
                     Self::preprocess_cjk(&draft.suggested_workflow_name),
-                    serde_json::to_string(&draft.suggested_steps)?,
-                    serde_json::to_string(&Vec::<String>::new())?,
-                    serde_json::to_string(&draft.suggested_tags)?,
+                    Self::fts_json(&draft.suggested_steps)?,
+                    Self::fts_json(&Vec::<String>::new())?,
+                    Self::fts_json(&draft.suggested_tags)?,
+                    fts_rowid,
                 ],
             )?;
         }
@@ -1789,7 +1884,8 @@ impl MemoryRepository {
     pub fn reject_suggestion(&self, id: &str, project_id: &str, now: i64) -> Result<bool> {
         let conn = self.conn()?;
         let affected = conn.execute(
-            "UPDATE reflection_suggestions SET status = 'rejected', resolved_at = ?1 \
+            "UPDATE reflection_suggestions SET status = 'rejected', resolved_at = ?1, \
+             rejected_occurrence_count = occurrence_count \
              WHERE id = ?2 AND project_id = ?3 AND status = 'pending'",
             params![now, id, project_id],
         )?;
@@ -1883,16 +1979,20 @@ impl MemoryRepository {
         for kind in MemoryKind::all() {
             // Collect candidates first so we don't hold a read cursor while
             // the purge transaction runs.
-            let candidates: Vec<(String, String)> = {
+            let candidates: Vec<(String, String, i64)> = {
                 let conn = self.conn()?;
                 let sql = format!(
-                    "SELECT id, project_id FROM {} \
+                    "SELECT id, project_id, rowid FROM {} \
                      WHERE archived_at IS NOT NULL AND archived_at < ?1",
                     kind.table()
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params![threshold], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
@@ -1911,7 +2011,7 @@ impl MemoryRepository {
                 let fts_table = kind_fts_table(kind);
                 let conn = self.conn()?;
                 let tx = conn.unchecked_transaction()?;
-                for (id, project_id) in &candidates {
+                for (id, project_id, fts_rowid) in &candidates {
                     let affected = tx.execute(
                         &format!(
                             "DELETE FROM {} WHERE id = ?1 AND project_id = ?2 \
@@ -1921,9 +2021,12 @@ impl MemoryRepository {
                         params![id, project_id],
                     )?;
                     if affected > 0 {
+                        // FTS rows are addressed by the main-table rowid —
+                        // matching the UNINDEXED memory_id column scanned the
+                        // whole FTS table for every GC'd row.
                         tx.execute(
-                            &format!("DELETE FROM {} WHERE memory_id = ?1", fts_table),
-                            params![id],
+                            &format!("DELETE FROM {} WHERE rowid = ?1", fts_table),
+                            params![fts_rowid],
                         )?;
                         tx.execute(
                             "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
@@ -1945,7 +2048,7 @@ impl MemoryRepository {
                 // Dry run: report every candidate as "would delete".
                 removed_rows = candidates
                     .into_iter()
-                    .map(|(id, _)| GcDeletedRow {
+                    .map(|(id, _, _)| GcDeletedRow {
                         memory_type: kind_str.clone(),
                         id,
                     })
@@ -1965,6 +2068,133 @@ impl MemoryRepository {
             per_type,
             deleted,
         })
+    }
+
+    /// Memory ids that share a graph entity (file/tool) with any of the
+    /// `seed` memories — the relationship graph's contribution to retrieval.
+    /// Returns `(memory_type, id)` pairs, at most `limit`, excluding seeds.
+    /// Only ACTIVE memories are returned (each candidate is probed against
+    /// its main table with an archived_at IS NULL check).
+    pub fn neighbor_memories(
+        &self,
+        project_id: &str,
+        seeds: &[String],
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        if seeds.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let placeholders = seeds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT DISTINCT r2.from_entity AS mid \
+             FROM graph_relations r1 \
+             JOIN graph_relations r2 \
+               ON r1.to_entity = r2.to_entity AND r2.from_entity <> r1.from_entity \
+             WHERE r1.project_id = ?1 AND r2.project_id = ?1 \
+               AND r1.from_entity IN ({placeholders}) \
+             LIMIT {limit2}",
+            limit2 = limit * 4, // over-fetch; type resolution drops non-memories
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id.to_string())];
+        for s in seeds {
+            params_vec.push(Box::new(s.clone()));
+        }
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let ids = stmt
+            .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Resolve each id to its (active) memory type.
+        let mut out = Vec::new();
+        for id in ids {
+            if out.len() >= limit {
+                break;
+            }
+            let ty: Option<String> = conn.query_row(
+                "SELECT CASE \
+                    WHEN EXISTS (SELECT 1 FROM episodic_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'episodic' \
+                    WHEN EXISTS (SELECT 1 FROM decision_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'decision' \
+                    WHEN EXISTS (SELECT 1 FROM failure_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'failure' \
+                    WHEN EXISTS (SELECT 1 FROM procedural_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'procedural' \
+                 END",
+                params![id],
+                |r| r.get(0),
+            ).unwrap_or(None);
+            if let Some(ty) = ty {
+                out.push((ty, id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Most recent ACTIVE episodic memory for a (project, session) pair —
+    /// used by session-import to make repeated hook firings idempotent
+    /// (upsert semantics instead of stacking near-duplicate memories).
+    pub fn find_episodic_by_session(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<EpisodicMemory>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, session_id, summary, content, files_touched, \
+             related_commits, importance, tags, created_at, updated_at \
+             FROM episodic_memories \
+             WHERE project_id = ?1 AND session_id = ?2 AND archived_at IS NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![project_id, session_id], |row| {
+                Ok(EpisodicMemory {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    summary: row.get(3)?,
+                    content: row.get(4)?,
+                    files_touched: row_get_json!(row, 5, Vec<String>),
+                    related_commits: row_get_json!(row, 6, Vec<String>),
+                    importance: row.get(7)?,
+                    tags: row_get_json!(row, 8, Vec<String>),
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Physically delete File/Tool entities that no relation references
+    /// anymore. Memories' own entities (type `Memory`) and entities still
+    /// attached to any edge are preserved. Returns the number removed
+    /// (or that would be removed, when `apply=false`).
+    ///
+    /// Before this, deleted/archived memories left their File/Tool entities
+    /// and edges behind forever — the entity table grew unboundedly and
+    /// `related_files` results filled with orphan noise.
+    pub fn gc_orphan_entities(&self, apply: bool) -> Result<usize> {
+        let conn = self.conn()?;
+        let orphan_sql = "SELECT COUNT(*) FROM entities e \
+             WHERE e.entity_type IN ('File', 'Tool') \
+               AND NOT EXISTS (SELECT 1 FROM graph_relations r \
+                                WHERE r.from_entity = e.id OR r.to_entity = e.id)";
+        if !apply {
+            let n: i64 = conn.query_row(orphan_sql, [], |r| r.get(0))?;
+            return Ok(n as usize);
+        }
+        let tx = conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM entities WHERE id IN ( \
+                SELECT e.id FROM entities e \
+                 WHERE e.entity_type IN ('File', 'Tool') \
+                   AND NOT EXISTS (SELECT 1 FROM graph_relations r \
+                                    WHERE r.from_entity = e.id OR r.to_entity = e.id) \
+             )",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Truncate the WAL back into the main database file. Best-effort: any
@@ -2242,8 +2472,17 @@ impl MemoryRepository {
         b
     }
 
-    /// Deserialize a little-endian byte BLOB back to an f32 vector.
+    /// Deserialize a little-endian byte BLOB back to an f32 vector. A blob
+    /// whose length is not a multiple of 4 (corruption / model change) is
+    /// logged and its trailing bytes dropped — silently keeping them would
+    /// yield a wrong-dimension vector whose cosine is always 0.
     fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+        if b.len() % 4 != 0 {
+            tracing::warn!(
+                "embedding blob has {} bytes (not f32-aligned); truncating",
+                b.len()
+            );
+        }
         b.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
@@ -2460,7 +2699,7 @@ mod tests {
         repo.create_episodic(&mem).unwrap();
 
         // Read
-        let retrieved = repo.get_episodic(&mem.id).unwrap().unwrap();
+        let retrieved = repo.get_episodic(&mem.id, "test-project").unwrap().unwrap();
         assert_eq!(retrieved.summary, "Fixed OAuth refresh loop");
         assert_eq!(retrieved.files_touched, vec!["auth.ts", "token.rs"]);
         assert_eq!(retrieved.importance, 0.8);
@@ -2471,14 +2710,17 @@ mod tests {
         updated.importance = 0.9;
         repo.update_episodic(&updated).unwrap();
 
-        let after_update = repo.get_episodic(&mem.id).unwrap().unwrap();
+        let after_update = repo.get_episodic(&mem.id, "test-project").unwrap().unwrap();
         assert_eq!(after_update.summary, "Fixed OAuth refresh loop v2");
         assert_eq!(after_update.importance, 0.9);
 
         // Delete
         assert!(repo.delete_episodic(&mem.id, "test-project").unwrap());
         assert!(!repo.delete_episodic(&mem.id, "wrong-project").unwrap());
-        assert!(repo.get_episodic(&mem.id).unwrap().is_none());
+        assert!(repo
+            .get_episodic(&mem.id, "test-project")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2498,19 +2740,25 @@ mod tests {
         };
 
         repo.create_decision(&mem).unwrap();
-        let retrieved = repo.get_decision(&mem.id).unwrap().unwrap();
+        let retrieved = repo.get_decision(&mem.id, "test-project").unwrap().unwrap();
         assert_eq!(retrieved.title, "Use Redis for session caching");
 
         let mut updated = retrieved;
         updated.title = "Use Redis for all caching".into();
         repo.update_decision(&updated).unwrap();
         assert_eq!(
-            repo.get_decision(&mem.id).unwrap().unwrap().title,
+            repo.get_decision(&mem.id, "test-project")
+                .unwrap()
+                .unwrap()
+                .title,
             "Use Redis for all caching"
         );
 
         assert!(repo.delete_decision(&mem.id, "test-project").unwrap());
-        assert!(repo.get_decision(&mem.id).unwrap().is_none());
+        assert!(repo
+            .get_decision(&mem.id, "test-project")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2530,17 +2778,23 @@ mod tests {
         };
 
         repo.create_failure(&mem).unwrap();
-        let retrieved = repo.get_failure(&mem.id).unwrap().unwrap();
+        let retrieved = repo.get_failure(&mem.id, "test-project").unwrap().unwrap();
         assert_eq!(retrieved.incident, "Auth token expiry mismatch");
         assert_eq!(retrieved.severity, 3);
 
         let mut updated = retrieved;
         updated.severity = 5;
         repo.update_failure(&updated).unwrap();
-        assert_eq!(repo.get_failure(&mem.id).unwrap().unwrap().severity, 5);
+        assert_eq!(
+            repo.get_failure(&mem.id, "test-project")
+                .unwrap()
+                .unwrap()
+                .severity,
+            5
+        );
 
         assert!(repo.delete_failure(&mem.id, "test-project").unwrap());
-        assert!(repo.get_failure(&mem.id).unwrap().is_none());
+        assert!(repo.get_failure(&mem.id, "test-project").unwrap().is_none());
     }
 
     #[test]
@@ -2562,7 +2816,10 @@ mod tests {
         };
 
         repo.create_procedural(&mem).unwrap();
-        let retrieved = repo.get_procedural(&mem.id).unwrap().unwrap();
+        let retrieved = repo
+            .get_procedural(&mem.id, "test-project")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.workflow_name, "deployment");
         assert_eq!(retrieved.steps.len(), 3);
 
@@ -2570,12 +2827,19 @@ mod tests {
         updated.steps.push("verify deployment".into());
         repo.update_procedural(&updated).unwrap();
         assert_eq!(
-            repo.get_procedural(&mem.id).unwrap().unwrap().steps.len(),
+            repo.get_procedural(&mem.id, "test-project")
+                .unwrap()
+                .unwrap()
+                .steps
+                .len(),
             4
         );
 
         assert!(repo.delete_procedural(&mem.id, "test-project").unwrap());
-        assert!(repo.get_procedural(&mem.id).unwrap().is_none());
+        assert!(repo
+            .get_procedural(&mem.id, "test-project")
+            .unwrap()
+            .is_none());
     }
 
     // ─── FTS5 Consistency Tests ────────────────────────────────────
@@ -2969,7 +3233,7 @@ mod tests {
         assert_eq!(repo.list_recent_failures("p", 10).unwrap().len(), 0);
 
         // get 仍可取到（按 id 显式取，不过滤）。
-        assert!(repo.get_episodic(&ep.id).unwrap().is_some());
+        assert!(repo.get_episodic(&ep.id, "p").unwrap().is_some());
     }
 
     // ─── Task 4: archive_batch + list_archived Tests ───────────────
@@ -3008,7 +3272,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(repo.get_episodic(&b.id).unwrap().is_some());
+        assert!(repo.get_episodic(&b.id, "p").unwrap().is_some());
         assert_eq!(repo.search_episodic("a", "p", 10).unwrap().len(), 0);
 
         // before 过滤：恢复后按 created_at < 1000 归档，a(100) 和 b(100) 命中，c(5000) 不在。
@@ -3257,7 +3521,7 @@ mod tests {
         // The memory must survive and remain active.
         // The memory must survive — GC's guarded delete must not physically
         // remove it.
-        let still = repo.get_episodic(&mem.id).unwrap();
+        let still = repo.get_episodic(&mem.id, "p").unwrap();
         assert!(still.is_some(), "restored memory must survive GC");
 
         // Its FTS index row must still be present (cascade did not purge it).
@@ -3271,43 +3535,269 @@ mod tests {
     }
 
     #[test]
+    fn fts_rowid_stays_aligned_with_main_table() {
+        // The FTS rowid must equal the main-table rowid: deletes/updates
+        // address FTS rows by rowid (O(log n)); a misaligned index would
+        // silently strand or destroy rows.
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("r1", "rowid alignment marker"))
+            .unwrap();
+        {
+            let conn = repo.connection().unwrap();
+            let (main_rowid, fts_rowid): (i64, i64) = conn
+                .query_row(
+                    "SELECT m.rowid, f.rowid FROM episodic_memories m \
+                     JOIN episodic_memories_fts f ON f.memory_id = m.id \
+                     WHERE m.id = 'r1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(main_rowid, fts_rowid);
+        }
+
+        // Update replaces the FTS row in place: still exactly one row,
+        // still aligned, and the new text is searchable.
+        let mut mem = episodic_fixture("r1", "updated marker REIDXPROBE");
+        mem.summary = "updated marker REIDXPROBE".into();
+        repo.update_episodic(&mem).unwrap();
+        {
+            let conn = repo.connection().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM episodic_memories_fts WHERE memory_id = 'r1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "update must not duplicate FTS rows");
+        }
+        assert!(!repo
+            .search_episodic("REIDXPROBE", "p", 10)
+            .unwrap()
+            .is_empty());
+
+        // Delete removes the FTS row entirely (by rowid).
+        repo.delete_episodic("r1", "p").unwrap();
+        {
+            let conn = repo.connection().unwrap();
+            let leftover: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM episodic_memories_fts WHERE memory_id = 'r1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0, "delete must purge the FTS row");
+        }
+    }
+
+    #[test]
+    fn migrate_v2_rebuilds_legacy_fts_rowid_aligned() {
+        // A v1-style DB (FTS rows with auto rowids, legacy preprocessing)
+        // must be rebuilt aligned + re-preprocessed by the v2 migration.
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("m1", "用Rust写mixed text"))
+            .unwrap();
+        {
+            let conn = repo.connection().unwrap();
+            // Reset to v1 and install a legacy-style index (auto rowid, no
+            // CJK-latin split) — as an old binary would have written it.
+            conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+            conn.execute("DELETE FROM episodic_memories_fts", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags) \
+                 VALUES ('m1', '用Rust写mixed text', '用Rust写mixed text', '[]', '[]')",
+                [],
+            )
+            .unwrap();
+        }
+        // Legacy query style (pre-boundary-split) can't match…
+        assert!(repo.search_episodic("rust", "p", 10).unwrap().is_empty());
+
+        repo.run_migrations().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        // …but after the v2 rebuild the latin term matches the mixed text.
+        assert!(
+            !repo.search_episodic("rust", "p", 10).unwrap().is_empty(),
+            "v2 rebuild must apply boundary-aware preprocessing"
+        );
+        let conn = repo.connection().unwrap();
+        let aligned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodic_memories m \
+                 JOIN episodic_memories_fts f ON f.memory_id = m.id AND f.rowid = m.rowid",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(aligned, 1, "FTS rowid must equal main-table rowid");
+    }
+    #[test]
     fn sanitize_fts_query_escapes_reserved_words_and_operators() {
         // sanitize_fts_query wraps each whitespace-separated token in a
         // double-quoted FTS5 phrase (doubling embedded quotes) and joins with
-        // " OR ". This must prevent FTS5 reserved words/operators in user input
-        // from acting as column filters or boolean operators — the historical
-        // UNIQUE-crash regression this guards against.
+        // AND or OR. This must prevent FTS5 reserved words/operators in user
+        // input from acting as column filters or boolean operators — the
+        // historical UNIQUE-crash regression this guards against.
         use MemoryRepository as R;
 
         // Reserved word becomes a literal phrase, not an operator/column filter.
-        assert_eq!(R::sanitize_fts_query("UNIQUE"), "\"UNIQUE\"");
+        assert_eq!(R::sanitize_fts_query("UNIQUE", true), "\"UNIQUE\"");
 
-        // Multiple tokens joined with OR, each quoted.
-        assert_eq!(R::sanitize_fts_query("foo bar"), "\"foo\" OR \"bar\"");
+        // Multiple tokens joined with AND or OR, each quoted.
+        assert_eq!(
+            R::sanitize_fts_query("foo bar", false),
+            "\"foo\" OR \"bar\""
+        );
+        assert_eq!(
+            R::sanitize_fts_query("foo bar", true),
+            "\"foo\" AND \"bar\""
+        );
 
         // Boolean operators inside the query are wrapped as literal phrases,
         // NOT parsed as FTS5 AND/OR/NOT.
         assert_eq!(
-            R::sanitize_fts_query("a AND b"),
+            R::sanitize_fts_query("a AND b", false),
             "\"a\" OR \"AND\" OR \"b\""
         );
-        assert_eq!(R::sanitize_fts_query("x OR y"), "\"x\" OR \"OR\" OR \"y\"");
         assert_eq!(
-            R::sanitize_fts_query("p NOT q"),
+            R::sanitize_fts_query("x OR y", false),
+            "\"x\" OR \"OR\" OR \"y\""
+        );
+        assert_eq!(
+            R::sanitize_fts_query("p NOT q", false),
             "\"p\" OR \"NOT\" OR \"q\""
         );
 
         // Embedded double-quote is escaped by doubling (FTS5 phrase escape).
-        assert_eq!(R::sanitize_fts_query("a\"b"), "\"a\"\"b\"");
+        assert_eq!(R::sanitize_fts_query("a\"b", false), "\"a\"\"b\"");
 
         // FTS5 special chars (*, :, ^) inside quotes → literal.
-        assert_eq!(R::sanitize_fts_query("foo*"), "\"foo*\"");
-        assert_eq!(R::sanitize_fts_query("a:b"), "\"a:b\"");
+        assert_eq!(R::sanitize_fts_query("foo*", false), "\"foo*\"");
+        assert_eq!(R::sanitize_fts_query("a:b", false), "\"a:b\"");
 
         // Empty / whitespace-only query yields a valid empty phrase (no crash,
         // no malformed MATCH).
-        assert_eq!(R::sanitize_fts_query(""), "\"\"");
-        assert_eq!(R::sanitize_fts_query("   "), "\"\"");
+        assert_eq!(R::sanitize_fts_query("", false), "\"\"");
+        assert_eq!(R::sanitize_fts_query("   ", true), "\"\"");
+    }
+
+    #[test]
+    fn preprocess_cjk_splits_script_boundaries() {
+        use MemoryRepository as R;
+        // Pure CJK: every character becomes its own token (pre-existing).
+        assert_eq!(R::preprocess_cjk("修复认证"), "修 复 认 证");
+        // CJK ↔ latin boundaries must also split: without this, `用Rust写`
+        // indexes as ONE opaque token that no sub-query can match.
+        assert_eq!(R::preprocess_cjk("用Rust写"), "用 Rust 写");
+        assert_eq!(R::preprocess_cjk("修复auth模块"), "修 复 auth 模 块");
+        assert_eq!(R::preprocess_cjk("SQLite做存储"), "SQLite 做 存 储");
+        // CJK ↔ digits split too.
+        assert_eq!(R::preprocess_cjk("修复了3个bug"), "修 复 了 3 个 bug");
+        // CJK punctuation (。etc.) is itself in the CJK ranges, so it splits
+        // like an ideograph — harmless for search (punctuation carries no
+        // query signal) and keeps the rule uniform.
+        assert_eq!(R::preprocess_cjk("修复。完成"), "修 复 。 完 成");
+        // No CJK: untouched.
+        assert_eq!(R::preprocess_cjk("plain ascii"), "plain ascii");
+    }
+
+    #[test]
+    fn search_finds_mixed_cjk_latin_text() {
+        // End-to-end: a memory written in mixed Chinese/English must be
+        // findable by either script's query terms.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mem = crate::models::EpisodicMemory {
+            id: "mix1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "用Rust重写认证模块".into(),
+            content: "SQLite存储 token 刷新逻辑".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec!["认证".into()],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mem).unwrap();
+
+        let by_latin = repo.search_episodic("rust", "p", 10).unwrap();
+        assert!(
+            !by_latin.is_empty(),
+            "latin term must match mixed-script text"
+        );
+        let by_cjk = repo.search_episodic("认证", "p", 10).unwrap();
+        assert!(!by_cjk.is_empty(), "CJK term must match mixed-script text");
+    }
+
+    #[test]
+    fn search_finds_cjk_tags() {
+        // Tags are indexed through the same CJK preprocessing as text —
+        // previously the raw JSON blob made Chinese tags unsearchable.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mem = crate::models::EpisodicMemory {
+            id: "tag1".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "english only summary".into(),
+            content: "english only content".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec!["部署策略".into()],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mem).unwrap();
+
+        let r = repo.search_episodic("部署", "p", 10).unwrap();
+        assert!(!r.is_empty(), "CJK tag must be searchable");
+    }
+
+    #[test]
+    fn search_and_requires_all_tokens_with_or_fallback() {
+        // "rust memory" with AND hits only memories containing BOTH terms;
+        // the OR fallback keeps recall when AND matches nothing.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |id: &str, summary: &str| crate::models::EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: summary.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mk("e1", "rust memory system"))
+            .unwrap();
+        repo.create_episodic(&mk("e2", "python memory system"))
+            .unwrap();
+        repo.create_episodic(&mk("e3", "kotlin coroutine flow"))
+            .unwrap();
+
+        // AND precision: "rust memory" must match ONLY the memory containing
+        // both terms — not the python/kotlin ones.
+        let both = repo.search_episodic("rust memory", "p", 10).unwrap();
+        let ids: Vec<&str> = both.iter().map(|s| s.memory.id.as_str()).collect();
+        assert_eq!(ids, vec!["e1"], "AND must require every token, got {ids:?}");
+
+        // OR recall: no memory has BOTH "zig" and "memory" → the AND pass is
+        // empty → the OR fallback returns the "memory"-only hits.
+        let fallback = repo.search_episodic("zig memory", "p", 10).unwrap();
+        assert!(
+            !fallback.is_empty(),
+            "OR fallback must preserve recall for partial matches"
+        );
     }
 
     // ─── Transaction Rollback Test ─────────────────────────────────
@@ -3333,7 +3823,10 @@ mod tests {
         repo.create_episodic(&mem).unwrap();
 
         // Verify it exists
-        let retrieved = repo.get_episodic("rollback-test-id").unwrap().unwrap();
+        let retrieved = repo
+            .get_episodic("rollback-test-id", "test")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.summary, "original summary");
     }
     #[test]
@@ -3432,7 +3925,7 @@ mod tests {
         assert!(!report.applied);
         assert_eq!(report.deleted.len(), 1);
         // Dry run: row still present.
-        assert!(repo.get_episodic("g1").unwrap().is_some());
+        assert!(repo.get_episodic("g1", "p").unwrap().is_some());
     }
 
     #[test]
@@ -3449,7 +3942,7 @@ mod tests {
         assert_eq!(report.per_type[0].0, "episodic");
         assert_eq!(report.per_type[0].1, 1);
         // Physically gone, and its embedding purged too.
-        assert!(repo.get_episodic("g1").unwrap().is_none());
+        assert!(repo.get_episodic("g1", "p").unwrap().is_none());
         assert!(repo
             .load_active_embeddings("p", "minilm")
             .unwrap()
@@ -3467,7 +3960,7 @@ mod tests {
         // older_than=3600s: the just-archived row is not yet expired.
         let report = repo.gc_archived(3600, true, now()).unwrap();
         assert_eq!(report.deleted.len(), 0);
-        assert!(repo.get_episodic("g1").unwrap().is_some());
+        assert!(repo.get_episodic("g1", "p").unwrap().is_some());
     }
 
     #[test]
@@ -3480,7 +3973,7 @@ mod tests {
 
         let report = repo.gc_archived(0, true, now()).unwrap();
         assert_eq!(report.deleted.len(), 1);
-        assert!(repo.get_episodic("g1").unwrap().is_none());
+        assert!(repo.get_episodic("g1", "p").unwrap().is_none());
     }
 
     #[test]
@@ -3623,8 +4116,10 @@ mod tests {
     #[test]
     fn rebuild_fts_repairs_orphans_and_missing_rows() {
         let repo = setup_repo();
-        repo.create_episodic(&episodic_fixture("e1", "alpha engine")).unwrap();
-        repo.create_episodic(&episodic_fixture("e2", "beta wheel")).unwrap();
+        repo.create_episodic(&episodic_fixture("e1", "alpha engine"))
+            .unwrap();
+        repo.create_episodic(&episodic_fixture("e2", "beta wheel"))
+            .unwrap();
 
         {
             let conn = repo.connection().unwrap();
@@ -3635,8 +4130,11 @@ mod tests {
                 [],
             )
             .unwrap();
-            conn.execute("DELETE FROM episodic_memories_fts WHERE memory_id = 'e2'", [])
-                .unwrap();
+            conn.execute(
+                "DELETE FROM episodic_memories_fts WHERE memory_id = 'e2'",
+                [],
+            )
+            .unwrap();
         }
 
         let written = repo.rebuild_fts().unwrap();
@@ -3667,8 +4165,11 @@ mod tests {
         // preprocessing-aware query side.
         {
             let conn = repo.connection().unwrap();
-            conn.execute("DELETE FROM episodic_memories_fts WHERE memory_id = 'c1'", [])
-                .unwrap();
+            conn.execute(
+                "DELETE FROM episodic_memories_fts WHERE memory_id = 'c1'",
+                [],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO episodic_memories_fts (memory_id, summary, content, files_touched, tags)
                  VALUES ('c1', '修复认证模块', '修复认证模块 body', '[]', '[]')",
@@ -3753,6 +4254,9 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(repo.list_projects().unwrap(), vec!["other".to_string(), "p".to_string()]);
+        assert_eq!(
+            repo.list_projects().unwrap(),
+            vec!["other".to_string(), "p".to_string()]
+        );
     }
 }

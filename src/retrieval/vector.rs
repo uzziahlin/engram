@@ -20,9 +20,14 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Return the ids of the top-`k` candidates by cosine similarity to `query`,
-/// highest first. `candidates` is (id, vector). Ties broken by input order.
-pub fn top_k_cosine(query: &[f32], candidates: &[(String, Vec<f32>)], k: usize) -> Vec<String> {
+/// Return the top-`k` candidates by cosine similarity to `query`, highest
+/// first, as `(id, cosine)` pairs — the score feeds the fused relevance.
+/// `candidates` is (id, vector). Ties broken by input order.
+pub fn top_k_cosine(
+    query: &[f32],
+    candidates: &[(String, Vec<f32>)],
+    k: usize,
+) -> Vec<(String, f32)> {
     let mut scored: Vec<(usize, &String, f32)> = candidates
         .iter()
         .enumerate()
@@ -37,7 +42,7 @@ pub fn top_k_cosine(query: &[f32], candidates: &[(String, Vec<f32>)], k: usize) 
     scored
         .into_iter()
         .take(k)
-        .map(|(_, id, _)| id.clone())
+        .map(|(_, id, score)| (id.clone(), score))
         .collect()
 }
 
@@ -61,6 +66,12 @@ mod tests {
             ("c".into(), vec![0.9, 0.1]),
         ];
         let got = top_k_cosine(&[1.0, 0.0], &cands, 2);
-        assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "a");
+        assert!(
+            (got[0].1 - 1.0).abs() < 1e-6,
+            "score must be returned for relevance injection"
+        );
+        assert_eq!(got[1].0, "c");
     }
 }

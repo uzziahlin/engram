@@ -39,6 +39,15 @@ pub struct JsonRpcError {
 /// what lets a future HTTP transport swap in without touching business code.
 pub trait RequestHandler: Send + Sync {
     fn handle(&self, req: JsonRpcRequest) -> JsonRpcResponse;
+
+    /// Methods the transport may answer inline on its reader thread instead
+    /// of queueing to the worker pool. With the default single worker, one
+    /// long tool call (ingest/reindex) would otherwise starve `ping` and
+    /// `tools/list` long enough for client health probes to time out. Only
+    /// list methods that never touch mutable state belong here.
+    fn fast_path_methods(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Render a caught panic payload as a best-effort string for logging.
@@ -50,6 +59,57 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "unknown panic payload".to_string()
     }
+}
+
+/// Serialize + write one response under the stdout lock. Returns false on
+/// BrokenPipe (client gone) so callers can stop cleanly.
+fn write_response(stdout: &Arc<Mutex<io::Stdout>>, response: &JsonRpcResponse) -> bool {
+    let Ok(s) = serde_json::to_string(response) else {
+        return true;
+    };
+    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+    match writeln!(out, "{s}").and_then(|_| out.flush()) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => false,
+        Err(e) => {
+            tracing::warn!("response write failed: {e}");
+            true
+        }
+    }
+}
+
+/// Run `handler` under panic isolation and write the response. Returns false
+/// on BrokenPipe.
+fn dispatch_isolated<H: RequestHandler>(
+    handler: &H,
+    req: JsonRpcRequest,
+    stdout: &Arc<Mutex<io::Stdout>>,
+) -> bool {
+    // Panic isolation: one bad request must not take down the whole MCP
+    // server (the release profile uses panic=unwind for exactly this). The id
+    // is cloned out first so the error response can be correlated even though
+    // the handler consumed the request.
+    let response = {
+        let id = req.id.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req))) {
+            Ok(resp) => resp,
+            Err(panic) => {
+                let msg = panic_message(&panic);
+                tracing::error!("request handler panicked: {msg}");
+                JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: "Internal error: request handler panicked".into(),
+                        data: Some(serde_json::json!({ "panic": msg })),
+                    }),
+                }
+            }
+        }
+    };
+    write_response(stdout, &response)
 }
 
 /// Run the JSON-RPC stdio transport: read frames from stdin, dispatch to a
@@ -83,47 +143,13 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
                     Err(_) => break, // channel closed → drain done
                 }
             };
-            // Panic isolation: one bad request must not take down the whole
-            // MCP server (the release profile uses panic=unwind for exactly
-            // this). The id is cloned out first so the error response can be
-            // correlated even though the handler consumed the request.
-            let response = {
-                let id = req.id.clone();
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req))) {
-                    Ok(resp) => resp,
-                    Err(panic) => {
-                        let msg = panic_message(&panic);
-                        tracing::error!("request handler panicked: {msg}");
-                        JsonRpcResponse {
-                            jsonrpc: "2.0".into(),
-                            id,
-                            result: None,
-                            error: Some(JsonRpcError {
-                                code: -32603,
-                                message: "Internal error: request handler panicked".into(),
-                                data: Some(serde_json::json!({ "panic": msg })),
-                            }),
-                        }
-                    }
-                }
-            };
-            if let Ok(s) = serde_json::to_string(&response) {
-                let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
-                let written = writeln!(out, "{s}").and_then(|_| out.flush());
-                if let Err(e) = written {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        // stdout closed (MCP client gone) — stop this worker
-                        // instead of silently looping on a broken pipe.
-                        break;
-                    }
-                    // Non-BrokenPipe write failures drop the response; log so
-                    // the loss is at least observable.
-                    tracing::warn!("response write failed: {e}");
-                }
+            if !dispatch_isolated(handler.as_ref(), req, &stdout) {
+                break; // BrokenPipe: MCP client gone
             }
         }));
     }
 
+    let fast_path = handler.fast_path_methods();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.context("failed to read from stdin")?;
@@ -149,35 +175,22 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
                     data: None,
                 }),
             };
-            if let Ok(s) = serde_json::to_string(&response) {
-                let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = writeln!(out, "{s}");
-                let _ = out.flush();
+            if !write_response(&stdout, &response) {
+                break;
             }
             continue;
         }
 
-        // JSON-RPC notifications (no `id`) get no response. Cache the id
-        // for error recovery on malformed payloads.
-        let cached_id = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if val.get("id").is_none() {
-                continue;
-            }
-            val.get("id").cloned()
-        } else {
-            None
-        };
-
-        match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(req) => {
-                if tx.send(req).is_err() {
-                    break; // workers all exited
-                }
-            }
+        // Two failure classes, kept distinct per the JSON-RPC 2.0 spec:
+        //   -32700 Parse error: the frame is not valid JSON;
+        //   -32600 Invalid Request: valid JSON, but not a compliant Request
+        //   object (missing/typo'd method, wrong types, wrong jsonrpc version).
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
                 let response = JsonRpcResponse {
                     jsonrpc: "2.0".into(),
-                    id: cached_id,
+                    id: None, // serializes as null per spec (id undetectable)
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32700,
@@ -185,12 +198,70 @@ pub fn run_stdio<H: RequestHandler + Send + Sync + 'static>(
                         data: None,
                     }),
                 };
-                if let Ok(s) = serde_json::to_string(&response) {
-                    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = writeln!(out, "{s}");
-                    let _ = out.flush();
+                if !write_response(&stdout, &response) {
+                    break;
                 }
+                continue;
             }
+        };
+
+        // Notifications (no `id`) get no response — but only once the frame
+        // is known to be a structurally valid Request; an invalid frame with
+        // no id must still get a -32600 with id null.
+        let cached_id = value.get("id").cloned();
+        let req = match serde_json::from_value::<JsonRpcRequest>(value) {
+            Ok(req) => req,
+            Err(e) => {
+                let response = JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: cached_id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: format!("Invalid Request: {e}"),
+                        data: None,
+                    }),
+                };
+                if !write_response(&stdout, &response) {
+                    break;
+                }
+                continue;
+            }
+        };
+        // The `jsonrpc` field must be exactly "2.0" (MCP inherits JSON-RPC's
+        // versioning rule); accepting anything else silently protocol-splits.
+        if req.jsonrpc != "2.0" {
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: req.id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32600,
+                    message: format!(
+                        "Invalid Request: jsonrpc must be \"2.0\", got {:?}",
+                        req.jsonrpc
+                    ),
+                    data: None,
+                }),
+            };
+            if !write_response(&stdout, &response) {
+                break;
+            }
+            continue;
+        }
+        if req.id.is_none() {
+            continue; // notification
+        }
+
+        // Read-only methods (ping/tools/list/prompts/list/initialize) are
+        // answered inline so a long-running tool on the worker pool cannot
+        // starve client health probes. MCP allows out-of-order responses.
+        if fast_path.contains(&req.method.as_str()) {
+            if !dispatch_isolated(handler.as_ref(), req, &stdout) {
+                break;
+            }
+        } else if tx.send(req).is_err() {
+            break; // workers all exited
         }
     }
 

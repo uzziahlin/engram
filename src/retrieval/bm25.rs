@@ -147,8 +147,13 @@ impl BM25Retriever {
     }
 
     /// Sigmoid normalization scaling factor.
-    /// Controls how quickly the normalization curve saturates.
-    const SIGMOID_SCALE: f64 = 5.0;
+    /// Calibrated against the practical FTS5 bm25() range on memory-scale
+    /// corpora (strong matches ≈ -2..-6, weak ≈ -0.2..-1 after negation):
+    /// a scale of 2.0 maps strong matches to ≈0.63..0.95 and weak ones to
+    /// ≈0.1..0.4, so relevance keeps most of its dynamic range after the
+    /// 0.5 relevance weight. (The old 5.0 scale compressed everything into
+    /// 0.08..0.55, letting the static type prior outvote it.)
+    const SIGMOID_SCALE: f64 = 2.0;
 
     /// Normalize FTS5 bm25() score to [0, 1].
     /// bm25() returns negative values; more negative = better match.
@@ -255,7 +260,11 @@ impl BM25Retriever {
                 repo.search_procedural(query, project_id, limit)?,
                 "procedural",
             )),
-            _ => Ok(Vec::new()),
+            // A typo'd type must fail loudly, not silently return "no
+            // memories" — the caller then knows to fix the filter.
+            other => anyhow::bail!(
+                "unknown memory_type {other:?}; valid: episodic, decision, failure, procedural"
+            ),
         }
     }
 
@@ -267,11 +276,12 @@ impl BM25Retriever {
     pub fn fetch_by_ids(
         repo: &MemoryRepository,
         ids: &[(String, String)],
+        project_id: &str,
     ) -> Result<Vec<SearchResult>> {
         let mut out = Vec::new();
         for (memory_type, id) in ids {
             let mut sr = match memory_type.as_str() {
-                "episodic" => repo.get_episodic(id)?.map(|m| {
+                "episodic" => repo.get_episodic(id, project_id)?.map(|m| {
                     Self::to_results(
                         vec![ScoredMemory {
                             memory: m,
@@ -280,7 +290,7 @@ impl BM25Retriever {
                         "episodic",
                     )
                 }),
-                "decision" => repo.get_decision(id)?.map(|m| {
+                "decision" => repo.get_decision(id, project_id)?.map(|m| {
                     Self::to_results(
                         vec![ScoredMemory {
                             memory: m,
@@ -289,7 +299,7 @@ impl BM25Retriever {
                         "decision",
                     )
                 }),
-                "failure" => repo.get_failure(id)?.map(|m| {
+                "failure" => repo.get_failure(id, project_id)?.map(|m| {
                     Self::to_results(
                         vec![ScoredMemory {
                             memory: m,
@@ -298,7 +308,7 @@ impl BM25Retriever {
                         "failure",
                     )
                 }),
-                "procedural" => repo.get_procedural(id)?.map(|m| {
+                "procedural" => repo.get_procedural(id, project_id)?.map(|m| {
                     Self::to_results(
                         vec![ScoredMemory {
                             memory: m,

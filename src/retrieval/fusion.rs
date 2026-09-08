@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 /// Fuse multiple ranked lists of ids into one, by RRF: `score(id) = Σ 1/(k + rank)`.
 /// `rank` is the 0-based position within each input list. Returns ids sorted by
-/// fused score descending.
+/// fused score descending; equal scores break ties by id ascending so the
+/// output is deterministic across runs (HashMap iteration order must not leak).
 pub fn rrf_fuse(lists: &[Vec<String>], k: f32) -> Vec<String> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     for list in lists {
@@ -18,7 +19,11 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: f32) -> Vec<String> {
         }
     }
     let mut ids: Vec<(String, f32)> = scores.into_iter().collect();
-    ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ids.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     ids.into_iter().map(|(id, _)| id).collect()
 }
 

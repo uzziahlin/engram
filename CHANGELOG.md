@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-08
+
+Deep-review fix batch (2026-09-08 全链路审查, see `docs/deep-review-2026-09.md`) plus the first feedback-loop / write-automation / graph-retrieval iterations.
+
+### Added
+- **`engram hook`**: Claude Code hook entry point — reads the Stop/SessionEnd hook payload from stdin (`transcript_path`, `session_id`, `cwd`) and distills the transcript into a memory via session-import. Empty sessions report `skipped`, not an error. Makes memory formation zero-config (see README §Integration).
+- **Session-import is idempotent per session**: re-importing the same `(project, session)` refreshes the existing episodic memory in place (upsert) instead of stacking near-duplicates — a `Stop` hook firing every turn now converges to exactly one memory that tracks the session as it grows. `SessionEnd` remains the recommended one-shot wiring.
+- **Graph-based retrieval**: `search_memory` now appends up to 2 memories that share an entity (file/tool) with the top hits, marked `graph_neighbor: true` at fixed low rank — the relationship graph finally participates in search. Toggle with `[retrieval].graph_expansion` (default true).
+- **Knowledge-gap report** in `engram maintain`: frequent queries that consistently return zero results (the cheapest signal for what memory to write next).
+- **Orphan entity GC**: `engram gc --apply` now also deletes File/Tool entities no relation references (previously unbounded growth + `related_files` noise); `maintain` previews the count.
+- **`[security] allowed_roots`** config: restrict `ingest_commits`/`collect_sources` `repo_path` to configured roots.
+- MCP transport: JSON-RPC `jsonrpc` version validation, and `ping`/`tools/list`/`prompts/list`/`initialize` are answered inline so a long tool call cannot starve client health probes.
+
+### Changed
+- **Ranking math rebuilt**: weights normalized to sum 1.0 (relevance dominant at 0.5), BM25 sigmoid rescaled to the real FTS5 score range, type-prior spread narrowed, and intents now raise *relevance* instead of only the query-independent priors — previously the static `failure>decision>episodic>procedural` prior effectively decided cross-type ranking regardless of the query.
+- **CJK search fixed for mixed-script text**: the preprocessor now splits CJK↔latin boundaries (`用Rust写` used to index as one unmatchable token) and preprocesses tags/files columns; schema migration v2 rebuilds existing FTS indexes with the new tokenization.
+- **Multi-token queries try AND first**, falling back to OR on empty results (was always-OR: "rust memory system" matched anything containing "system").
+- **FTS rowid alignment** (schema migration v2): FTS rows now share the main table's rowid, making update/delete FTS maintenance O(log n) instead of a full index scan per operation (verified via EXPLAIN QUERY PLAN).
+- **git ingest is lazy**: the rev walk sorts by commit time and stops after N — the entire history (100k+ commits on monorepos) is no longer decoded to fetch the newest 20.
+- **CLI `search` uses the full MCP pipeline** (intent → plan → rerank → optional semantic fuse); it was a bare-BM25 fork that ranked differently from the MCP tool.
+- Milestone clustering splits themes on >30-day gaps: years-apart `fix` commits no longer merge into one meaningless "milestone".
+- Tool failures now return MCP `result.isError = true` (business errors) or `-32602` (bad params / unknown tool) instead of blanket `-32603`; a broken config file is fatal for the MCP server too (it used to silently fall back to the default database — splitting data across two stores).
+- Semantic (feature build): cosine scores are injected into relevance (they were computed then discarded), explicit `memory_type`/`tags`/`before` filters apply to vector-only hits, `update_memory` re-embeds changed text, embeddings truncate at the model's 512-token limit (long inputs used to OOM/near-hang), and model changes with zero vectors now point at `engram reindex`.
+- Collector heuristics: TODO/NOTE no longer flood the annotation budget; py/sh/sql/lua `#`/`--` decision comments are recognized; CHANGELOG "Fixed" sections match exact words; repo-root `.circleci`/`.buildkite` configs are found; conventional-commit types are whitelist-checked; fix-detection scans the subject only; file collection walks are budgeted (entries/depth/time), deterministic (sorted), and read via streaming truncation (a multi-GB file can no longer OOM the collector).
+- `repo_path` from MCP clients is validated (must exist, be a directory, not the home directory or `/`; optional allowlist above).
+
+### Fixed
+- `get_*`/`update_*` enforce `project_id` in SQL (isolation no longer depends on every caller remembering to check); update can no longer move a memory across projects.
+- `limit` clamped to 1..=1000 and `days` to 0..=3650 on every tool (`limit=1000000` previously flowed into SQL; extreme `days` overflowed the timestamp arithmetic).
+- Empty queries and typo'd `memory_type` values are loud errors instead of silent empty results; `prompts/get` validates required arguments.
+- Startup no longer runs two full-table dedup writes on every command (one-time, index-existence guarded).
+- Reflection re-arm: rejecting a proposal no longer silences the tag forever — it re-proposes after `min_occurrences` NEW failures (migration v3).
+- near-dup consolidation pre-filters by length ratio before building word sets (the O(n²) hot path), and stale "time-window merging" docs corrected.
+
 ## [0.3.0] - 2026-09-07
 
 Read-path completion, lifecycle automation, and a deep-review fix batch.

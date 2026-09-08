@@ -824,6 +824,58 @@ fn test_jsonrpc_parse_error_response() {
 }
 
 #[test]
+fn search_surfaces_graph_neighbors() {
+    // Two memories touching the same file are graph-adjacent: searching
+    // for one must surface the other as a low-rank `graph_neighbor` even
+    // though its text doesn't match the query.
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+
+    let mk = |id: &str, summary: &str, files: Vec<&str>| crate::models::EpisodicMemory {
+        id: id.into(),
+        project_id: "p".into(),
+        session_id: "s".into(),
+        summary: summary.into(),
+        content: summary.into(),
+        files_touched: files.into_iter().map(String::from).collect(),
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec![],
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create_episodic(&mk(
+        "g1",
+        "authentication refactor SESSIONX",
+        vec!["auth.rs"],
+    ))
+    .unwrap();
+    repo.create_episodic(&mk("g2", "rate limiter UNRELATED", vec!["auth.rs"]))
+        .unwrap();
+
+    let resp = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "authentication refactor".into(),
+            limit: None,
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let results = resp.get("results").and_then(|r| r.as_array()).unwrap();
+    assert!(!results.is_empty());
+    let neighbor = results
+        .iter()
+        .find(|r| r.get("id").and_then(|i| i.as_str()) == Some("g2"))
+        .expect("graph-adjacent memory must surface");
+    assert_eq!(
+        neighbor.get("graph_neighbor").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
 fn test_jsonrpc_tools_call_unknown_tool() {
     let server = McpServer::new();
     let response = server.handle_request(JsonRpcRequest {
@@ -836,9 +888,11 @@ fn test_jsonrpc_tools_call_unknown_tool() {
         })),
     });
     assert!(response.error.is_some());
+    // MCP spec: an unknown tool name is an invalid parameter of tools/call,
+    // not a missing method (tools/call itself exists) — -32602, not -32601.
     let err = response.error.unwrap();
-    assert_eq!(err.code, -32601);
-    assert!(err.message.contains("Unknown tool"));
+    assert_eq!(err.code, -32602);
+    assert!(err.message.contains("unknown tool"));
 }
 
 #[test]

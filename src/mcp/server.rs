@@ -40,6 +40,20 @@ macro_rules! dispatch_tool {
     };
 }
 
+/// Clamp a caller-supplied `limit` into 1..=1000. Unclamped values flowed
+/// straight into SQL LIMIT and result materialization (limit=1_000_000 kept
+/// every row in memory; `limit * 3` overflowed in debug builds).
+fn clamp_limit(v: Option<usize>, default: usize) -> usize {
+    v.unwrap_or(default).clamp(1, 1000)
+}
+
+/// Clamp a `days` window into 0..=3650 (10 years). `now - days*86400`
+/// previously overflowed i64 on extreme values (saturating_mul saturates, but
+/// the subtraction then wrapped).
+fn clamp_days(days: i64) -> i64 {
+    days.clamp(0, 3650)
+}
+
 /// search_memory tool input.
 #[derive(Debug, Deserialize)]
 pub struct SearchMemoryInput {
@@ -397,6 +411,136 @@ impl DefaultMemoryProvider {
         &self.repo
     }
 
+    /// Record a search in the query log (retrieval-feedback signal for
+    /// `query_stats` / `engram queries`). Shared by the CLI `search` command;
+    /// the MCP `search_memory` tool records inline with its own rendering.
+    pub fn record_query(
+        &self,
+        project_id: &str,
+        query: &str,
+        result_ids: &[String],
+        memory_type: Option<&str>,
+    ) -> Result<()> {
+        self.repo.record_query(
+            project_id,
+            query,
+            result_ids,
+            memory_type,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// Full retrieval pipeline: validate → intent → plan → BM25 (+filters)
+    /// → semantic fuse → rerank → truncate. Returns ranked results; callers
+    /// decide how to render them.
+    pub fn search_core(
+        &self,
+        query: &str,
+        project_id: &str,
+        memory_type: Option<&str>,
+        tags: &[String],
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::retrieval::bm25::SearchResult>> {
+        if query.trim().is_empty() {
+            anyhow::bail!("query must be a non-empty string");
+        }
+        if let Some(mt) = memory_type {
+            // Fail loudly on a typo'd type instead of silently returning
+            // "no memories" — matches get/update/forget behavior.
+            MemoryKind::from_type_str(mt)?;
+        }
+
+        let repo = self.lock_repo();
+
+        // Intent routing is SOFT: it adjusts ranking weights (relevance/type/
+        // recency boosts in the plan below) but never narrows the memory
+        // types searched. Hard source-narrowing cost recall — e.g. a Workflow
+        // query could no longer surface a decision record about test design.
+        let intents = if self.config.retrieval.intent_routing {
+            self.classifier.classify(query)
+        } else {
+            vec![MemoryIntent::General]
+        };
+        let plan = self.planner.plan(&intents);
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // Filters shrink the candidate set post-retrieval, so over-fetch when
+        // any is present to keep result counts useful, then truncate to limit.
+        let has_filters = !tags.is_empty() || before.is_some();
+        let fetch_limit = if has_filters {
+            (limit * 3).min(100)
+        } else {
+            limit
+        };
+
+        let mut results = if let Some(mt) = memory_type {
+            BM25Retriever::search_by_type(repo, query, project_id, mt, fetch_limit)?
+        } else {
+            BM25Retriever::search_all(repo, query, project_id, fetch_limit)?
+        };
+
+        if has_filters {
+            results.retain(|r| {
+                let tags_ok = tags.is_empty() || r.tags.iter().any(|t| tags.contains(t));
+                let before_ok = before.map_or(true, |b| r.created_at < b);
+                tags_ok && before_ok
+            });
+        }
+
+        // Semantic fusion: when an embedder is present, blend vector top-K with
+        // the BM25 candidates via RRF via the embedding service. Vector-only
+        // hits are materialized so they can surface even when BM25 missed them.
+        #[cfg(feature = "semantic")]
+        {
+            if self.embedding.is_active() {
+                results = self.embedding.fuse(
+                    repo,
+                    query,
+                    project_id,
+                    results,
+                    self.config.semantic.top_k,
+                    self.config.semantic.rrf_k,
+                    memory_type,
+                    tags,
+                    before,
+                )?;
+            }
+        }
+
+        self.reranker.deduplicate(&mut results);
+        let half_life_seconds = (self.config.retrieval.recency_half_life_days as f32) * 86400.0;
+        self.reranker
+            .rerank(&mut results, &plan, now_ts, half_life_seconds);
+        results.truncate(limit);
+
+        // Graph-based second tier: memories that share an entity (file/tool)
+        // with the top hits are contextually related even when their text
+        // didn't match the query. Capped at 2 and appended below the reranked
+        // order, so this can only ADD context, never displace a match.
+        if self.config.retrieval.graph_expansion && !results.is_empty() {
+            const GRAPH_NEIGHBOR_CAP: usize = 2;
+            let seeds: Vec<String> = results.iter().take(3).map(|r| r.id.clone()).collect();
+            let existing: std::collections::HashSet<&str> =
+                results.iter().map(|r| r.id.as_str()).collect();
+            let neighbors = repo.neighbor_memories(project_id, &seeds, GRAPH_NEIGHBOR_CAP)?;
+            let fresh: Vec<(String, String)> = neighbors
+                .into_iter()
+                .filter(|(_, id)| !existing.contains(id.as_str()))
+                .collect();
+            for mut sr in BM25Retriever::fetch_by_ids(repo, &fresh, project_id)? {
+                // Fixed low relevance: these are "related by graph", not
+                // text matches — they must rank below every true hit.
+                sr.relevance_score = 0.30;
+                if let Some(obj) = sr.detail.as_object_mut() {
+                    obj.insert("graph_neighbor".to_string(), serde_json::Value::Bool(true));
+                }
+                results.push(sr);
+            }
+        }
+        Ok(results)
+    }
+
     /// Backfill embeddings for active memories (semantic feature).
     /// Forwards to the embedded `EmbeddingService`; see its `reindex` for
     /// the full `project`/`force`/`dry_run` semantics.
@@ -414,76 +558,23 @@ impl DefaultMemoryProvider {
 
 impl MemoryToolProvider for DefaultMemoryProvider {
     fn search_memory(&self, input: SearchMemoryInput) -> Result<serde_json::Value> {
-        let repo = self.lock_repo();
-        let classifier = &self.classifier;
-        let planner = &self.planner;
-        let reranker = &self.reranker;
-        let composer = &self.composer;
-
-        let limit = input
-            .limit
-            .unwrap_or(self.config.retrieval.default_limit)
-            .max(1);
-
-        // Intent routing is SOFT: it adjusts ranking weights (type/recency/
-        // importance boosts in the plan below) but never narrows the memory
-        // types searched. Hard source-narrowing cost recall — e.g. a Workflow
-        // query could no longer surface a decision record about test design.
-        let intents = if self.config.retrieval.intent_routing {
-            classifier.classify(&input.query)
-        } else {
-            vec![MemoryIntent::General]
-        };
-        let plan = planner.plan(&intents);
+        let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
         let now_ts = chrono::Utc::now().timestamp();
 
-        // Filters shrink the candidate set post-retrieval, so over-fetch when
-        // any is present to keep result counts useful, then truncate to limit.
-        let has_filters = !input.tags.is_empty() || input.before.is_some();
-        let fetch_limit = if has_filters { (limit * 3).min(100) } else { limit };
-
-        let mut results = if let Some(ref mt) = input.memory_type {
-            BM25Retriever::search_by_type(repo, &input.query, &input.project_id, mt, fetch_limit)?
-        } else {
-            BM25Retriever::search_all(repo, &input.query, &input.project_id, fetch_limit)?
-        };
-
-        if has_filters {
-            results.retain(|r| {
-                let tags_ok =
-                    input.tags.is_empty() || r.tags.iter().any(|t| input.tags.contains(t));
-                let before_ok = input.before.map_or(true, |b| r.created_at < b);
-                tags_ok && before_ok
-            });
-        }
-
-        // Semantic fusion: when an embedder is present, blend vector top-K with
-        // the BM25 candidates via RRF via the embedding service. Vector-only
-        // hits are materialized so they can surface even when BM25 missed them.
-        #[cfg(feature = "semantic")]
-        {
-            if self.embedding.is_active() {
-                results = self.embedding.fuse(
-                    repo,
-                    &input.query,
-                    &input.project_id,
-                    results,
-                    self.config.semantic.top_k,
-                    self.config.semantic.rrf_k,
-                )?;
-            }
-        }
-
-        reranker.deduplicate(&mut results);
-        let half_life_seconds = (self.config.retrieval.recency_half_life_days as f32) * 86400.0;
-        reranker.rerank(&mut results, &plan, now_ts, half_life_seconds);
-        results.truncate(limit);
+        let results = self.search_core(
+            &input.query,
+            &input.project_id,
+            input.memory_type.as_deref(),
+            &input.tags,
+            input.before,
+            limit,
+        )?;
 
         let budget = ContextBudget::new(
             self.config.context.context_window_tokens,
             self.config.context.memory_budget_percent,
         );
-        let context = composer.compose_context(&results, &budget);
+        let context = self.composer.compose_context(&results, &budget);
 
         // Results carry each memory's full type-specific payload (root_cause/
         // fix/prevention, context/tradeoffs, steps, content…): search is the
@@ -513,7 +604,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         // `query_stats` / `engram queries` can surface hit-rate signal. A
         // logging failure must never break search.
         let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-        if let Err(e) = repo.record_query(
+        if let Err(e) = self.repo.record_query(
             &input.project_id,
             &input.query,
             &result_ids,
@@ -535,12 +626,14 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let kind = MemoryKind::from_type_str(&input.memory_type)?;
         macro_rules! fetch {
             ($get:ident) => {{
-                let mem = repo
-                    .$get(&input.id)?
-                    .ok_or_else(|| anyhow::anyhow!("memory not found: {}", input.id))?;
-                if mem.project_id != input.project_id {
-                    anyhow::bail!("memory does not belong to project {}", input.project_id);
-                }
+                // project scoping is enforced in the SQL itself
+                let mem = repo.$get(&input.id, &input.project_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "memory not found in project {}: {}",
+                        input.project_id,
+                        input.id
+                    )
+                })?;
                 serde_json::to_value(&mem)?
             }};
         }
@@ -582,7 +675,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let since = chrono::Utc::now().timestamp() - (input.days.saturating_mul(86400));
+        let since = chrono::Utc::now().timestamp() - clamp_days(input.days).saturating_mul(86400);
         let rows = repo.timeline(&input.project_id, since)?;
         let events: Vec<serde_json::Value> = rows
             .iter()
@@ -598,11 +691,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let limit = input
-            .limit
-            .unwrap_or(self.config.retrieval.default_limit)
-            .max(1);
-        let since = chrono::Utc::now().timestamp() - (input.days.saturating_mul(86400));
+        let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
+        let since = chrono::Utc::now().timestamp() - clamp_days(input.days).saturating_mul(86400);
         let rows = repo.query_stats(&input.project_id, since, limit)?;
         let queries: Vec<serde_json::Value> = rows
             .iter()
@@ -620,10 +710,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let limit = input
-            .limit
-            .unwrap_or(self.config.retrieval.default_limit)
-            .max(1);
+        let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
         let query = input.service.as_deref().unwrap_or("");
         let results = if query.is_empty() {
             repo.list_recent_failures(&input.project_id, limit)?
@@ -663,10 +750,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         input: ArchitecturalDecisionsInput,
     ) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        let limit = input
-            .limit
-            .unwrap_or(self.config.retrieval.default_limit)
-            .max(1);
+        let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
         let query = input.topic.as_deref().unwrap_or("");
         let results = if query.is_empty() {
             repo.list_recent_decisions(&input.project_id, limit)?
@@ -915,8 +999,13 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn ingest_commits(&self, input: IngestCommitsInput) -> Result<serde_json::Value> {
         let count = input.count.clamp(1, 1000);
-        let repo_path = std::path::Path::new(&input.repo_path);
-        let git = GitIntegration::new(repo_path)?;
+        // repo_path is agent-controlled: validate before touching the disk
+        // (home dir / FS root / outside-allowlist rejection).
+        let repo_path = crate::path_guard::validate_repo_path(
+            std::path::Path::new(&input.repo_path),
+            &self.config.security.allowed_roots,
+        )?;
+        let git = GitIntegration::new(&repo_path)?;
         let session_id = input.session_id.unwrap_or_else(|| "auto-ingest".into());
 
         let events = git.get_recent_commits(count)?;
@@ -933,11 +1022,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         // One memory per (type, scope) milestone instead of one per commit —
         // the distillation git_collector's bootstrap path always intended.
-        let memories = crate::git_integration::milestone_memories(
-            &input.project_id,
-            &session_id,
-            &fresh,
-        );
+        let memories =
+            crate::git_integration::milestone_memories(&input.project_id, &session_id, &fresh);
 
         let mut ingested = Vec::new();
         for mem in &memories {
@@ -975,8 +1061,9 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         };
 
         let opts = collectors::CollectOptions {
-            max_commits: input.max_commits.min(1000),
+            max_commits: input.max_commits.clamp(1, 1000),
             ingested_commit_hashes: ingested_hashes,
+            allowed_roots: self.config.security.allowed_roots.clone(),
             ..Default::default()
         };
 
@@ -1019,15 +1106,16 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
 
-        // Guard: the fetched memory must belong to the caller's project.
         macro_rules! guarded_update {
             ($get:ident, $update:ident) => {{
-                let existing = repo
-                    .$get(&input.id)?
-                    .ok_or_else(|| anyhow::anyhow!("memory not found: {}", input.id))?;
-                if existing.project_id != input.project_id {
-                    anyhow::bail!("memory does not belong to project {}", input.project_id);
-                }
+                // project scoping is enforced in the SQL itself
+                let existing = repo.$get(&input.id, &input.project_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "memory not found in project {}: {}",
+                        input.project_id,
+                        input.id
+                    )
+                })?;
                 let updated = merge_patch(&existing, &input.patch, now)?;
                 repo.$update(&updated)?;
             }};
@@ -1038,6 +1126,34 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             MemoryKind::Decision => guarded_update!(get_decision, update_decision),
             MemoryKind::Failure => guarded_update!(get_failure, update_failure),
             MemoryKind::Procedural => guarded_update!(get_procedural, update_procedural),
+        }
+
+        // Semantic freshness: re-embed the updated text so vector search
+        // matches what the memory now says. The create path embeds; without
+        // this, update left the OLD text's vector in place indefinitely.
+        #[cfg(feature = "semantic")]
+        {
+            if self.embedding.is_active() {
+                macro_rules! reembed {
+                    ($get:ident) => {{
+                        if let Some(m) = self.repo.$get(&input.id, &input.project_id)? {
+                            self.embedding.index(
+                                &self.repo,
+                                kind.as_str(),
+                                &input.id,
+                                &input.project_id,
+                                &m.embedding_text(),
+                            );
+                        }
+                    }};
+                }
+                match kind {
+                    MemoryKind::Episodic => reembed!(get_episodic),
+                    MemoryKind::Decision => reembed!(get_decision),
+                    MemoryKind::Failure => reembed!(get_failure),
+                    MemoryKind::Procedural => reembed!(get_procedural),
+                }
+            }
         }
 
         Ok(serde_json::json!({
@@ -1080,10 +1196,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     fn list_archived(&self, input: ListArchivedInput) -> Result<serde_json::Value> {
         let kinds = resolve_kinds(&input.memory_type)?;
         let repo = self.lock_repo();
-        let limit = input
-            .limit
-            .unwrap_or(self.config.retrieval.default_limit)
-            .max(1);
+        let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
         let mut archived: Vec<serde_json::Value> = Vec::new();
         for kind in kinds {
             for row in repo.list_archived(kind, &input.project_id, limit)? {
@@ -1632,6 +1745,18 @@ impl McpServer {
             "prompts/get" => {
                 let params = request.params.unwrap_or_default();
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    return JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: "Invalid params: prompts/get requires a string 'name'".into(),
+                            data: None,
+                        }),
+                    };
+                }
                 if name != BOOTSTRAP_PROMPT_NAME {
                     JsonRpcResponse {
                         jsonrpc: "2.0".into(),
@@ -1645,14 +1770,26 @@ impl McpServer {
                     }
                 } else {
                     let args = params.get("arguments").cloned().unwrap_or_default();
-                    let project_id = args
-                        .get("project_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<project_id>");
-                    let repo_path = args
-                        .get("repo_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<repo_path>");
+                    // prompts/list declares project_id/repo_path as required —
+                    // enforce it here instead of silently rendering "<project_id>"
+                    // placeholders into the prompt the agent will follow.
+                    let (Some(project_id), Some(repo_path)) = (
+                        args.get("project_id").and_then(|v| v.as_str()),
+                        args.get("repo_path").and_then(|v| v.as_str()),
+                    ) else {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: "Invalid params: engram.bootstrap requires string \
+                                          arguments 'project_id' and 'repo_path'"
+                                    .into(),
+                                data: None,
+                            }),
+                        };
+                    };
                     let dimensions = args
                         .get("dimensions")
                         .and_then(|v| v.as_str())
@@ -1674,7 +1811,24 @@ impl McpServer {
             }
             "tools/call" => {
                 let params = request.params.unwrap_or_default();
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                // A missing/non-string `name` is a malformed tools/call —
+                // report it as invalid params instead of "unknown tool ''".
+                let tool_name = match params.get("name").and_then(|v| v.as_str()) {
+                    Some(n) if !n.is_empty() => n,
+                    _ => {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: "Invalid params: tools/call requires a string 'name'"
+                                    .into(),
+                                data: None,
+                            }),
+                        };
+                    }
+                };
                 let arguments = params.get("arguments").cloned().unwrap_or_default();
 
                 let (result, parse_error): (
@@ -1781,8 +1935,13 @@ impl McpServer {
                     _ => (
                         None,
                         Some(JsonRpcError {
-                            code: -32601,
-                            message: format!("Unknown tool: {tool_name}"),
+                            // MCP spec: an unknown tool name on tools/call is a
+                            // parameter problem of THIS method, not a missing
+                            // method (-32601 was wrong — the method exists).
+                            code: -32602,
+                            message: format!(
+                                "Invalid params: unknown tool {tool_name:?}; see tools/list"
+                            ),
                             data: None,
                         }),
                     ),
@@ -1805,15 +1964,20 @@ impl McpServer {
                             })),
                             error: None,
                         },
+                        // Tool business failures (memory not found, bad
+                        // severity, …) are NOT protocol errors: the MCP spec
+                        // requires `result.isError = true` so clients can show
+                        // the message to the agent, which can then fix its
+                        // arguments. JSON-RPC errors stay reserved for
+                        // protocol/transport failures and panics.
                         Err(e) => JsonRpcResponse {
                             jsonrpc: "2.0".into(),
                             id: request.id,
-                            result: None,
-                            error: Some(JsonRpcError {
-                                code: -32603,
-                                message: format!("Internal error: {e}"),
-                                data: None,
-                            }),
+                            result: Some(serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("error: {e}") }],
+                                "isError": true,
+                            })),
+                            error: None,
                         },
                     }
                 }
@@ -1835,6 +1999,22 @@ impl McpServer {
 impl RequestHandler for McpServer {
     fn handle(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         self.handle_request(req)
+    }
+
+    fn fast_path_methods(&self) -> &'static [&'static str] {
+        // Static, read-only responses that never touch the repository — safe
+        // to answer inline (concurrently with a busy worker) so client health
+        // probes stay responsive during long tool calls like ingest/reindex.
+        &["ping", "tools/list", "prompts/list", "initialize"]
+    }
+}
+
+/// Test-only repo accessor (the field is private; tests build their own
+/// provider via `make_provider` and need to seed memories).
+#[cfg(test)]
+impl DefaultMemoryProvider {
+    pub fn repo_for_test(&self) -> &MemoryRepository {
+        &self.repo
     }
 }
 

@@ -151,6 +151,40 @@ engram init-guide            # writes ENGRAM.md (project_id defaults to the dir 
 
 `@ENGRAM.md` uses Claude Code's import syntax, so the guide loads with your `CLAUDE.md`.
 
+#### Automatic memory formation (hooks)
+
+Instead of relying on the agent remembering to write memories, wire engram to
+Claude Code's `Stop` hook and every session is distilled into an episodic
+memory automatically. Add to your project's `.claude/settings.json` (or
+`~/.claude/settings.json` for all projects):
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "engram hook --project myproj" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`engram hook` reads the hook payload (transcript path, session id, working
+directory) from stdin, distills the session transcript into one episodic
+memory tagged `session-import`, and reports `skipped` (not an error) for
+sessions with nothing worth recording. `--project` defaults to the payload
+`cwd`'s directory name. Pair it with a weekly `engram maintain --apply` to
+consolidate duplicates and prune the query log.
+
+`SessionEnd` fires once per session with the complete transcript — the
+recommended wiring. `Stop` (every agent turn) also works: imports are
+**idempotent per session** — re-importing refreshes the existing memory in
+place instead of stacking near-duplicates, so the memory tracks the session
+as it grows.
+
 ### Cursor
 
 Add to your Cursor MCP settings (`Settings → MCP`):
@@ -273,16 +307,23 @@ query_log_retention_days = 90            # `engram maintain` prunes older query_
 default_limit = 10                       # Default result count when a tool omits `limit`
 recency_half_life_days = 30              # Recency decay half-life (days) for reranking
 intent_routing = true                    # Intent keywords adjust ranking weights (soft); every memory type is always searched
-weight_relevance = 0.4                   # BM25 score weight in the final ranking
-weight_recency = 0.2                     # Base recency-decay weight (intents may raise it via max)
-weight_importance = 0.4                  # Base per-record importance weight (intents may raise it via max)
-weight_type = 0.4                        # Base memory-type prior weight (intents may raise it via max)
+graph_expansion = true                   # Append up to 2 graph-adjacent memories (shared files/tools) below the ranked hits
+# Ranking-signal weights, normalized to sum 1 at load. Relevance (the BM25 /
+# semantic match) is the dominant signal; the others only break ties.
+weight_relevance = 0.5
+weight_recency = 0.15
+weight_importance = 0.2
+weight_type = 0.15
 [context]
 context_window_tokens = 200000           # LLM context window size
 memory_budget_percent = 15               # % of context for memories
 
 [mcp]
 worker_threads = 1                       # Concurrent request handlers (default 1 = FIFO sequential; raise only if your client pipelines independent requests)
+
+[security]                              # Guards for agent-supplied repo_path (prompt-injection defense)
+allowed_roots = []                      # Non-empty: ingest/collect only accept paths under these roots
+                                         # (home dir and / are always rejected)
 
 [semantic]                               # Semantic search — only active in builds compiled with --features semantic
 enabled = false                          # Turn on embedding-based retrieval
@@ -327,7 +368,7 @@ Data is stored in `~/.engram/memory.db` by default.
 - **Project isolation** — all memories scoped by `project_id`, supporting multi-project workflows
 - **BM25 via FTS5** — built into SQLite, no external search engine needed
 - **CJK-aware search** — Chinese/Japanese/Korean queries get character-level segmentation (spaces inserted between CJK runes), and FTS5 reserved words in a query are escaped so terms like `UNIQUE` or `AND` match as text rather than column filters. The intent classifier recognizes Chinese keywords too (e.g. 调试/修复, 架构/决策).
-- **Ranking signals** — `search_memory` reranks BM25 results by recency (exponential half-life decay against the real clock), per-record `importance`, and a memory-type prior (`type_weight`). The relationship graph powers `related_files` only; it does **not** participate in search ranking.
+- **Ranking signals** — `search_memory` reranks BM25 results with weights normalized to sum 1: relevance (the normalized BM25 — or fused semantic — score) dominates; recency (exponential half-life decay against the real clock), per-record `importance`, and a narrow memory-type prior only break ties. Classified intents raise *relevance* (the query matched that domain), never the static priors. The relationship graph contributes second-tier candidates: memories sharing a file/tool entity with the top hits are appended at low rank, marked `graph_neighbor: true`.
 - **Connection pool + concurrency** — the repository uses an r2d2 pool over WAL-mode SQLite (multi-reader, single-writer via `busy_timeout`); concurrent reads no longer serialize. MCP request handling dispatches to a bounded worker pool (`[mcp] worker_threads`, default 1 = FIFO sequential — safe for stdio clients that pipeline dependent requests; raise only for independent workloads).
 - **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. Vectors are stored as BLOBs in SQLite and scored by brute-force cosine over the active set (no separate vector index), so semantic search suits thousands — not millions — of memories per project. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
 
@@ -431,7 +472,9 @@ Re-running is idempotent — commits already stored as episodic memories are ski
 - [x] CLI interface
 - [x] Memory consolidation (dedup + soft-delete lifecycle: forget/restore/update)
 - [x] Embedding-based semantic search (candle + RRF fusion, behind the `semantic` feature)
-- [x] Reflection engine (self-improving retrieval)
+- [x] Reflection engine (failure-to-rule distillation with confirm/reject lifecycle + knowledge-gap reporting via `engram maintain`)
+- [x] Write automation (`engram hook` — Claude Code Stop/SessionEnd hooks distill sessions automatically)
+- [x] Graph-participating retrieval (shared-entity neighbors as second-tier search candidates)
 - [ ] HTTP MCP transport (for remote access)
 - [ ] Multi-agent memory sharing
 

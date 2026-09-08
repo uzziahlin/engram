@@ -231,179 +231,67 @@ pub fn init_guide(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Whether a memory passes the `--tag`/`--before` filters (ANY-tag semantics,
-/// matching forget-batch and the MCP search filter).
-fn matches_filters(tags: &[String], created_at: i64, ftags: &[String], before: Option<i64>) -> bool {
-    (ftags.is_empty() || tags.iter().any(|t| ftags.contains(t)))
-        && before.map_or(true, |b| created_at < b)
-}
-
 pub fn search(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let query = require_str(args, "query")?;
     let memory_type = optional_str(args, "type");
-    let limit = optional_num(args, "limit").unwrap_or(10.0) as usize;
     let tags = repeated_args(args, "tag");
     let before = optional_num(args, "before").map(|n| n as i64);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
-    // Collect (bm25 score, item) pairs so the all-types path can merge-sort
-    // across types instead of concatenating in fixed type order and letting
-    // episodic crowd out everything else at the truncate boundary.
-    let mut scored: Vec<(f64, serde_json::Value)> = if let Some(ref mt) = memory_type {
-        match mt.as_str() {
-            "episodic" => repo
-                .search_episodic(&query, &project_id, limit)?
-                .into_iter()
-                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
-                .map(|m| {
-                    (
-                        m.bm25_score,
-                        serde_json::json!({
-                            "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
-                            "content": m.memory.content, "files": m.memory.files_touched,
-                            "importance": m.memory.importance, "tags": m.memory.tags,
-                            "created_at": m.memory.created_at,
-                        }),
-                    )
-                })
-                .collect(),
-            "decision" => repo
-                .search_decisions(&query, &project_id, limit)?
-                .into_iter()
-                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
-                .map(|m| {
-                    (
-                        m.bm25_score,
-                        serde_json::json!({
-                            "id": m.memory.id, "type": "decision", "title": m.memory.title,
-                            "context": m.memory.context, "rationale": m.memory.rationale,
-                            "tradeoffs": m.memory.tradeoffs, "tags": m.memory.tags,
-                            "created_at": m.memory.created_at,
-                        }),
-                    )
-                })
-                .collect(),
-            "failure" => repo
-                .search_failures(&query, &project_id, limit)?
-                .into_iter()
-                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
-                .map(|m| {
-                    (
-                        m.bm25_score,
-                        serde_json::json!({
-                            "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
-                            "root_cause": m.memory.root_cause, "fix": m.memory.fix,
-                            "prevention": m.memory.prevention, "severity": m.memory.severity,
-                            "tags": m.memory.tags, "created_at": m.memory.created_at,
-                        }),
-                    )
-                })
-                .collect(),
-            "procedural" => repo
-                .search_procedural(&query, &project_id, limit)?
-                .into_iter()
-                .filter(|m| matches_filters(&m.memory.tags, m.memory.created_at, &tags, before))
-                .map(|m| {
-                    (
-                        m.bm25_score,
-                        serde_json::json!({
-                            "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
-                            "steps": m.memory.steps, "tools": m.memory.related_tools,
-                            "tags": m.memory.tags, "created_at": m.memory.created_at,
-                        }),
-                    )
-                })
-                .collect(),
-            _ => anyhow::bail!(
-                "Unknown memory type: {mt}. Use: episodic, decision, failure, procedural"
-            ),
-        }
-    } else {
-        // Search all types — errors propagate (`?`): a DB failure must not
-        // masquerade as "no results" with exit code 0.
-        let mut all: Vec<(f64, serde_json::Value)> = Vec::new();
-        for m in repo.search_episodic(&query, &project_id, limit)? {
-            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
-                all.push((
-                    m.bm25_score,
-                    serde_json::json!({
-                        "id": m.memory.id, "type": "episodic", "summary": m.memory.summary,
-                        "content": m.memory.content, "importance": m.memory.importance,
-                        "tags": m.memory.tags, "created_at": m.memory.created_at,
-                    }),
-                ));
-            }
-        }
-        for m in repo.search_decisions(&query, &project_id, limit)? {
-            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
-                all.push((
-                    m.bm25_score,
-                    serde_json::json!({
-                        "id": m.memory.id, "type": "decision", "title": m.memory.title,
-                        "rationale": m.memory.rationale, "tradeoffs": m.memory.tradeoffs,
-                        "tags": m.memory.tags, "created_at": m.memory.created_at,
-                    }),
-                ));
-            }
-        }
-        for m in repo.search_failures(&query, &project_id, limit)? {
-            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
-                all.push((
-                    m.bm25_score,
-                    serde_json::json!({
-                        "id": m.memory.id, "type": "failure", "incident": m.memory.incident,
-                        "severity": m.memory.severity, "fix": m.memory.fix,
-                        "root_cause": m.memory.root_cause, "prevention": m.memory.prevention,
-                        "tags": m.memory.tags, "created_at": m.memory.created_at,
-                    }),
-                ));
-            }
-        }
-        for m in repo.search_procedural(&query, &project_id, limit)? {
-            if matches_filters(&m.memory.tags, m.memory.created_at, &tags, before) {
-                all.push((
-                    m.bm25_score,
-                    serde_json::json!({
-                        "id": m.memory.id, "type": "procedural", "workflow": m.memory.workflow_name,
-                        "steps": m.memory.steps, "tags": m.memory.tags,
-                        "created_at": m.memory.created_at,
-                    }),
-                ));
-            }
-        }
-        all
-    };
+    // Same pipeline as the MCP search_memory tool — intent → plan → BM25 →
+    // (semantic fuse) → rerank. The CLI previously ran a bare-BM25 fork that
+    // ranked differently from MCP on the same query and duplicated the field
+    // mapping for all four memory types (which had already drifted).
+    let limit = optional_num(args, "limit")
+        .map(|n| n.clamp(1.0, 1000.0) as usize)
+        .unwrap_or(config.retrieval.default_limit);
+    let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+    let results = provider.search_core(
+        &query,
+        &project_id,
+        memory_type.as_deref(),
+        &tags,
+        before,
+        limit,
+    )?;
 
-    // Merge-sort by BM25 score across types, then truncate — replaces the old
-    // fixed-order concat + truncate that always favored episodic.
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let results: Vec<serde_json::Value> = scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, item)| item)
+    let results_out: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            let mut item = serde_json::json!({
+                "id": r.id,
+                "type": r.memory_type,
+                "summary": r.summary,
+                "score": (r.relevance_score.clamp(0.0, 1.0) * 100.0).round() / 100.0,
+                "importance": (r.importance * 100.0).round() / 100.0,
+                "tags": r.tags,
+                "created_at": r.created_at,
+            });
+            if let (Some(obj), Some(detail)) = (item.as_object_mut(), r.detail.as_object()) {
+                for (k, v) in detail {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            item
+        })
         .collect();
 
     // Best-effort retrieval feedback (mirrors MCP search_memory): log this
     // query + its hits so `engram queries` / MCP `query_stats` can surface
     // hit-rate signal. A logging failure never breaks the command.
-    let result_ids: Vec<String> = results
-        .iter()
-        .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
-        .collect();
-    if let Err(e) = repo.record_query(
-        &project_id,
-        &query,
-        &result_ids,
-        memory_type.as_deref(),
-        now_ts(),
-    ) {
+    let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    if let Err(e) = provider.record_query(&project_id, &query, &result_ids, memory_type.as_deref())
+    {
         tracing::warn!("query log failed: {e}");
     }
 
-    print_json(&serde_json::json!({"results": results, "total": results.len()}));
+    print_json(&serde_json::json!({
+        "results": results_out,
+        "total": results_out.len(),
+    }));
     Ok(())
 }
 
@@ -483,7 +371,13 @@ pub fn create_failure(args: &[String]) -> Result<()> {
     let root_cause = require_str(args, "root-cause")?;
     let fix = require_str(args, "fix")?;
     let prevention = require_str(args, "prevention")?;
-    let severity = optional_num(args, "severity").unwrap_or(3.0) as u8;
+    let severity = {
+        let v = optional_num(args, "severity").unwrap_or(3.0);
+        if !(1.0..=5.0).contains(&v) {
+            anyhow::bail!("severity must be between 1 and 5, got {v}");
+        }
+        v as u8
+    };
     let tags = repeated_args(args, "tag");
 
     let config = load_config()?;
@@ -593,7 +487,7 @@ pub fn collect(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let repo_path = require_str(args, "repo")?;
     let dimensions = optional_str(args, "dimensions");
-    let max_commits = (optional_num(args, "max-commits").unwrap_or(200.0) as usize).min(1000);
+    let max_commits = (optional_num(args, "max-commits").unwrap_or(200.0) as usize).clamp(1, 1000);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
@@ -622,7 +516,7 @@ pub fn collect(args: &[String]) -> Result<()> {
 pub fn recent_failures(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let service = optional_str(args, "service");
-    let limit = optional_num(args, "limit").unwrap_or(5.0) as usize;
+    let limit = (optional_num(args, "limit").unwrap_or(5.0) as usize).clamp(1, 1000);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
@@ -658,7 +552,7 @@ pub fn recent_failures(args: &[String]) -> Result<()> {
 pub fn decisions(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let topic = optional_str(args, "topic");
-    let limit = optional_num(args, "limit").unwrap_or(5.0) as usize;
+    let limit = (optional_num(args, "limit").unwrap_or(5.0) as usize).clamp(1, 1000);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
@@ -726,7 +620,7 @@ pub fn timeline(args: &[String]) -> Result<()> {
 pub fn queries(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let days = optional_num(args, "days").unwrap_or(7.0) as i64;
-    let limit = optional_num(args, "limit").unwrap_or(10.0) as usize;
+    let limit = (optional_num(args, "limit").unwrap_or(10.0) as usize).clamp(1, 1000);
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
@@ -806,11 +700,8 @@ pub fn update(args: &[String]) -> Result<()> {
     macro_rules! guarded {
         ($get:ident, $update:ident) => {{
             let existing = repo
-                .$get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
-            if existing.project_id != project_id {
-                anyhow::bail!("memory does not belong to project {project_id}");
-            }
+                .$get(&id, &project_id)?
+                .ok_or_else(|| anyhow::anyhow!("memory not found in project {project_id}: {id}"))?;
             let mut obj = match serde_json::to_value(&existing)? {
                 serde_json::Value::Object(m) => m,
                 _ => anyhow::bail!("memory did not serialize to object"),
@@ -823,7 +714,9 @@ pub fn update(args: &[String]) -> Result<()> {
                     obj.insert(k.clone(), v.clone());
                 } else {
                     // A typo'd key used to vanish silently; say so.
-                    eprintln!("warning: unknown field '{k}' ignored (no such field on this memory type)");
+                    eprintln!(
+                        "warning: unknown field '{k}' ignored (no such field on this memory type)"
+                    );
                 }
             }
             obj.insert("updated_at".into(), serde_json::json!(now));
@@ -875,7 +768,7 @@ pub fn forget_batch(args: &[String]) -> Result<()> {
 pub fn list_archived(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = optional_str(args, "type");
-    let limit = optional_num(args, "limit").unwrap_or(20.0) as usize;
+    let limit = (optional_num(args, "limit").unwrap_or(20.0) as usize).clamp(1, 1000);
     let kinds = match memory_type {
         Some(s) => vec![crate::storage::MemoryKind::from_type_str(&s)?],
         None => crate::storage::MemoryKind::all().to_vec(),
@@ -934,7 +827,16 @@ pub fn gc(args: &[String]) -> Result<()> {
     let now = now_ts();
 
     let report = repo.gc_archived(older_than_seconds, apply, now)?;
-    print_json(&serde_json::to_value(&report)?);
+    // Orphan File/Tool entities left behind by deleted memories go with the
+    // same pass (counted separately — it is not an archived-memory delete).
+    let orphan_entities = repo.gc_orphan_entities(apply)?;
+    print_json(&serde_json::json!({
+        "applied": report.applied,
+        "older_than_seconds": report.older_than_seconds,
+        "per_type": report.per_type,
+        "deleted": report.deleted,
+        "orphan_entities_removed": orphan_entities,
+    }));
 
     // Reclaim space: checkpoint the WAL (best-effort), then optionally VACUUM.
     if apply && !no_checkpoint {
@@ -1098,12 +1000,10 @@ pub fn get(args: &[String]) -> Result<()> {
 
     macro_rules! fetch {
         ($get:ident) => {{
+            // project scoping is enforced in the SQL itself
             let mem = repo
-                .$get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
-            if mem.project_id != project_id {
-                anyhow::bail!("memory does not belong to project {project_id}");
-            }
+                .$get(&id, &project_id)?
+                .ok_or_else(|| anyhow::anyhow!("memory not found in project {project_id}: {id}"))?;
             serde_json::to_value(&mem)?
         }};
     }
@@ -1167,8 +1067,10 @@ pub fn maintain(args: &[String]) -> Result<()> {
     let fts_rows = repo.rebuild_fts()?;
 
     // 3. query_log retention prune.
-    let retention_secs =
-        (config.storage.query_log_retention_days.saturating_mul(86_400)) as i64;
+    let retention_secs = (config
+        .storage
+        .query_log_retention_days
+        .saturating_mul(86_400)) as i64;
     let pruned = if apply {
         repo.prune_query_log(retention_secs, now)?
     } else {
@@ -1183,6 +1085,26 @@ pub fn maintain(args: &[String]) -> Result<()> {
 
     // 5. GC preview (dry-run only; physical delete stays explicit).
     let gc_report = repo.gc_archived(0, false, now)?;
+    let orphan_entities = repo.gc_orphan_entities(false)?;
+
+    // 6. Knowledge gaps (feedback loop): frequent queries that consistently
+    // return zero results are the cheapest signal for what to write next —
+    // surfaced here instead of rotting inside query_log.
+    let gap_window = 30 * 86_400;
+    let mut knowledge_gaps: Vec<serde_json::Value> = Vec::new();
+    for p in &projects {
+        for stat in repo.query_stats(p, now - gap_window, 20)? {
+            if stat.result_count_avg < 0.5 && stat.count >= 2 {
+                knowledge_gaps.push(serde_json::json!({
+                    "project": p,
+                    "query": stat.query,
+                    "searches": stat.count,
+                    "avg_hits": stat.result_count_avg,
+                }));
+            }
+        }
+    }
+    knowledge_gaps.truncate(20);
 
     print_json(&serde_json::json!({
         "applied": apply,
@@ -1197,7 +1119,16 @@ pub fn maintain(args: &[String]) -> Result<()> {
         "stale": stale,
         "gc_preview": {
             "archived_eligible_for_gc": gc_report.deleted.len(),
+            "orphan_entities": orphan_entities,
             "note": "run `engram gc --older-than <dur> --apply` to physically purge",
+        },
+        "knowledge_gaps": if knowledge_gaps.is_empty() {
+            serde_json::json!({ "note": "no repeated zero-hit queries in the last 30 days" })
+        } else {
+            serde_json::json!({
+                "note": "frequent queries with no results — write a memory covering these",
+                "gaps": knowledge_gaps,
+            })
         },
     }));
     Ok(())
@@ -1277,7 +1208,9 @@ pub fn session_import(args: &[String]) -> Result<()> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
 
     let path = Path::new(&transcript);
-    let text = std::fs::read_to_string(path)
+    // Streaming bounded read: Claude Code transcripts can reach hundreds of
+    // MB; the distiller only needs prompts/edits/conclusions, so cap at 64MB.
+    let text = read_text_bounded(path, 64 * 1024 * 1024)
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
     let digest = parse_transcript(&text);
 
@@ -1309,7 +1242,15 @@ pub fn session_import(args: &[String]) -> Result<()> {
     }
     if !digest.files.is_empty() {
         content.push_str(&format!("\nFiles touched ({}):\n", digest.files.len()));
-        content.push_str(&digest.files.iter().take(50).cloned().collect::<Vec<_>>().join(", "));
+        content.push_str(
+            &digest
+                .files
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     let content: String = content.chars().take(4000).collect();
 
@@ -1337,15 +1278,84 @@ pub fn session_import(args: &[String]) -> Result<()> {
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
-    repo.create_episodic(&memory)?;
+    let action = upsert_session_memory(&repo, &memory, now)?;
     print_json(&serde_json::json!({
-        "id": memory.id,
-        "status": "created",
+        "id": action.id,
+        "status": action.status, // "created" | "updated"
         "session_id": session_id,
-        "files": memory.files_touched.len(),
+        "files": action.files,
         "created_at": now,
     }));
     Ok(())
+}
+
+/// Idempotent session-import write: if an active episodic already exists for
+/// this (project, session), REFRESH it instead of creating a near-duplicate.
+///
+/// Hook wiring fires on every `Stop` (each agent turn), and the transcript
+/// keeps growing — without this, one session produced N overlapping memories.
+/// Upsert semantics make both `Stop` (memory tracks the session live) and
+/// `SessionEnd` (one final import) converge to exactly one memory.
+struct SessionUpsert {
+    id: String,
+    status: &'static str,
+    files: usize,
+}
+
+fn upsert_session_memory(
+    repo: &crate::storage::MemoryRepository,
+    memory: &EpisodicMemory,
+    now: i64,
+) -> Result<SessionUpsert> {
+    if let Some(mut existing) =
+        repo.find_episodic_by_session(&memory.project_id, &memory.session_id)?
+    {
+        existing.summary = memory.summary.clone();
+        existing.content = memory.content.clone();
+        existing.files_touched = memory.files_touched.clone();
+        // Union tags: keep anything added after the first import (user
+        // curation), but don't re-add a marker tag the user removed.
+        let mut tags = existing.tags.clone();
+        for t in &memory.tags {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        existing.tags = tags;
+        existing.updated_at = now;
+        repo.update_episodic(&existing)?;
+        return Ok(SessionUpsert {
+            id: existing.id,
+            status: "updated",
+            files: existing.files_touched.len(),
+        });
+    }
+    let id = memory.id.clone();
+    let files = memory.files_touched.len();
+    repo.create_episodic(memory)?;
+    Ok(SessionUpsert {
+        id,
+        status: "created",
+        files,
+    })
+}
+
+/// Read a text file up to `max_bytes` (lossy UTF-8), appending a truncation
+/// marker when cut. Streams — never slurps the whole file first.
+fn read_text_bounded(path: &Path, max_bytes: usize) -> Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("\n…[transcript truncated]");
+    }
+    Ok(text)
 }
 
 fn session_id_from_path(path: &str) -> String {
@@ -1354,6 +1364,96 @@ fn session_id_from_path(path: &str) -> String {
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "session".into())
+}
+
+/// `engram hook [--project <id>] [--dry-run]` — Claude Code hook entry point.
+///
+/// Reads a hook payload from stdin (the JSON Claude Code pipes to Stop /
+/// SessionEnd hooks: `{"transcript_path": …, "session_id": …, "cwd": …}`),
+/// distills the transcript into an episodic memory via the session-import
+/// path, and exits 0. A transcript with no usable signal is reported as
+/// `skipped` (not an error) — empty sessions are normal.
+///
+/// Wire it in `~/.claude/settings.json` (or a project's `.claude/settings.json`):
+///
+/// ```json
+/// {
+///   "hooks": {
+///     "Stop": [{ "hooks": [{ "type": "command",
+///       "command": "engram hook --project myproj" }] }]
+///   }
+/// }
+/// ```
+///
+/// `--project` defaults to the payload `cwd`'s directory name, matching
+/// `init-guide`'s project-id convention.
+pub fn hook(args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let project_override = optional_str(args, "project");
+    let transcript_override = optional_str(args, "transcript");
+
+    // Hook payloads come on stdin. Missing/invalid stdin is a configuration
+    // error worth surfacing loudly.
+    let mut stdin = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin)?;
+    let payload: serde_json::Value = serde_json::from_str(stdin.trim()).with_context(|| {
+        "hook: expected a JSON payload on stdin (are you running this from a Claude Code hook?)"
+    })?;
+
+    let transcript = transcript_override
+        .or_else(|| {
+            payload
+                .get("transcript_path")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("hook: no transcript path (pass --transcript or wire the hook so Claude Code provides transcript_path)")
+        })?;
+
+    let project_id = project_override
+        .or_else(|| {
+            payload.get("cwd").and_then(|v| v.as_str()).and_then(|cwd| {
+                std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "hook: no project id (pass --project <id> or ensure cwd is in the hook payload)"
+            )
+        })?;
+
+    let mut import_args: Vec<String> = vec![
+        "--project".into(),
+        project_id.clone(),
+        "--transcript".into(),
+        transcript,
+    ];
+    if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
+        import_args.push("--session".into());
+        import_args.push(sid.to_string());
+    }
+    if dry_run {
+        import_args.push("--dry-run".into());
+    }
+
+    // "No usable signal" is a normal empty session, not a failure — the hook
+    // must not spam Claude Code with errors every idle Stop.
+    if let Err(e) = session_import(&import_args) {
+        let msg = e.to_string();
+        if msg.contains("no usable signal") || msg.contains("failed to read transcript") {
+            print_json(&serde_json::json!({
+                "status": "skipped",
+                "reason": msg,
+            }));
+            return Ok(());
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// What `parse_transcript` extracted from a session JSONL.
@@ -1624,9 +1724,14 @@ mod tests {
 not json at all
 "#;
         let d = parse_transcript(jsonl);
-        assert_eq!(d.user_prompts, vec!["fix the auth middleware bug".to_string()]);
+        assert_eq!(
+            d.user_prompts,
+            vec!["fix the auth middleware bug".to_string()]
+        );
         assert_eq!(d.assistant_texts.len(), 2);
-        assert!(d.assistant_texts.contains(&"Root cause was a stale token.".to_string()));
+        assert!(d
+            .assistant_texts
+            .contains(&"Root cause was a stale token.".to_string()));
         assert!(d.files.contains(&"/src/auth.rs".to_string()));
         assert!(d.files.contains(&"/src/main.rs".to_string()));
     }
@@ -1659,6 +1764,63 @@ not json at all
             "--dry-run".to_string(),
         ];
         session_import(&args).unwrap(); // must not panic; writes nothing (dry-run)
+    }
+
+    #[test]
+    fn upsert_session_memory_is_idempotent_per_session() {
+        // A Stop hook fires once per agent turn — re-importing the same
+        // (growing) session must converge to ONE memory, refreshed in place.
+        let repo = crate::storage::MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |id: &str, summary: &str, files: &[&str]| EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "sess-1".into(),
+            summary: summary.into(),
+            content: format!("{summary} content"),
+            files_touched: files.iter().map(|f| f.to_string()).collect(),
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec!["session-import".into()],
+            created_at: 100,
+            updated_at: 100,
+        };
+
+        let first = upsert_session_memory(&repo, &mk("m1", "first turn", &["a.rs"]), 100).unwrap();
+        assert_eq!(first.status, "created");
+
+        // Same session, more content → updates m1, does not add m2.
+        let second = upsert_session_memory(
+            &repo,
+            &mk("m2", "first turn + more", &["a.rs", "b.rs"]),
+            200,
+        )
+        .unwrap();
+        assert_eq!(second.status, "updated");
+        assert_eq!(second.id, "m1", "must refresh the existing memory");
+        let updated = repo.get_episodic("m1", "p").unwrap().unwrap();
+        assert_eq!(updated.summary, "first turn + more");
+        assert_eq!(updated.files_touched.len(), 2);
+        assert_eq!(updated.updated_at, 200);
+
+        // Exactly one memory for the session.
+        {
+            let conn = repo.connection().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM episodic_memories WHERE project_id = 'p' AND session_id = 'sess-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+
+        // A DIFFERENT session still creates its own memory.
+        let mut m3 = mk("m3", "other session", &[]);
+        m3.session_id = "sess-2".into();
+        let third = upsert_session_memory(&repo, &m3, 300).unwrap();
+        assert_eq!(third.status, "created");
     }
 
     #[test]

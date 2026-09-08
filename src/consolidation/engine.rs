@@ -22,7 +22,7 @@ pub struct ConsolidationPlan {
 }
 
 /// Consolidation engine (MVP stub).
-/// Basic rule-based deduplication: content hash + time-window merging.
+/// Basic rule-based deduplication: content hash + word-set near-dup.
 pub struct ConsolidationEngine;
 
 impl Default for ConsolidationEngine {
@@ -108,8 +108,17 @@ impl ConsolidationEngine {
                     continue;
                 }
                 let mut dups = Vec::new();
+                let a_words = recs[a].1.split_whitespace().count().max(1);
                 for &b in &remaining[pos + 1..] {
                     if grouped.contains(&b) {
+                        continue;
+                    }
+                    // Cheap length pre-filter: Jaccard of word sets cannot
+                    // reach a >=0.6 threshold when one text has >2.5x the
+                    // words of the other — skips the set-building cost (the
+                    // O(n²) hot path) for obviously-unrelated pairs.
+                    let b_words = recs[b].1.split_whitespace().count().max(1);
+                    if a_words.max(b_words) as f64 > 2.5 * a_words.min(b_words) as f64 {
                         continue;
                     }
                     if Self::jaccard_similarity(&recs[a].1, &recs[b].1, threshold) {
@@ -255,7 +264,7 @@ mod tests {
             .unwrap();
         let group = &plans[0].groups[0];
         // keeper 仍活跃，且必须是最早创建的那条（ts=100，而非 ts=200）。
-        let keeper = repo.get_episodic(&group.keeper_id).unwrap().unwrap();
+        let keeper = repo.get_episodic(&group.keeper_id, "p").unwrap().unwrap();
         assert_eq!(
             keeper.created_at, 100,
             "keeper must be the earliest (ts=100)"
@@ -359,7 +368,7 @@ mod tests {
         );
         assert_eq!(g.duplicate_ids.len(), 1);
         // keeper 必须是更早创建的 A（ts=100）。
-        let keeper = repo.get_episodic(&g.keeper_id).unwrap().unwrap();
+        let keeper = repo.get_episodic(&g.keeper_id, "p").unwrap().unwrap();
         assert_eq!(keeper.created_at, 100, "near-dup keeper 仍应为最早创建者");
         assert_eq!(plan.archived, 0, "plan_for_kind 不应归档");
     }
@@ -385,7 +394,7 @@ mod tests {
         assert_eq!(plan.groups.len(), 1, "三条近义记录应只归为一组");
         let g = &plan.groups[0];
         assert_eq!(g.duplicate_ids.len(), 2, "B、C 都应并入 A 这一组");
-        let keeper = repo.get_episodic(&g.keeper_id).unwrap().unwrap();
+        let keeper = repo.get_episodic(&g.keeper_id, "p").unwrap().unwrap();
         assert_eq!(keeper.created_at, 100);
     }
 

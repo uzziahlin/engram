@@ -34,6 +34,7 @@ macro_rules! impl_memory_crud {
         tx = $tx:ident,
         row = $row:ident,
         link_ts = $link_ts:ident,
+        fts_rowid = $fts_rowid:ident,
 
         struct_type = $Struct:ident,
         table = $table:literal,
@@ -67,6 +68,11 @@ macro_rules! impl_memory_crud {
             #[allow(unused_variables)]
             let $link_ts = $mem.created_at;
             $tx.execute($insert_sql, $($insert_params)*)?;
+            // Keep the FTS rowid in lockstep with the main-table rowid so
+            // deletes/updates address FTS rows by rowid (O(log n)). Matching
+            // the UNINDEXED memory_id column instead was a full FTS scan on
+            // EVERY update/delete (confirmed via EXPLAIN QUERY PLAN).
+            let $fts_rowid: i64 = $tx.last_insert_rowid();
             $tx.execute($fts_insert_sql, $($fts_params)*)?;
             $($entity_link)*
             $tx.commit()?;
@@ -74,12 +80,17 @@ macro_rules! impl_memory_crud {
         }
 
         // ─── GET ─────────────────────────────────────────────────
-        pub fn $get_fn(&self, id: &str) -> Result<Option<$Struct>> {
+        /// Project-scoped at the SQL level: isolation no longer depends on
+        /// every caller remembering to compare `project_id` afterwards (the
+        /// 2026-09 review found unguarded call paths, e.g. vector-candidate
+        /// materialization in `fetch_by_ids`).
+        pub fn $get_fn(&self, id: &str, project_id: &str) -> Result<Option<$Struct>> {
             let conn = self.conn()?;
             let mut stmt = conn.prepare(concat!(
-                "SELECT ", $select_cols, " FROM ", $table, " WHERE id = ?1"
+                "SELECT ", $select_cols, " FROM ", $table,
+                " WHERE id = ?1 AND project_id = ?2"
             ))?;
-            let $row = stmt.query_row(params![id], |$row| {
+            let $row = stmt.query_row(params![id, project_id], |$row| {
                 Ok($($row_mapper)*)
             }).optional()?;
             Ok($row)
@@ -103,10 +114,16 @@ macro_rules! impl_memory_crud {
                     $table
                 );
             }
-            // FTS5: delete-then-insert
+            // FTS5: delete-then-insert, addressed by the stable main-table
+            // rowid (rowids are unchanged by UPDATE).
+            let $fts_rowid: i64 = $tx.query_row(
+                concat!("SELECT rowid FROM ", $table, " WHERE id = ?1 AND project_id = ?2"),
+                params![$mem.id, $mem.project_id],
+                |r| r.get(0),
+            )?;
             $tx.execute(
-                concat!("DELETE FROM ", $fts_table, " WHERE memory_id = ?1"),
-                params![$mem.id],
+                concat!("DELETE FROM ", $fts_table, " WHERE rowid = ?1"),
+                params![$fts_rowid],
             )?;
             $tx.execute($fts_insert_sql, $($fts_params)*)?;
             // Refresh graph edges: files/tools may have changed since create,
@@ -125,15 +142,25 @@ macro_rules! impl_memory_crud {
         pub fn $delete_fn(&self, id: &str, project_id: &str) -> Result<bool> {
             let conn = self.conn()?;
             let $tx = conn.unchecked_transaction()?;
+            // Resolve the FTS row by rowid before the main row goes away.
+            let fts_rowid: Option<i64> = $tx
+                .query_row(
+                    concat!("SELECT rowid FROM ", $table, " WHERE id = ?1 AND project_id = ?2"),
+                    params![id, project_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
             let affected = $tx.execute(
                 concat!("DELETE FROM ", $table, " WHERE id = ?1 AND project_id = ?2"),
                 params![id, project_id],
             )?;
             if affected > 0 {
-                $tx.execute(
-                    concat!("DELETE FROM ", $fts_table, " WHERE memory_id = ?1"),
-                    params![id],
-                )?;
+                if let Some(rid) = fts_rowid {
+                    $tx.execute(
+                        concat!("DELETE FROM ", $fts_table, " WHERE rowid = ?1"),
+                        params![rid],
+                    )?;
+                }
                 // Clean up graph relations and entity for this memory
                 $tx.execute(
                     "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
@@ -157,7 +184,12 @@ macro_rules! impl_memory_crud {
         pub fn $search_fn(
             &self, query: &str, project_id: &str, limit: usize,
         ) -> Result<Vec<ScoredMemory<$Struct>>> {
-            let fts_query = Self::sanitize_fts_query(query);
+            // Multi-token queries try AND first (every token must match) for
+            // precision, and fall back to OR (any token matches) when AND
+            // returns nothing — the old always-OR behavior made "rust memory
+            // system" match any memory containing just "system".
+            let and_query = Self::sanitize_fts_query(query, true);
+            let or_query = Self::sanitize_fts_query(query, false);
             let conn = self.conn()?;
             let mut stmt = conn.prepare(concat!(
                 "SELECT ", $search_cols, ", bm25(", $fts_table, ") as score",
@@ -166,17 +198,24 @@ macro_rules! impl_memory_crud {
                 " WHERE ", $fts_table, " MATCH ?1 AND m.project_id = ?2 AND m.archived_at IS NULL",
                 " ORDER BY f.rank LIMIT ?3"
             ))?;
-            let rows = stmt.query_map(params![fts_query, project_id, limit], |$row| {
-                Ok(ScoredMemory {
-                    memory: $($row_mapper)*,
-                    bm25_score: $row.get::<_, f64>($score_col_idx)?,
-                })
-            })?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
+            let mut fetch = |fts_query: &str| -> Result<Vec<ScoredMemory<$Struct>>> {
+                let rows = stmt.query_map(params![fts_query, project_id, limit], |$row| {
+                    Ok(ScoredMemory {
+                        memory: $($row_mapper)*,
+                        bm25_score: $row.get::<_, f64>($score_col_idx)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            };
+            let results = fetch(&and_query)?;
+            if !results.is_empty() || and_query == or_query {
+                return Ok(results);
             }
-            Ok(results)
+            fetch(&or_query)
         }
 
         // ─── LIST ACTIVE (plain SELECT, no FTS) — for reindex/backfill ──

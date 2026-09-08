@@ -68,9 +68,14 @@ const SOURCE_EXTS: &[&str] = &[
 ];
 
 /// Comment keywords that signal a decision-flavored note worth recording.
-const ANNOTATION_KEYWORDS: &[&str] = &[
-    "WHY", "NOTE", "HACK", "DECISION", "REASON", "WARNING", "XXX", "TODO",
-];
+/// TODO/NOTE were deliberately removed: they are ubiquitous, carry no "why"
+/// knowledge, and were consuming the whole annotation budget.
+const ANNOTATION_KEYWORDS: &[&str] = &["WHY", "HACK", "DECISION", "REASON", "WARNING", "XXX"];
+
+/// Extensions whose line comments start with `#` (python/shell/ruby/vim).
+const HASH_COMMENT_EXTS: &[&str] = &["py", "sh", "rb", "vim", "yml", "yaml", "toml", "r"];
+/// Extensions whose line comments start with `--` (sql/lua/elm/hs…).
+const DASH_COMMENT_EXTS: &[&str] = &["sql", "lua", "elm", "hs"];
 
 const MAX_DOCUMENTS: usize = 40;
 const MAX_ANNOTATIONS: usize = 200;
@@ -157,27 +162,22 @@ fn doc_kind(rel: &str, name: &str) -> &'static str {
 
 /// Whether `rel` lies inside any of the given top-level-or-nested directories.
 fn in_subdir(rel: &str, dirs: &[&str]) -> bool {
-    dirs.iter().any(|d| {
-        rel.contains(&format!("/{d}/")) || rel.starts_with(&format!("{d}/"))
-    })
+    dirs.iter()
+        .any(|d| rel.contains(&format!("/{d}/")) || rel.starts_with(&format!("{d}/")))
 }
 
 /// Scan a source file for decision-flavored comments and module docs.
 fn scan_annotations(path: &Path, root: &Path, max_bytes: usize, out: &mut Vec<CodeAnnotation>) {
-    // Bound the read so a generated/minified file can't exhaust memory.
-    let Ok(bytes) = std::fs::read(path) else {
+    // Bound the read so a generated/minified file can't exhaust memory —
+    // streaming via read_bounded (never slurps the whole file first).
+    let Ok(text) = super::read_bounded(path, max_bytes) else {
         return;
     };
-    let slice = if bytes.len() > max_bytes {
-        &bytes[..max_bytes]
-    } else {
-        &bytes[..]
-    };
-    let text = String::from_utf8_lossy(slice);
     let rel = super::relpath(path, root);
 
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     for (i, line) in text.lines().enumerate() {
-        if let Some((kind, text_part)) = classify_comment_line(line) {
+        if let Some((kind, text_part)) = classify_comment_line(line, ext) {
             if text_part.is_empty() {
                 continue;
             }
@@ -195,8 +195,10 @@ fn scan_annotations(path: &Path, root: &Path, max_bytes: usize, out: &mut Vec<Co
 }
 
 /// Return `(kind, text)` if a line is a module doc or a labeled decision note.
-/// `kind` is a static keyword; `text` borrows from the input line.
-fn classify_comment_line(line: &str) -> Option<(&'static str, &str)> {
+/// `kind` is a static keyword; `text` borrows from the input line. `ext`
+/// selects the comment syntax for languages without `//` comments —
+/// previously py/sh/sql decision notes were systematically missed.
+fn classify_comment_line<'a>(line: &'a str, ext: &str) -> Option<(&'static str, &'a str)> {
     let t = line.trim_start();
 
     // Rust module-level doc: `//!` — usually carries architectural rationale.
@@ -208,8 +210,26 @@ fn classify_comment_line(line: &str) -> Option<(&'static str, &str)> {
         return None;
     }
 
+    // Hash comments (# WHY: ...) for python/shell/ruby-style sources.
+    if HASH_COMMENT_EXTS.contains(&ext) {
+        if let Some(rest) = t.strip_prefix('#').map(str::trim_start) {
+            return labeled(rest);
+        }
+    }
+    // Double-dash comments (-- WHY: ...) for sql/lua-style sources.
+    if DASH_COMMENT_EXTS.contains(&ext) {
+        if let Some(rest) = t.strip_prefix("--").map(str::trim_start) {
+            return labeled(rest);
+        }
+    }
+
     // Line comment `// KEYWORD ...` (language-agnostic).
     let rest = t.strip_prefix("//")?.trim_start();
+    labeled(rest)
+}
+
+/// Match `KEYWORD [: text]` at the start of a comment body.
+fn labeled(rest: &str) -> Option<(&'static str, &str)> {
     for kw in ANNOTATION_KEYWORDS {
         if let Some(after) = rest.strip_prefix(kw) {
             // Require a delimiter so prefix-collisions (e.g. "NOTES" vs "NOTE")
@@ -228,13 +248,11 @@ fn classify_comment_line(line: &str) -> Option<(&'static str, &str)> {
 fn kw_lower(kw: &str) -> &'static str {
     match kw {
         "WHY" => "why",
-        "NOTE" => "note",
         "HACK" => "hack",
         "DECISION" => "decision",
         "REASON" => "reason",
         "WARNING" => "warning",
         "XXX" => "xxx",
-        "TODO" => "todo",
         _ => "note",
     }
 }
@@ -339,7 +357,7 @@ mod tests {
     #[test]
     fn classify_rust_module_doc() {
         let (k, t) =
-            classify_comment_line("//! No async runtime — SQLite is local and sync").unwrap();
+            classify_comment_line("//! No async runtime — SQLite is local and sync", "rs").unwrap();
         assert_eq!(k, "module-doc");
         assert!(t.contains("No async runtime"));
     }
@@ -347,15 +365,36 @@ mod tests {
     #[test]
     fn classify_labeled_note() {
         let (k, t) =
-            classify_comment_line("    // WHY: gix avoids libgit2 dynamic linking").unwrap();
+            classify_comment_line("    // WHY: gix avoids libgit2 dynamic linking", "rs").unwrap();
         assert_eq!(k, "why");
         assert!(t.contains("gix"));
     }
 
     #[test]
     fn classify_rejects_plain_code() {
-        assert!(classify_comment_line("let x = 5;").is_none());
-        assert!(classify_comment_line("// ").is_none());
+        assert!(classify_comment_line("let x = 5;", "rs").is_none());
+        assert!(classify_comment_line("// ", "rs").is_none());
+    }
+
+    #[test]
+    fn classify_hash_and_dash_comment_styles() {
+        // python / shell `#` comments carry the same labeled keywords.
+        let (k, t) = classify_comment_line("# WHY: vendored to pin a patch", "py").unwrap();
+        assert_eq!(k, "why");
+        assert!(t.contains("vendored"));
+        // sql / lua `--` comments too.
+        let (k, _) = classify_comment_line("-- DECISION: partition by month", "sql").unwrap();
+        assert_eq!(k, "decision");
+        // `#` is a preprocessor in C — must NOT classify there.
+        assert!(classify_comment_line("#include <stdio.h>", "c").is_none());
+    }
+
+    #[test]
+    fn todo_and_plain_notes_are_not_collected() {
+        // TODO/NOTE are noise, not decisions — they were dropped from the
+        // keyword list so they cannot consume the annotation budget.
+        assert!(classify_comment_line("// TODO: refactor later", "rs").is_none());
+        assert!(classify_comment_line("// NOTE: see docs", "rs").is_none());
     }
 
     #[test]

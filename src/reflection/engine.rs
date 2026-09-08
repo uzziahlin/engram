@@ -115,10 +115,18 @@ impl ReflectionEngine {
                 source_preventions,
             };
 
-            // Block on ANY prior proposal for this tag — pending, confirmed, or
-            // rejected. Checking only 'pending' let rejected suggestions
-            // resurrect on the next run and confirmed rules be re-proposed.
-            if apply && !repo.has_suggestion_for_tag(project_id, &rule.pattern_tag)? {
+            // Block on a prior pending/confirmed proposal, or on a rejected
+            // one UNTIL min_occurrences new failures arrive since the
+            // rejection (re-arm — a one-shot rejection used to silence the
+            // tag forever, even as fresh evidence piled up).
+            if apply
+                && !repo.has_suggestion_for_tag(
+                    project_id,
+                    &rule.pattern_tag,
+                    rule.occurrence_count as i64,
+                    self.min_occurrences as i64,
+                )?
+            {
                 let row = ReflectionSuggestionRow {
                     id: uuid::Uuid::new_v4().to_string(),
                     project_id: project_id.to_string(),
@@ -305,6 +313,38 @@ mod tests {
     }
 
     #[test]
+    fn rejected_tag_rearms_after_new_evidence() {
+        // A rejection used to silence a tag FOREVER. Now the rejection stamps
+        // the occurrence count it saw, and the tag becomes re-proposable once
+        // `min_occurrences` NEW failures accumulate.
+        let repo = setup();
+        for i in 1..=3 {
+            failure(&repo, &format!("f{i}"), "auth", "rotate keys");
+        }
+        ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 100)
+            .unwrap();
+        let pending = repo.list_pending_suggestions("p").unwrap();
+        assert_eq!(pending.len(), 1);
+        repo.reject_suggestion(&pending[0].id, "p", 200).unwrap();
+
+        // One new failure (4 total) is NOT yet enough — re-arm needs 3 NEW.
+        failure(&repo, "f4", "auth", "rotate keys");
+        let not_yet = ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 300)
+            .unwrap();
+        assert_eq!(not_yet.created, 0, "one new failure must not re-propose");
+
+        // Three new failures since the rejection → re-proposed.
+        failure(&repo, "f5", "auth", "rotate keys");
+        failure(&repo, "f6", "auth", "rotate keys");
+        let rearm = ReflectionEngine::with_min_occurrences(3)
+            .reflect(&repo, "p", true, 400)
+            .unwrap();
+        assert_eq!(rearm.created, 1, "tag must re-arm after new evidence");
+    }
+
+    #[test]
     fn rejected_suggestions_do_not_resurrect() {
         // Regression: `has_pending_suggestion` only blocked pending rows, so a
         // rejected proposal came back on the very next `reflect --apply`.
@@ -339,8 +379,7 @@ mod tests {
             .reflect(&repo, "p", true, 100)
             .unwrap();
         let pending = repo.list_pending_suggestions("p").unwrap();
-        repo.confirm_suggestion(&pending[0].id, "p", 200)
-            .unwrap();
+        repo.confirm_suggestion(&pending[0].id, "p", 200).unwrap();
 
         let again = ReflectionEngine::with_min_occurrences(3)
             .reflect(&repo, "p", true, 300)

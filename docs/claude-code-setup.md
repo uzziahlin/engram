@@ -99,13 +99,13 @@ Claude Code 会调用 `recent_failures` 工具查找相关故障记忆。
 ```json
 {
   "hooks": {
-    "Stop": [
+    "SessionEnd": [
       {
         "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.transcript_path // empty' | xargs -r -I{} ~/.engram/bin/engram session-import --project my-project --transcript {}"
+            "command": "~/.engram/bin/engram hook --project my-project"
           }
         ]
       }
@@ -115,9 +115,9 @@ Claude Code 会调用 `recent_failures` 工具查找相关故障记忆。
 ```
 
 说明：
-- `Stop` 事件在 Claude Code 主回复结束时触发，stdin 收到含 `transcript_path` 的 JSON。
-- `engram session-import` 会从会话 JSONL 提取用户需求、结论和改动文件，蒸馏成一条 episodic 记忆（`--dry-run` 可预览）。
-- 也可以用 `SessionEnd` 事件（整个会话结束时触发一次）代替 `Stop`（每次回复结束都触发，频率更高）。
+- 推荐挂 `SessionEnd`（整个会话结束时触发一次，transcript 完整），stdin 收到含 `transcript_path` 的 JSON。
+- `engram hook` 直接读 stdin 的 hook payload，无需 jq/xargs 管道；会从会话 JSONL 提取用户需求、结论和改动文件，蒸馏成一条 episodic 记忆（`--dry-run` 可预览）。
+- 挂 `Stop`（每次回复结束触发）也可以：session-import 对同一 session **幂等**——重复导入会原地刷新既有记忆而非堆叠近似重复，记忆随会话增长实时更新。
 - 想更省心，可配合 cron 定期跑维护：`engram maintain --apply`（去重 + FTS 修复 + query_log 清理 + 过期报告）。
 
 ## 可用工具一览

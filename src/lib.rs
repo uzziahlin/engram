@@ -6,6 +6,7 @@ pub mod context;
 pub mod git_integration;
 pub mod mcp;
 pub mod models;
+pub mod path_guard;
 pub mod reflection;
 pub mod retrieval;
 pub mod storage;

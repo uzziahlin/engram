@@ -44,13 +44,18 @@ impl Reranker {
                 1.0
             };
 
-            // Type prior (memory-type importance), distinct from per-record importance.
+            // Type prior (memory-type importance), distinct from per-record
+            // importance. Deliberately narrow: with the default type weight
+            // (0.15) the full prior spread contributes at most ~0.07 to the
+            // final score, so it breaks ties between similar relevance
+            // instead of overriding the BM25 signal (the 2026-09 review found
+            // the old 0.3..0.9 spread outvoting relevance entirely).
             let type_prior: f32 = match result.memory_type.as_str() {
                 "failure" => 0.9,
-                "decision" => 0.7,
-                "episodic" => 0.5,
-                "procedural" => 0.3,
-                _ => 0.4,
+                "decision" => 0.75,
+                "episodic" => 0.6,
+                "procedural" => 0.5,
+                _ => 0.6,
             };
 
             let final_score = plan.relevance_weight * relevance

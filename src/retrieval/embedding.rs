@@ -37,9 +37,22 @@ impl CandleBertEmbedder {
             &std::fs::read_to_string(dir.join("config.json"))
                 .with_context(|| format!("read config.json in {}", dir.display()))?,
         )?;
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(anyhow::Error::msg)
             .context("load tokenizer.json")?;
+        // Truncate at the model's positional-embedding limit (BERT: 512).
+        // Without this, a long memory (the MCP frame cap allows 16 MiB texts)
+        // builds a [1, seq, hidden] tensor that OOMs or near-hangs the single
+        // worker thread — and previously failed forward() so the memory never
+        // got a vector at all.
+        let max_len = config.max_position_embeddings.min(512) as usize;
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: max_len,
+                ..Default::default()
+            }))
+            .map_err(anyhow::Error::msg)
+            .context("configure tokenizer truncation")?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DTYPE, &device)
                 .context("mmap model.safetensors")?

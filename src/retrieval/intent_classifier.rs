@@ -36,6 +36,8 @@ impl IntentClassifier {
             "调试",
             "修复",
             "错误",
+            "失败",
+            "报错",
             "崩溃",
             "异常",
         ] {
@@ -60,6 +62,7 @@ impl IntentClassifier {
             "设计",
             "决策",
             "模块",
+            "组件",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Architecture]);
         }
@@ -78,6 +81,8 @@ impl IntentClassifier {
             "step",
             "工作流",
             "流程",
+            "步骤",
+            "测试",
             "构建",
         ] {
             keyword_map.insert((*kw).to_lowercase(), vec![MemoryIntent::Workflow]);
@@ -94,6 +99,7 @@ impl IntentClassifier {
             "merge",
             "split",
             "extract",
+            "重构",
             "重写",
             "简化",
             "提取",
@@ -112,6 +118,7 @@ impl IntentClassifier {
             "migration",
             "upgrade",
             "config change",
+            "部署",
             "发布",
             "上线",
             "回滚",
@@ -132,10 +139,11 @@ impl IntentClassifier {
             "p2",
             "downtime",
             "alert",
-            "page",
             "post-mortem",
             "postmortem",
             "故障",
+            "事故",
+            "宕机",
             "停机",
             "告警",
         ] {
@@ -202,8 +210,8 @@ impl IntentClassifier {
         while let Some(rel) = text[from..].find(keyword) {
             let start = from + rel;
             let end = start + kb.len();
-            let left_ok = start == 0 || !tb[start - 1].is_ascii_alphabetic();
-            let right_ok = end >= tb.len() || !tb[end].is_ascii_alphabetic();
+            let left_ok = start == 0 || !tb[start - 1].is_ascii_alphanumeric();
+            let right_ok = end >= tb.len() || !tb[end].is_ascii_alphanumeric();
             if left_ok && right_ok {
                 return true;
             }
@@ -349,5 +357,67 @@ mod tests {
         assert!(classifier
             .classify("test")
             .contains(&MemoryIntent::Workflow));
+    }
+
+    #[test]
+    fn test_chinese_keyword_coverage() {
+        // High-frequency Chinese engineering terms that were missing from the
+        // keyword map (2026-09 review): each must classify its intent.
+        let classifier = IntentClassifier::new();
+        assert!(
+            classifier
+                .classify("部署到生产环境")
+                .contains(&MemoryIntent::Deployment),
+            "部署 must classify Deployment"
+        );
+        assert!(
+            classifier
+                .classify("重构这个模块")
+                .contains(&MemoryIntent::Refactor),
+            "重构 must classify Refactor"
+        );
+        assert!(
+            classifier
+                .classify("测试失败的原因")
+                .contains(&MemoryIntent::Debugging),
+            "失败 must classify Debugging"
+        );
+        assert!(
+            classifier
+                .classify("接口一直报错")
+                .contains(&MemoryIntent::Debugging),
+            "报错 must classify Debugging"
+        );
+        assert!(
+            classifier
+                .classify("昨晚的事故复盘")
+                .contains(&MemoryIntent::Incident),
+            "事故 must classify Incident"
+        );
+        assert!(
+            classifier
+                .classify("服务宕机了")
+                .contains(&MemoryIntent::Incident),
+            "宕机 must classify Incident"
+        );
+        assert!(
+            classifier
+                .classify("发布步骤是什么")
+                .contains(&MemoryIntent::Workflow),
+            "步骤 must classify Workflow"
+        );
+    }
+
+    #[test]
+    fn test_word_boundary_treats_digits_as_word_chars() {
+        let classifier = IntentClassifier::new();
+        // "fix2" is a single identifier — "fix" must not match inside it.
+        assert!(!classifier
+            .classify("bump fix2 counter")
+            .contains(&MemoryIntent::Debugging));
+        // But "fix 2" (space-separated) still matches.
+        assert!(classifier
+            .classify("fix 2 failing tests")
+            .contains(&MemoryIntent::Debugging));
     }
 }

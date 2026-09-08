@@ -16,6 +16,8 @@ pub struct Config {
     pub semantic: SemanticConfig,
     #[serde(default)]
     pub reflection: ReflectionConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +154,10 @@ pub struct RetrievalConfig {
     /// is soft, it never narrows the sources (recall first).
     #[serde(default = "RetrievalConfig::default_intent_routing")]
     pub intent_routing: bool,
+    /// Graph-based second-tier retrieval: memories sharing an entity (file/
+    /// tool) with the top search hits are appended as low-rank context.
+    #[serde(default = "RetrievalConfig::default_graph_expansion")]
+    pub graph_expansion: bool,
     /// Global ranking-signal weights. Defaults reproduce the pre-config
     /// hard-coded values, so an absent `[retrieval]` section is a no-op.
     /// `weight_relevance` scales the BM25 score; the other three are the base
@@ -172,6 +178,7 @@ impl Default for RetrievalConfig {
             default_limit: Self::default_limit(),
             recency_half_life_days: Self::default_recency_half_life_days(),
             intent_routing: Self::default_intent_routing(),
+            graph_expansion: Self::default_graph_expansion(),
             weight_relevance: Self::default_weight_relevance(),
             weight_recency: Self::default_weight_recency(),
             weight_importance: Self::default_weight_importance(),
@@ -190,17 +197,23 @@ impl RetrievalConfig {
     fn default_intent_routing() -> bool {
         true
     }
+    fn default_graph_expansion() -> bool {
+        true
+    }
+    // Defaults sum to 1.0: relevance is the dominant signal (the query terms
+    // matched), the static priors only break ties. The planner renormalizes
+    // after per-intent adjustments, so custom values may use any scale.
     fn default_weight_relevance() -> f32 {
-        0.4
+        0.5
     }
     fn default_weight_recency() -> f32 {
-        0.2
+        0.15
     }
     fn default_weight_importance() -> f32 {
-        0.4
+        0.2
     }
     fn default_weight_type() -> f32 {
-        0.4
+        0.15
     }
 }
 
@@ -320,6 +333,19 @@ impl ReflectionConfig {
     }
 }
 
+/// Filesystem-access guard config. `repo_path` arguments come from the MCP
+/// client (ultimately the agent, which can be steered by prompt injection);
+/// see `src/path_guard.rs` for the enforcement rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// When non-empty, `ingest_commits`/`collect_sources` only accept
+    /// `repo_path` values under one of these roots (canonical comparison).
+    /// Empty (default) = no allowlist; the home directory and filesystem
+    /// root are rejected unconditionally either way.
+    #[serde(default)]
+    pub allowed_roots: Vec<PathBuf>,
+}
+
 impl Config {
     /// Load configuration from a TOML file, falling back to defaults for missing fields.
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
@@ -330,6 +356,15 @@ impl Config {
         // it as a relative path and creates a literal `~/` directory under the process cwd.
         // Expand it at the config boundary so the rest of the system sees an absolute path.
         config.storage.database_path = expand_tilde(&config.storage.database_path);
+        config.security.allowed_roots = config
+            .security
+            .allowed_roots
+            .iter()
+            .map(|p| expand_tilde(p))
+            .collect();
+        // Validate on every load path, not just `load()` — embedders and tests
+        // that use `load_from_file` directly must not bypass range checks.
+        config.validate()?;
         Ok(config)
     }
 
@@ -352,10 +387,16 @@ impl Config {
 
     /// Validate configuration fields are within acceptable ranges.
     fn validate(&self) -> anyhow::Result<()> {
-        if self.context.memory_budget_percent > 50 {
+        if self.context.memory_budget_percent == 0 || self.context.memory_budget_percent > 50 {
             anyhow::bail!(
-                "context.memory_budget_percent must be <= 50, got {}",
+                "context.memory_budget_percent must be between 1 and 50, got {}",
                 self.context.memory_budget_percent
+            );
+        }
+        if self.context.context_window_tokens < 1000 {
+            anyhow::bail!(
+                "context.context_window_tokens must be >= 1000, got {}",
+                self.context.context_window_tokens
             );
         }
         if self.retrieval.default_limit == 0 || self.retrieval.default_limit > 1000 {
@@ -364,11 +405,48 @@ impl Config {
                 self.retrieval.default_limit
             );
         }
+        // Weight sanity: finite, non-negative, not all-zero. NaN would poison
+        // every partial_cmp in the reranker (NaN == NaN compares Equal), and a
+        // negative weight silently inverts the ranking.
+        let r = &self.retrieval;
+        for (name, v) in [
+            ("weight_relevance", r.weight_relevance),
+            ("weight_recency", r.weight_recency),
+            ("weight_importance", r.weight_importance),
+            ("weight_type", r.weight_type),
+        ] {
+            if !v.is_finite() {
+                anyhow::bail!("retrieval.{name} must be a finite number, got {v}");
+            }
+            if v < 0.0 {
+                anyhow::bail!("retrieval.{name} must be >= 0, got {v}");
+            }
+        }
+        if r.weight_relevance + r.weight_recency + r.weight_importance + r.weight_type <= 0.0 {
+            anyhow::bail!(
+                "retrieval weight_* must not all be zero (sum = {})",
+                r.weight_relevance + r.weight_recency + r.weight_importance + r.weight_type
+            );
+        }
         if self.mcp.worker_threads == 0 || self.mcp.worker_threads > 64 {
             anyhow::bail!(
                 "mcp.worker_threads must be between 1 and 64, got {}",
                 self.mcp.worker_threads
             );
+        }
+        if self.reflection.min_occurrences == 0 {
+            anyhow::bail!("reflection.min_occurrences must be >= 1, got 0",);
+        }
+        if self.semantic.enabled || cfg!(feature = "semantic") {
+            if !self.semantic.rrf_k.is_finite() || self.semantic.rrf_k <= 0.0 {
+                anyhow::bail!(
+                    "semantic.rrf_k must be a positive number, got {}",
+                    self.semantic.rrf_k
+                );
+            }
+            if self.semantic.top_k == 0 {
+                anyhow::bail!("semantic.top_k must be >= 1, got 0");
+            }
         }
         Ok(())
     }
