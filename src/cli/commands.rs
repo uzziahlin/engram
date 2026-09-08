@@ -346,6 +346,13 @@ pub fn create_decision(args: &[String]) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
 
+    let importance = {
+        let v = optional_num(args, "importance").unwrap_or(0.5);
+        if !(0.0..=1.0).contains(&v) {
+            anyhow::bail!("importance must be between 0 and 1, got {v}");
+        }
+        v as f32
+    };
     let memory = DecisionMemory {
         id: id.clone(),
         project_id,
@@ -355,6 +362,7 @@ pub fn create_decision(args: &[String]) -> Result<()> {
         tradeoffs,
         related_files: files,
         tags,
+        importance,
         created_at: now,
         updated_at: now,
     };
@@ -421,6 +429,13 @@ pub fn create_procedural(args: &[String]) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
 
+    let importance = {
+        let v = optional_num(args, "importance").unwrap_or(0.5);
+        if !(0.0..=1.0).contains(&v) {
+            anyhow::bail!("importance must be between 0 and 1, got {v}");
+        }
+        v as f32
+    };
     let memory = ProceduralMemory {
         id: id.clone(),
         project_id,
@@ -428,6 +443,7 @@ pub fn create_procedural(args: &[String]) -> Result<()> {
         steps,
         related_tools: tools,
         tags,
+        importance,
         created_at: now,
         updated_at: now,
     };
@@ -1020,18 +1036,243 @@ pub fn get(args: &[String]) -> Result<()> {
     }));
     Ok(())
 }
+/// `engram backup [--out <dir>] [--keep N]` — snapshot the database via the
+/// SQLite online-backup API (safe while the MCP server has the DB open).
+/// Defaults: `~/.engram/backups`, keep the newest 10.
+pub fn backup(args: &[String]) -> Result<()> {
+    let keep = (optional_num(args, "keep").unwrap_or(10.0) as usize).max(1);
+    let config = load_config()?;
+    let db_path = &config.storage.database_path;
+    if !db_path.exists() {
+        anyhow::bail!(
+            "database {} does not exist — nothing to back up",
+            db_path.display()
+        );
+    }
 
+    let out_dir = match optional_str(args, "out") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => db_path
+            .parent()
+            .context("database path has no parent dir")?
+            .join("backups"),
+    };
+    std::fs::create_dir_all(&out_dir)?;
+
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let dest = out_dir.join(format!("memory-{stamp}.db"));
+    {
+        let repo = open_repo(&config)?;
+        use rusqlite::backup::Backup;
+        let src = repo.connection()?;
+        let mut dst = rusqlite::Connection::open(&dest)
+            .with_context(|| format!("open backup target {}", dest.display()))?;
+        let backup = Backup::new(&src, &mut dst)
+            .context("init backup (is the source database busy in a transaction?)")?;
+        backup.run_to_completion(64, std::time::Duration::from_millis(5), None)?;
+    }
+
+    // Retention: keep the newest `keep` memory-*.db backups.
+    let mut backups: Vec<_> = std::fs::read_dir(&out_dir)?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("memory-") && n.ends_with(".db")
+        })
+        .collect();
+    backups.sort_by_key(|e| e.file_name());
+    let mut removed = 0usize;
+    while backups.len() > keep {
+        let oldest = backups.remove(0);
+        std::fs::remove_file(oldest.path()).ok();
+        removed += 1;
+    }
+
+    print_json(&serde_json::json!({
+        "backup": dest.to_string_lossy(),
+        "kept": backups.len(),
+        "pruned_old": removed,
+    }));
+    Ok(())
+}
+
+/// `engram export [--project <id>] [--out <file>]` — dump all active memories
+/// to JSON (stdout by default). Project-scoped with `--project`.
+pub fn export(args: &[String]) -> Result<()> {
+    let project = optional_str(args, "project");
+    let out = optional_str(args, "out");
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let scope = project.as_deref();
+
+    let payload = serde_json::json!({
+        "format": "engram-export",
+        "version": 1,
+        "exported_at": now_ts(),
+        "project": scope,
+        "episodic": repo.list_active_episodic(scope)?,
+        "decision": repo.list_active_decision(scope)?,
+        "failure": repo.list_active_failure(scope)?,
+        "procedural": repo.list_active_procedural(scope)?,
+    });
+    let json = serde_json::to_string_pretty(&payload)?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, json).with_context(|| format!("write export file {path}"))?;
+            let count = payload["episodic"].as_array().map_or(0, |a| a.len())
+                + payload["decision"].as_array().map_or(0, |a| a.len())
+                + payload["failure"].as_array().map_or(0, |a| a.len())
+                + payload["procedural"].as_array().map_or(0, |a| a.len());
+            print_json(&serde_json::json!({ "exported": count, "out": path }));
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+/// `engram import --file <export.json>` — load memories from an `engram
+/// export` dump. Idempotent by id: memories that already exist (same id AND
+/// project) are skipped, so re-importing is safe.
+pub fn import(args: &[String]) -> Result<()> {
+    let file = require_str(args, "file")?;
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("read import file {file}"))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {file} as JSON"))?;
+    if payload.get("format").and_then(|f| f.as_str()) != Some("engram-export") {
+        anyhow::bail!("not an engram export (missing format: engram-export)");
+    }
+
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+
+    macro_rules! import_kind {
+        ($key:literal, $get:ident, $create:ident, $ty:ty) => {{
+            if let Some(items) = payload.get($key).and_then(|v| v.as_array()) {
+                for item in items {
+                    let mem: $ty = serde_json::from_value(item.clone())
+                        .with_context(|| format!("invalid {} entry in export", $key))?;
+                    if repo.$get(&mem.id, &mem.project_id)?.is_some() {
+                        skipped += 1;
+                    } else {
+                        repo.$create(&mem)?;
+                        created += 1;
+                    }
+                }
+            }
+        }};
+    }
+    import_kind!(
+        "episodic",
+        get_episodic,
+        create_episodic,
+        crate::models::EpisodicMemory
+    );
+    import_kind!(
+        "decision",
+        get_decision,
+        create_decision,
+        crate::models::DecisionMemory
+    );
+    import_kind!(
+        "failure",
+        get_failure,
+        create_failure,
+        crate::models::FailureMemory
+    );
+    import_kind!(
+        "procedural",
+        get_procedural,
+        create_procedural,
+        crate::models::ProceduralMemory
+    );
+
+    print_json(&serde_json::json!({
+        "created": created,
+        "skipped_existing": skipped,
+    }));
+    Ok(())
+}
+
+/// `engram stats [--days N]` — one-glance store observability: memory counts
+/// per type/project, entity graph size, reflection states, and retrieval
+/// feedback (query volume, zero-hit and adoption rates) over the last N days.
+pub fn stats(args: &[String]) -> Result<()> {
+    let days = (optional_num(args, "days").unwrap_or(30.0) as i64).clamp(1, 3650);
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let now = now_ts();
+
+    let mut snapshot = serde_json::to_value(repo.stats_snapshot()?)?;
+
+    // Retrieval feedback aggregates across all projects.
+    let since = now - days * 86_400;
+    let projects = repo.list_projects()?;
+    let mut total_queries = 0i64;
+    let mut total_zero_hit = 0i64;
+    let mut total_adopted = 0i64;
+    let mut top_adopted: Vec<serde_json::Value> = Vec::new();
+    let mut top_zero_hit: Vec<serde_json::Value> = Vec::new();
+    for p in &projects {
+        for stat in repo.query_stats(p, since, 50)? {
+            total_queries += stat.count;
+            total_adopted += stat.adopted;
+            if stat.result_count_avg < 0.5 {
+                total_zero_hit += stat.count;
+                if stat.count >= 2 && top_zero_hit.len() < 10 {
+                    top_zero_hit.push(serde_json::json!({
+                        "project": p, "query": stat.query, "searches": stat.count,
+                    }));
+                }
+            }
+            if stat.adopted > 0 && top_adopted.len() < 10 {
+                top_adopted.push(serde_json::json!({
+                    "project": p, "query": stat.query,
+                    "searches": stat.count, "adopted": stat.adopted,
+                }));
+            }
+        }
+    }
+
+    let db_size = std::fs::metadata(&config.storage.database_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert(
+            "database".to_string(),
+            serde_json::json!({
+                "path": config.storage.database_path,
+                "size_bytes": db_size,
+            }),
+        );
+        obj.insert(
+            "retrieval_feedback".to_string(),
+            serde_json::json!({
+                "window_days": days,
+                "queries": total_queries,
+                "zero_hit_queries": total_zero_hit,
+                "adopted_results": total_adopted,
+                "adoption_rate": if total_queries > 0 {
+                    (total_adopted as f64 / total_queries as f64 * 100.0).round() / 100.0
+                } else { 0.0 },
+                "top_adopted": top_adopted,
+                "top_zero_hit": top_zero_hit,
+            }),
+        );
+    }
+
+    print_json(&snapshot);
+    Ok(())
+}
 /// `engram maintain [--project <id>] [--repo <path>] [--apply]` — one-shot
-/// memory health pass. Designed to run from a hook/cron so the store doesn't
-/// rot silently. Steps:
-///
-/// 1. consolidate: archive exact duplicates (soft-delete, reversible)
-/// 2. rebuild FTS: repair orphan/missing/mis-preprocessed index rows (always)
-/// 3. prune query_log past `[storage].query_log_retention_days` (apply only)
-/// 4. staleness report: memories whose referenced files no longer exist
-///    (read-only; requires `--repo`)
-/// 5. gc preview: how many archived rows a later `engram gc --apply` would purge
-///    (never auto-applied — physical deletion stays an explicit decision)
+/// memory health pass for hook/cron: consolidate duplicates, repair FTS,
+/// prune query_log, staleness report (--repo), gc/orphan-entity preview, and
+/// a knowledge-gap report (frequent zero-hit queries).
 pub fn maintain(args: &[String]) -> Result<()> {
     let apply = args.iter().any(|a| a == "--apply");
     let project = optional_str(args, "project");
@@ -1214,7 +1455,7 @@ pub fn session_import(args: &[String]) -> Result<()> {
         .with_context(|| format!("failed to read transcript {}", path.display()))?;
     let digest = parse_transcript(&text);
 
-    if digest.user_prompts.is_empty() && digest.files.is_empty() {
+    if digest.user_prompts.is_empty() && digest.files.is_empty() && digest.errors.is_empty() {
         anyhow::bail!(
             "transcript yielded no usable signal (no user prompts, no file edits); \
              not writing an empty memory"
@@ -1252,6 +1493,15 @@ pub fn session_import(args: &[String]) -> Result<()> {
                 .join(", "),
         );
     }
+    if !digest.errors.is_empty() {
+        content.push_str(&format!(
+            "\nErrors encountered ({} — failure-memory candidates):\n",
+            digest.errors.len()
+        ));
+        for e in digest.errors.iter().take(10) {
+            content.push_str(&format!("- {e}\n"));
+        }
+    }
     let content: String = content.chars().take(4000).collect();
 
     let memory = EpisodicMemory {
@@ -1263,7 +1513,13 @@ pub fn session_import(args: &[String]) -> Result<()> {
         files_touched: digest.files.iter().take(50).cloned().collect(),
         related_commits: vec![],
         importance: 0.5,
-        tags: vec!["session-import".into()],
+        tags: if digest.errors.is_empty() {
+            vec!["session-import".into()]
+        } else {
+            // has-errors lets bootstrap/reflection find sessions carrying
+            // failure evidence without reading every session memory.
+            vec!["session-import".into(), "has-errors".into()]
+        },
         created_at: now,
         updated_at: now,
     };
@@ -1356,6 +1612,22 @@ fn read_text_bounded(path: &Path, max_bytes: usize) -> Result<String> {
         text.push_str("\n…[transcript truncated]");
     }
     Ok(text)
+}
+
+/// Best-effort text of a tool_result content block (string or array of text
+/// parts), flattened and bounded.
+fn tool_result_text(item: &serde_json::Value) -> String {
+    let raw = match item.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return String::new(),
+    };
+    let flat = raw.replace('\n', " ");
+    flat.trim().chars().take(300).collect()
 }
 
 fn session_id_from_path(path: &str) -> String {
@@ -1462,6 +1734,10 @@ struct SessionDigest {
     user_prompts: Vec<String>,
     assistant_texts: Vec<String>,
     files: Vec<String>,
+    /// Error payloads from tool results — the raw material for failure
+    /// memories and the reflection engine (previously transcripts carried
+    /// this signal but it was discarded).
+    errors: Vec<String>,
 }
 
 /// Parse a Claude Code transcript (JSONL, one message object per line).
@@ -1514,6 +1790,19 @@ fn parse_transcript(text: &str) -> SessionDigest {
                                 if !t.is_empty() && !t.starts_with('<') {
                                     push_unique(&mut digest.user_prompts, t);
                                 }
+                            }
+                        }
+                        // Tool results flagged as errors become failure
+                        // evidence (bounded; dedup like every other signal).
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            && item
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false)
+                        {
+                            let text = tool_result_text(item);
+                            if !text.is_empty() && digest.errors.len() < 20 {
+                                push_unique(&mut digest.errors, &text);
                             }
                         }
                     }
@@ -1745,6 +2034,21 @@ not json at all
         let d = parse_transcript(jsonl);
         assert!(d.user_prompts.is_empty());
         assert!(d.files.is_empty());
+    }
+
+    #[test]
+    fn parse_transcript_extracts_tool_errors() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","is_error":true,"content":"error: cannot find crate `foo`"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok fine"}]}}"#,
+            "\n",
+        );
+        let d = parse_transcript(jsonl);
+        assert_eq!(d.errors.len(), 1);
+        assert!(d.errors[0].contains("cannot find crate"));
+        // Non-error results must not be captured.
+        assert!(!d.errors.iter().any(|e| e.contains("fine")));
     }
 
     #[test]

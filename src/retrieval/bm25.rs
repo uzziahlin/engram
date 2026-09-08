@@ -67,7 +67,7 @@ impl Searchable for DecisionMemory {
         self.created_at
     }
     fn search_importance(&self) -> f32 {
-        0.5
+        self.importance.clamp(0.0, 1.0)
     }
     fn search_tags(&self) -> Vec<String> {
         self.tags.clone()
@@ -119,7 +119,7 @@ impl Searchable for ProceduralMemory {
         self.created_at
     }
     fn search_importance(&self) -> f32 {
-        0.5
+        self.importance.clamp(0.0, 1.0)
     }
     fn search_tags(&self) -> Vec<String> {
         self.tags.clone()
@@ -130,6 +130,36 @@ impl Searchable for ProceduralMemory {
             "related_tools": self.related_tools,
         })
     }
+}
+
+/// Type-erased search fields with the RAW bm25 score, before any
+/// normalization — the calibration pass needs the raw scale.
+struct ScoredRaw {
+    raw: f64,
+    id: String,
+    summary: String,
+    importance: f32,
+    created_at: i64,
+    tags: Vec<String>,
+    detail: serde_json::Value,
+}
+
+fn raw_group<T: Searchable>(scored: Vec<ScoredMemory<T>>) -> Vec<ScoredRaw> {
+    scored
+        .into_iter()
+        .map(|s| {
+            let m = s.memory;
+            ScoredRaw {
+                raw: (-s.bm25_score).max(0.0),
+                id: m.search_id().to_string(),
+                summary: m.search_summary().to_string(),
+                importance: m.search_importance(),
+                created_at: m.search_created_at(),
+                tags: m.search_tags(),
+                detail: m.search_detail(),
+            }
+        })
+        .collect()
 }
 
 /// BM25 retrieval engine using SQLite FTS5.
@@ -186,6 +216,13 @@ impl BM25Retriever {
     /// Search a subset of memory types via FTS5 BM25, merging and sorting by
     /// relevance. Used to route `search_memory` to only the types implied by
     /// the classified intent. `search_all` is this with all four sources.
+    ///
+    /// Cross-type calibration: the four FTS tables have independent corpora
+    /// and IDF scales, so raw bm25() scores are not comparable across types
+    /// (a weak failure-table match used to outrank a strong episodic match).
+    /// Each type's scores are rescaled to `raw / type_best * sigmoid(type_best)`
+    /// — the best match of a type keeps `sigmoid(best)` (absolute strength)
+    /// and weaker matches scale down linearly within their type.
     pub fn search_by_types(
         repo: &MemoryRepository,
         query: &str,
@@ -193,24 +230,50 @@ impl BM25Retriever {
         sources: &[MemorySource],
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let mut results = Vec::new();
+        // Gather raw-scored groups per type, calibrate within each type,
+        // then merge. See the method doc for the calibration rationale.
+        let mut groups: Vec<(Vec<ScoredRaw>, &str)> = Vec::new();
         for src in sources {
-            let typed = match src {
-                MemorySource::Episodic => {
-                    Self::to_results(repo.search_episodic(query, project_id, limit)?, "episodic")
-                }
-                MemorySource::Decision => {
-                    Self::to_results(repo.search_decisions(query, project_id, limit)?, "decision")
-                }
-                MemorySource::Failure => {
-                    Self::to_results(repo.search_failures(query, project_id, limit)?, "failure")
-                }
-                MemorySource::Procedural => Self::to_results(
-                    repo.search_procedural(query, project_id, limit)?,
+            match src {
+                MemorySource::Episodic => groups.push((
+                    raw_group(repo.search_episodic(query, project_id, limit)?),
+                    "episodic",
+                )),
+                MemorySource::Decision => groups.push((
+                    raw_group(repo.search_decisions(query, project_id, limit)?),
+                    "decision",
+                )),
+                MemorySource::Failure => groups.push((
+                    raw_group(repo.search_failures(query, project_id, limit)?),
+                    "failure",
+                )),
+                MemorySource::Procedural => groups.push((
+                    raw_group(repo.search_procedural(query, project_id, limit)?),
                     "procedural",
-                ),
-            };
-            results.extend(typed);
+                )),
+            }
+        }
+
+        let mut results = Vec::new();
+        for (raws, memory_type) in groups {
+            let type_best = raws.iter().map(|r| r.raw).fold(0.0f64, f64::max);
+            for raw in raws {
+                let relevance = if type_best > 0.0 {
+                    (raw.raw / type_best) as f32 * Self::normalize_bm25(type_best)
+                } else {
+                    0.0
+                };
+                results.push(SearchResult {
+                    id: raw.id,
+                    memory_type: memory_type.to_string(),
+                    summary: raw.summary,
+                    relevance_score: relevance,
+                    importance: raw.importance,
+                    created_at: raw.created_at,
+                    tags: raw.tags,
+                    detail: raw.detail,
+                });
+            }
         }
 
         // Sort by relevance score descending
@@ -372,6 +435,7 @@ mod tests {
             tradeoffs: "to".into(),
             related_files: vec![],
             tags: vec![],
+            importance: 0.5,
             created_at: 0,
             updated_at: 0,
         }
@@ -384,6 +448,7 @@ mod tests {
             steps: vec![],
             related_tools: vec![],
             tags: vec![],
+            importance: 0.5,
             created_at: 0,
             updated_at: 0,
         }
@@ -475,6 +540,7 @@ mod tests {
             tradeoffs: "to".into(),
             related_files: vec![],
             tags: vec![],
+            importance: 0.5,
             created_at: 3,
             updated_at: 3,
         };

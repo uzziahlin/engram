@@ -12,6 +12,8 @@ pub struct DecisionMemory {
     pub tradeoffs: String,
     pub related_files: Vec<String>,
     pub tags: Vec<String>,
+    /// Ranking signal used by the reranker (0..=1). Default 0.5.
+    pub importance: f32,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -40,6 +42,7 @@ mod tests {
             tags: vec![],
             created_at: 0,
             updated_at: 0,
+            importance: 0.5,
         };
         assert_eq!(m.embedding_text(), "pick candle\npure rust offline");
     }

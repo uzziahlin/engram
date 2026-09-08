@@ -18,6 +18,8 @@ pub struct Config {
     pub reflection: ReflectionConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +335,37 @@ impl ReflectionConfig {
     }
 }
 
+/// MCP Streamable-HTTP transport config (see `src/mcp/http.rs`). Disabled by
+/// default — stdio remains the primary transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address, e.g. "127.0.0.1:8742".
+    #[serde(default = "HttpConfig::default_bind")]
+    pub bind: String,
+    /// Bearer token REQUIRED when enabled — an open memory server is a
+    /// data exfiltration channel; startup refuses an empty token.
+    #[serde(default)]
+    pub auth_token: String,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: Self::default_bind(),
+            auth_token: String::new(),
+        }
+    }
+}
+
+impl HttpConfig {
+    fn default_bind() -> String {
+        "127.0.0.1:8742".to_string()
+    }
+}
+
 /// Filesystem-access guard config. `repo_path` arguments come from the MCP
 /// client (ultimately the agent, which can be steered by prompt injection);
 /// see `src/path_guard.rs` for the enforcement rules.
@@ -436,6 +469,12 @@ impl Config {
         }
         if self.reflection.min_occurrences == 0 {
             anyhow::bail!("reflection.min_occurrences must be >= 1, got 0",);
+        }
+        if self.http.enabled && self.http.auth_token.trim().is_empty() {
+            anyhow::bail!(
+                "http.enabled requires http.auth_token — refusing to start an \
+                 unauthenticated memory server"
+            );
         }
         if self.semantic.enabled || cfg!(feature = "semantic") {
             if !self.semantic.rrf_k.is_finite() || self.semantic.rrf_k <= 0.0 {

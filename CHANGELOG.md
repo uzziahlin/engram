@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-08
+
+Iteration round 2 — feedback loop, write quality, ops, and engineering-debt payoff.
+
+### Added
+- **Adoption feedback loop**: `get_memory` records which search results were actually read (24h window), `query_stats` reports adoption counts/rates, and the new `mark_relevance` MCP tool lets the agent flag a result `useful` (+0.1 importance) or `irrelevant` (−0.1) — importance now evolves with real usage (migration v5 adds `query_log.adopted`).
+- **`engram stats`**: one-glance observability — memory counts per type/project, entity graph size, reflection states, retrieval feedback (query volume, zero-hit and adoption rates, top adopted/unanswered queries).
+- **`engram backup / export / import`**: SQLite hot backup (safe while the server runs, retention `--keep N`), and idempotent-by-id JSON export/import.
+- **HTTP MCP transport** (`[http]` config, off by default): Streamable-HTTP subset on tiny_http (no async runtime) — `POST /mcp` with mandatory Bearer token; startup refuses an empty token.
+- **`engram.distill` prompt**: refines raw `session-import` memories into clean typed memories (decisions / failures with root cause / procedures) with quality bars, then archives the originals.
+- **Transcript error extraction**: `session-import`/`hook` now captures `is_error` tool results as failure evidence (`has-errors` tag) — raw material for failure memories and the reflection engine.
+- **Cross-project global search**: `project_id = "*"` on `search_memory` spans all projects (global knowledge); semantic + graph paths honor it too.
+- **`--features jieba`**: word-level Chinese tokenization (embedded jieba dictionary). A `meta` table records which tokenizer built the FTS index; switching builds triggers exactly one automatic rebuild.
+- Transport test suite: the stdio transport (`run_transport`, now reader/writer-generic) is directly tested — parse vs invalid-request distinction, jsonrpc version check, notifications, panic isolation, the 16 MiB frame cap, multi-worker dispatch.
+- Semantic stub tests: a deterministic embedder exercises fuse (vector-only materialization, cosine injection, filter enforcement) and the vector cache in CI — no model download needed.
+
+### Changed
+- **Contentless FTS5** (migration v6): shadow tables store the inverted index only — the document text is no longer duplicated, halving database size; search joins by rowid.
+- **Cross-type BM25 calibration**: each type's scores are rescaled to `raw/type_best × sigmoid(type_best)`, so a weak match in one table no longer outranks a strong match in another.
+- **decision/procedural importance** is a real field now (migration v4; tools accept `importance`, failure feedback maps to severity) — the reranker weight is no longer dead for those types.
+- **Token budget covers the `results` array** too: over budget, detail fields are stripped from the lowest-ranked results first (`detail_omitted: true`, re-fetchable via `get_memory`); previously only the `context` field was bounded.
+- Semantic: the embedding model loads lazily on first use (the ~90 MB first-run download no longer blocks the MCP initialize handshake), and vectors are cached per project with write-time invalidation (was: full reload + deserialize on every query).
+
+### Engineering debt
+- `repository.rs` split into `schema.rs` (DDL/migrations/tokenization), `graph.rs` (entities/relations/neighbors), `embeddings.rs` (vector store) — 4,600 lines down to 3,200 in the core file.
+- Composer dead code removed (`ContentType`/`detect_content_type`).
+- CI: new `test-features` job runs the jieba + semantic test suites.
+
+## [0.4.0] - 2026-09-08
 ## [0.4.0] - 2026-09-08
 
 Deep-review fix batch (2026-09-08 全链路审查, see `docs/deep-review-2026-09.md`) plus the first feedback-loop / write-automation / graph-retrieval iterations.

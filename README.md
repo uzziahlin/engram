@@ -90,6 +90,7 @@ cargo build --release    # binary lands in cargo's target dir (honors CARGO_TARG
 cargo install --path .   # or install system-wide into ~/.cargo/bin
 
 cargo build --release --features semantic   # opt-in: local embedding semantic search (larger binary; see [semantic] config)
+cargo build --release --features jieba      # opt-in: word-level Chinese tokenization (jieba dictionary, ~5 MB)
 ```
 
 Requires Rust 1.75+ and a C compiler (only for the bundled SQLite via `rusqlite`; the git layer is pure-Rust `gix`). No external databases or services needed.
@@ -248,7 +249,7 @@ Optional environment variables:
 
 ## 🛠️ Tools Reference
 
-All tools require a `project_id` parameter for multi-project isolation.
+All tools require a `project_id` parameter for multi-project isolation. `search_memory` also accepts `project_id = "*"` to search across all projects (global knowledge — user preferences, shared workflows).
 
 ### Read Tools
 
@@ -260,7 +261,8 @@ All tools require a `project_id` parameter for multi-project isolation.
 | `timeline` | Get a timeline of memory events for the past N days | `days`, `project_id` |
 | `recent_failures` | List recent failure/incident memories | `limit`, `project_id` |
 | `architectural_decisions` | List architecture decision records | `limit`, `project_id` |
-| `query_stats` | Aggregate past search queries by frequency and avg hit count (retrieval feedback) | `days`, `limit`, `project_id` |
+| `query_stats` | Aggregate past search queries by frequency, avg hit count, and adoption (retrieval feedback) | `days`, `limit`, `project_id` |
+| `mark_relevance` | Feedback on a search result: `useful` (+0.1 importance, counts as adopted) / `irrelevant` (−0.1) — tunes future rankings | `project_id`, `memory_type`, `id`, `feedback` |
 
 ### Write Tools
 
@@ -291,6 +293,7 @@ Engram also exposes MCP **prompts** (server-side templates any MCP client can fe
 | Prompt | Description | Arguments |
 |-------|-------------|-----------|
 | `engram.bootstrap` | Seed memory for an existing project: gather evidence via `collect_sources`, then distill it into structured memories with quality bars | `project_id`, `repo_path`, `dimensions` |
+| `engram.distill` | Refine raw `session-import` memories (auto-written by `engram hook`) into clean typed memories: decisions, failures with root cause, procedures | `project_id` |
 
 ---
 
@@ -324,6 +327,11 @@ worker_threads = 1                       # Concurrent request handlers (default 
 [security]                              # Guards for agent-supplied repo_path (prompt-injection defense)
 allowed_roots = []                      # Non-empty: ingest/collect only accept paths under these roots
                                          # (home dir and / are always rejected)
+
+[http]                                  # Optional MCP Streamable-HTTP transport (stdio stays the default)
+enabled = false                         # true → serve POST /mcp (Bearer-token gated)
+bind = "127.0.0.1:8742"
+auth_token = ""                         # REQUIRED when enabled — startup refuses an empty token
 
 [semantic]                               # Semantic search — only active in builds compiled with --features semantic
 enabled = false                          # Turn on embedding-based retrieval
@@ -397,8 +405,19 @@ engram get --project myproj --type failure --id <id>
 # Distill a Claude Code session transcript into a memory (wire to a Stop/SessionEnd hook)
 engram session-import --project myproj --transcript ~/.claude/projects/.../session.jsonl --dry-run
 
-# One-shot health pass: dedup + FTS repair + query-log prune + staleness report
+# One-shot health pass: dedup + FTS repair + query-log prune + staleness
+# report + orphan-entity preview + knowledge gaps (frequent zero-hit queries)
 engram maintain --apply
+
+# Store observability: memory counts, retrieval feedback, adoption rates
+engram stats --days 30
+
+# Backup (SQLite hot backup, safe while the MCP server runs; keeps newest 10)
+engram backup --keep 10
+
+# Export/import memories as JSON (idempotent by id — safe to re-import)
+engram export --project myproj --out memories.json
+engram import --file memories.json
 
 # View history
 engram timeline --project myproj --days 7
@@ -475,8 +494,12 @@ Re-running is idempotent — commits already stored as episodic memories are ski
 - [x] Reflection engine (failure-to-rule distillation with confirm/reject lifecycle + knowledge-gap reporting via `engram maintain`)
 - [x] Write automation (`engram hook` — Claude Code Stop/SessionEnd hooks distill sessions automatically)
 - [x] Graph-participating retrieval (shared-entity neighbors as second-tier search candidates)
-- [ ] HTTP MCP transport (for remote access)
-- [ ] Multi-agent memory sharing
+- [x] HTTP MCP transport (Streamable HTTP via `[http]` config, Bearer-token gated)
+- [x] Cross-project global search (`project_id = "*"`)
+- [x] Word-level Chinese tokenization (`--features jieba`, auto FTS rebuild on switch)
+- [x] Adoption feedback loop (get_memory tracking + `mark_relevance` tool)
+- [x] Backup / export / import
+- [ ] Multi-agent memory sharing (auth/scoping design first)
 
 ---
 

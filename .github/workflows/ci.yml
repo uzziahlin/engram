@@ -50,6 +50,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  # Feature-gated code paths (jieba tokenization, semantic retrieval stubs,
+  # HTTP transport) need their own test run — the default build compiles none
+  # of them. Real-model semantic tests stay #[ignore]d (no network in CI).
+  test-features:
+    name: Test (features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-features
+      - run: cargo test --locked --lib --features "semantic,jieba"
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}

@@ -23,14 +23,6 @@ impl ContextBudget {
     }
 }
 
-/// Content type for token estimation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentType {
-    English,
-    Chinese,
-    Code,
-}
-
 /// Context composer for converting retrieval results into compact high-signal context.
 pub struct ContextComposer;
 
@@ -71,33 +63,6 @@ impl ContextComposer {
         // 20% safety margin
         let with_margin = (tokens as f64 * 1.2).ceil() as usize;
         with_margin.max(1)
-    }
-
-    /// Detect the dominant content type of a string.
-    /// Empty strings default to English.
-    pub fn detect_content_type(text: &str) -> ContentType {
-        if text.is_empty() {
-            return ContentType::English;
-        }
-
-        let mut english = 0usize;
-        let mut chinese = 0usize;
-
-        for ch in text.chars() {
-            if ch.is_ascii() {
-                english += 1;
-            } else if is_chinese_char(ch) {
-                chinese += 1;
-            }
-        }
-
-        if chinese > english / 2 {
-            ContentType::Chinese
-        } else if english > text.chars().count() / 2 {
-            ContentType::English
-        } else {
-            ContentType::Code
-        }
     }
 
     /// Compose context from search results within a token budget.
@@ -203,18 +168,6 @@ mod tests {
         assert!(
             tokens > 0 && tokens < 15,
             "expected reasonable estimate, got {tokens}"
-        );
-    }
-
-    #[test]
-    fn test_detect_content_type() {
-        assert_eq!(
-            ContextComposer::detect_content_type("Hello world"),
-            ContentType::English
-        );
-        assert_eq!(
-            ContextComposer::detect_content_type("你好世界测试代码"),
-            ContentType::Chinese
         );
     }
 

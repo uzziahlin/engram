@@ -419,6 +419,7 @@ mod tests {
             tradeoffs: "to".into(),
             related_files: vec![],
             tags: vec![],
+            importance: 0.5,
             created_at: ts,
             updated_at: ts,
         };

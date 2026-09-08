@@ -194,8 +194,13 @@ macro_rules! impl_memory_crud {
             let mut stmt = conn.prepare(concat!(
                 "SELECT ", $search_cols, ", bm25(", $fts_table, ") as score",
                 " FROM ", $fts_table, " f",
-                " JOIN ", $table, " m ON f.memory_id = m.id",
-                " WHERE ", $fts_table, " MATCH ?1 AND m.project_id = ?2 AND m.archived_at IS NULL",
+                " JOIN ", $table, " m ON f.rowid = m.rowid",
+                // `project_id = '*'` searches across all projects (global
+                // knowledge like user preferences / shared workflows). FTS
+                // MATCH drives the query plan, so the OR costs nothing on
+                // the project-scoped path.
+                " WHERE ", $fts_table,
+                " MATCH ?1 AND (?2 = '*' OR m.project_id = ?2) AND m.archived_at IS NULL",
                 " ORDER BY f.rank LIMIT ?3"
             ))?;
             let mut fetch = |fts_query: &str| -> Result<Vec<ScoredMemory<$Struct>>> {

@@ -185,7 +185,7 @@ fn reindex_backfills_then_recalls() {
 #[test]
 fn test_list_tools() {
     let tools = McpServer::list_tools();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 24);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"search_memory"));
@@ -265,7 +265,7 @@ fn test_handle_tools_list() {
     assert!(response.result.is_some());
     let result = response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 24);
 }
 
 #[test]
@@ -416,6 +416,7 @@ fn test_create_decision_with_provider() {
             tradeoffs: "Added infrastructure complexity".into(),
             related_files: vec!["auth.ts".into()],
             tags: vec!["architecture".into()],
+            importance: None,
         })
         .unwrap();
 
@@ -478,6 +479,7 @@ fn test_create_procedural_with_provider() {
             ],
             related_tools: vec!["docker".into()],
             tags: vec!["deploy".into()],
+            importance: None,
         })
         .unwrap();
 
@@ -824,6 +826,56 @@ fn test_jsonrpc_parse_error_response() {
 }
 
 #[test]
+fn search_with_star_project_spans_projects() {
+    // project_id = '*' is the global scope: knowledge in project A must
+    // surface for an agent working in project B.
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+    let mk = |id: &str, project: &str| crate::models::EpisodicMemory {
+        id: id.into(),
+        project_id: project.into(),
+        session_id: "s".into(),
+        summary: format!("global marker {id} GLOBALSEARCHX"),
+        content: "c".into(),
+        files_touched: vec![],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec![],
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create_episodic(&mk("ga", "proj-a")).unwrap();
+    repo.create_episodic(&mk("gb", "proj-b")).unwrap();
+
+    let resp = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "*".into(),
+            query: "GLOBALSEARCHX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let results = resp.get("results").and_then(|r| r.as_array()).unwrap();
+    assert_eq!(results.len(), 2, "both projects' memories must surface");
+
+    // Project-scoped search still isolates.
+    let scoped = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "proj-a".into(),
+            query: "GLOBALSEARCHX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let scoped_results = scoped.get("results").and_then(|r| r.as_array()).unwrap();
+    assert_eq!(scoped_results.len(), 1);
+}
+
+#[test]
 fn search_surfaces_graph_neighbors() {
     // Two memories touching the same file are graph-adjacent: searching
     // for one must surface the other as a low-rank `graph_neighbor` even
@@ -1081,12 +1133,32 @@ fn test_prompts_list_returns_bootstrap() {
     assert!(response.error.is_none());
     let result = response.result.unwrap();
     let prompts = result["prompts"].as_array().unwrap();
-    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts.len(), 2);
     assert_eq!(prompts[0]["name"], "engram.bootstrap");
+    assert_eq!(prompts[1]["name"], "engram.distill");
     let args = prompts[0]["arguments"].as_array().unwrap();
     assert!(args
         .iter()
         .any(|a| a["name"] == "project_id" && a["required"] == true));
+}
+
+#[test]
+fn test_prompts_get_renders_distill_template() {
+    let server = McpServer::new();
+    let response = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(1)),
+        method: "prompts/get".into(),
+        params: Some(serde_json::json!({
+            "name": "engram.distill",
+            "arguments": { "project_id": "myproj" }
+        })),
+    });
+    assert!(response.error.is_none(), "got {response:?}");
+    let result = response.result.unwrap();
+    let text = result["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("myproj"), "project id must be substituted");
+    assert!(text.contains("session-import"));
 }
 
 #[test]

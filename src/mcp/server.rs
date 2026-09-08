@@ -54,6 +54,16 @@ fn clamp_days(days: i64) -> i64 {
     days.clamp(0, 3650)
 }
 
+/// mark_relevance tool input: agent feedback on a search result's usefulness.
+#[derive(Debug, Deserialize)]
+pub struct MarkRelevanceInput {
+    pub project_id: String,
+    pub memory_type: String,
+    pub id: String,
+    /// "useful" bumps importance (+0.1), "irrelevant" drops it (-0.1).
+    pub feedback: String,
+}
+
 /// search_memory tool input.
 #[derive(Debug, Deserialize)]
 pub struct SearchMemoryInput {
@@ -191,6 +201,9 @@ pub struct CreateDecisionInput {
     pub related_files: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Ranking signal (0..=1, default 0.5).
+    #[serde(default)]
+    pub importance: Option<f32>,
 }
 
 /// create_failure tool input.
@@ -221,6 +234,9 @@ pub struct CreateProceduralInput {
     pub related_tools: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Ranking signal (0..=1, default 0.5).
+    #[serde(default)]
+    pub importance: Option<f32>,
 }
 
 /// ingest_commits tool input — auto-generate memories from git history.
@@ -356,6 +372,7 @@ pub trait MemoryToolProvider: Send + Sync {
     fn forget_memory(&self, input: ForgetMemoryInput) -> Result<serde_json::Value>;
     fn restore_memory(&self, input: RestoreMemoryInput) -> Result<serde_json::Value>;
     fn update_memory(&self, input: UpdateMemoryInput) -> Result<serde_json::Value>;
+    fn mark_relevance(&self, input: MarkRelevanceInput) -> Result<serde_json::Value>;
     fn forget_batch(&self, input: ForgetBatchInput) -> Result<serde_json::Value>;
     fn list_archived(&self, input: ListArchivedInput) -> Result<serde_json::Value>;
     fn consolidate_memories(&self, input: ConsolidateInput) -> Result<serde_json::Value>;
@@ -579,7 +596,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         // Results carry each memory's full type-specific payload (root_cause/
         // fix/prevention, context/tradeoffs, steps, content…): search is the
         // agents' only read path, so a teaser summary is not enough.
-        let result_items: Vec<serde_json::Value> = results
+        let mut result_items: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
                 let mut item = serde_json::json!({
@@ -599,6 +616,35 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                 item
             })
             .collect();
+
+        // The token budget now covers the RESULTS array too — it previously
+        // only constrained the `context` field while `results` carried every
+        // full payload regardless of size. Over budget: strip the detail
+        // fields from the LOWEST-ranked results first (agents can re-fetch
+        // the full record via get_memory).
+        let mut used = crate::context::composer::ContextComposer::estimate_tokens(
+            &serde_json::to_string(&result_items).unwrap_or_default(),
+        );
+        let mut idx = result_items.len();
+        while used > budget.reserved_for_memory && idx > 0 {
+            idx -= 1;
+            if let Some(obj) = result_items[idx].as_object_mut() {
+                let keep = [
+                    "id",
+                    "memory_type",
+                    "summary",
+                    "relevance_score",
+                    "importance",
+                    "tags",
+                    "created_at",
+                ];
+                obj.retain(|k, _| keep.contains(&k.as_str()));
+                obj.insert("detail_omitted".to_string(), serde_json::Value::Bool(true));
+            }
+            used = crate::context::composer::ContextComposer::estimate_tokens(
+                &serde_json::to_string(&result_items).unwrap_or_default(),
+            );
+        }
 
         // Best-effort retrieval feedback: log this query + its hits so
         // `query_stats` / `engram queries` can surface hit-rate signal. A
@@ -643,6 +689,19 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             MemoryKind::Failure => fetch!(get_failure),
             MemoryKind::Procedural => fetch!(get_procedural),
         };
+        // Adoption signal: this memory was returned by a recent search and
+        // now actually read. Feeds query_stats adoption rates. Best-effort.
+        let fetched_id = memory.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !fetched_id.is_empty() {
+            if let Err(e) = repo.record_adoption(
+                &input.project_id,
+                fetched_id,
+                chrono::Utc::now().timestamp(),
+                24 * 3600,
+            ) {
+                tracing::warn!("adoption tracking failed: {e}");
+            }
+        }
         Ok(serde_json::json!({
             "memory_type": kind.as_str(),
             "memory": memory,
@@ -840,6 +899,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             tradeoffs: input.tradeoffs,
             related_files: input.related_files,
             tags: input.tags,
+            importance: input.importance.unwrap_or(0.5).clamp(0.0, 1.0),
             created_at: now,
             updated_at: now,
         };
@@ -912,6 +972,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             steps: input.steps,
             related_tools: input.related_tools,
             tags: input.tags,
+            importance: input.importance.unwrap_or(0.5).clamp(0.0, 1.0),
             created_at: now,
             updated_at: now,
         };
@@ -1083,6 +1144,11 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
         let archived = repo.archive(kind, &input.id, &input.project_id, now)?;
+        #[cfg(feature = "semantic")]
+        if archived {
+            // The vector cache still holds the now-archived memory.
+            self.embedding.invalidate_vectors(Some(&input.project_id));
+        }
         Ok(serde_json::json!({
             "id": input.id,
             "archived": archived,
@@ -1094,6 +1160,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let kind = MemoryKind::from_type_str(&input.memory_type)?;
         let repo = self.lock_repo();
         let restored = repo.restore(kind, &input.id, &input.project_id)?;
+        #[cfg(feature = "semantic")]
+        if restored {
+            self.embedding.invalidate_vectors(Some(&input.project_id));
+        }
         Ok(serde_json::json!({
             "id": input.id,
             "restored": restored,
@@ -1163,6 +1233,71 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         }))
     }
 
+    fn mark_relevance(&self, input: MarkRelevanceInput) -> Result<serde_json::Value> {
+        let kind = MemoryKind::from_type_str(&input.memory_type)?;
+        let step = match input.feedback.as_str() {
+            "useful" => 0.1,
+            "irrelevant" => -0.1,
+            other => anyhow::bail!("feedback must be 'useful' or 'irrelevant', got {other:?}"),
+        };
+        let repo = self.lock_repo();
+        let now = chrono::Utc::now().timestamp();
+
+        macro_rules! adjust_importance {
+            ($get:ident, $update:ident) => {{
+                let mut mem = repo.$get(&input.id, &input.project_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "memory not found in project {}: {}",
+                        input.project_id,
+                        input.id
+                    )
+                })?;
+                mem.importance = (mem.importance + step).clamp(0.0, 1.0);
+                mem.updated_at = now;
+                let importance = mem.importance;
+                repo.$update(&mem)?;
+                importance
+            }};
+        }
+        // Failure memories have no importance field — severity IS their
+        // importance signal (severity/5 in the reranker), so feedback adjusts
+        // severity by half a point, clamped to the 1..=5 scale.
+        macro_rules! adjust_severity {
+            ($get:ident, $update:ident) => {{
+                let mut mem = repo.$get(&input.id, &input.project_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "memory not found in project {}: {}",
+                        input.project_id,
+                        input.id
+                    )
+                })?;
+                let delta = (step * 5.0).round() as i8;
+                mem.severity = (mem.severity as i8 + delta).clamp(1, 5) as u8;
+                mem.updated_at = now;
+                let importance = mem.severity as f32 / 5.0;
+                repo.$update(&mem)?;
+                importance
+            }};
+        }
+        let importance = match kind {
+            MemoryKind::Episodic => adjust_importance!(get_episodic, update_episodic),
+            MemoryKind::Decision => adjust_importance!(get_decision, update_decision),
+            MemoryKind::Failure => adjust_severity!(get_failure, update_failure),
+            MemoryKind::Procedural => adjust_importance!(get_procedural, update_procedural),
+        };
+
+        // Explicit "useful" is also an adoption event for retrieval feedback.
+        if step > 0.0 {
+            let _ = repo.record_adoption(&input.project_id, &input.id, now, 24 * 3600);
+        }
+
+        Ok(serde_json::json!({
+            "id": input.id,
+            "feedback": input.feedback,
+            "importance": importance,
+        }))
+    }
+
     fn forget_batch(&self, input: ForgetBatchInput) -> Result<serde_json::Value> {
         let kinds = resolve_kinds(&input.memory_type)?;
         let repo = self.lock_repo();
@@ -1221,6 +1356,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             now,
         )?;
         let total_archived: usize = plans.iter().map(|p| p.archived).sum();
+        #[cfg(feature = "semantic")]
+        if input.apply && total_archived > 0 {
+            self.embedding.invalidate_vectors(Some(&input.project_id));
+        }
         Ok(serde_json::json!({
             "applied": input.apply,
             "plans": plans,
@@ -1268,6 +1407,8 @@ fn resolve_kinds(memory_type: &Option<String>) -> Result<Vec<MemoryKind>> {
 /// The bootstrap prompt template, kept in sync with `docs/bootstrap.md` so
 /// humans and agents read the same guidance (single source of truth).
 const BOOTSTRAP_PROMPT_TEMPLATE: &str = include_str!("../../docs/bootstrap.md");
+const DISTILL_PROMPT_NAME: &str = "engram.distill";
+const DISTILL_PROMPT_TEMPLATE: &str = include_str!("../../docs/distill.md");
 
 /// Prompt templates this server exposes via `prompts/list` + `prompts/get`.
 /// Keeping the registry here lets `initialize` advertise the capability and
@@ -1330,6 +1471,7 @@ impl McpServer {
                 forget_memory, ForgetMemoryInput, {"archived": false, "status": "noop"};
                 restore_memory, RestoreMemoryInput, {"restored": false, "status": "noop"};
                 update_memory, UpdateMemoryInput, {"id": "", "status": "noop"};
+                mark_relevance, MarkRelevanceInput, {"id": "", "status": "noop"};
                 forget_batch, ForgetBatchInput, {"applied": false, "matched": [], "count": 0};
                 list_archived, ListArchivedInput, {"archived": [], "count": 0};
                 consolidate_memories, ConsolidateInput, {"applied": false, "plans": [], "total_archived": 0};
@@ -1372,7 +1514,7 @@ impl McpServer {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "project_id": { "type": "string", "description": "Project identifier; '*' searches across all projects (global knowledge)" },
                         "query": { "type": "string", "description": "Search query" },
                         "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"], "description": "Filter by memory type" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Only memories carrying any of these tags" },
@@ -1595,6 +1737,20 @@ impl McpServer {
                 }),
             },
             ToolDefinition {
+                name: "mark_relevance".into(),
+                description: "Give feedback on a search result: 'useful' raises its ranking importance (+0.1, also counted as adopted), 'irrelevant' lowers it (-0.1). Call this after reading a result that helped (or didn't) — it tunes future rankings.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier" },
+                        "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"] },
+                        "id": { "type": "string", "description": "Memory id the feedback applies to" },
+                        "feedback": { "type": "string", "enum": ["useful", "irrelevant"], "description": "useful = +0.1 importance, irrelevant = -0.1" },
+                    },
+                    "required": ["project_id", "memory_type", "id", "feedback"],
+                }),
+            },
+            ToolDefinition {
                 name: "forget_batch".into(),
                 description: "Archive memories matching tags and/or a before-timestamp. Dry-run by default (apply=true to archive).".into(),
                 input_schema: serde_json::json!({
@@ -1738,6 +1894,12 @@ impl McpServer {
                             { "name": "repo_path", "description": "Path to the project root (required)", "required": true },
                             { "name": "dimensions", "description": "Comma-separated: git,decisions,failures,workflow (default: all)", "required": false },
                         ],
+                    }, {
+                        "name": DISTILL_PROMPT_NAME,
+                        "description": "Refine raw session-import memories (auto-written by `engram hook`) into clean typed memories: decisions, failures (with root cause), procedures. Run periodically or after several sessions.",
+                        "arguments": [
+                            { "name": "project_id", "description": "Project identifier (required)", "required": true },
+                        ],
                     }],
                 })),
                 error: None,
@@ -1757,7 +1919,36 @@ impl McpServer {
                         }),
                     };
                 }
-                if name != BOOTSTRAP_PROMPT_NAME {
+                if name == DISTILL_PROMPT_NAME {
+                    let args = params.get("arguments").cloned().unwrap_or_default();
+                    let Some(project_id) = args.get("project_id").and_then(|v| v.as_str()) else {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: "Invalid params: engram.distill requires a string \
+                                          argument 'project_id'"
+                                    .into(),
+                                data: None,
+                            }),
+                        };
+                    };
+                    let rendered = DISTILL_PROMPT_TEMPLATE.replace("{{PROJECT_ID}}", project_id);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "description": "Refine raw session-import memories into typed memories",
+                            "messages": [{
+                                "role": "user",
+                                "content": { "type": "text", "text": rendered }
+                            }],
+                        })),
+                        error: None,
+                    }
+                } else if name != BOOTSTRAP_PROMPT_NAME {
                     JsonRpcResponse {
                         jsonrpc: "2.0".into(),
                         id: request.id,
@@ -1898,6 +2089,9 @@ impl McpServer {
                     }
                     "update_memory" => {
                         dispatch_tool!(arguments, UpdateMemoryInput, self.provider, update_memory)
+                    }
+                    "mark_relevance" => {
+                        dispatch_tool!(arguments, MarkRelevanceInput, self.provider, mark_relevance)
                     }
                     "forget_batch" => {
                         dispatch_tool!(arguments, ForgetBatchInput, self.provider, forget_batch)

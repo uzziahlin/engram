@@ -1,6 +1,6 @@
 [package]
 name = "engram"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 description = "A local-first memory system for AI coding agents — persistent engineering knowledge via MCP"
@@ -22,11 +22,17 @@ semantic = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+# Word-level CJK segmentation (jieba dictionary, ~5 MB embedded). Improves
+# Chinese retrieval precision over the default per-character splitting:
+# `认证` matches as one word instead of "both chars present anywhere".
+# Changing this feature changes FTS tokenization — the meta table records
+# which tokenizer built the index and initialize_schema rebuilds on mismatch.
+jieba = ["dep:jieba-rs"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.31", features = ["bundled", "column_decltype", "backup"] }
 # gix (pure-Rust git) replaces git2 to eliminate dynamic linking of
 # openssl/libssh2/libz — keeps the release binary self-contained and portable.
 gix = { version = "0.83", default-features = false, features = ["blob-diff", "sha1"] }
@@ -40,6 +46,11 @@ toml = "0.8"
 dirs = "5"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.24"
+jieba-rs = { version = "0.7", optional = true }
+# Minimal synchronous HTTP server for the optional MCP Streamable-HTTP
+# transport — deliberately NOT axum/tokio: engram is a no-async-runtime
+# codebase and this keeps the dependency set tiny.
+tiny_http = "0.12"
 candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", optional = true }

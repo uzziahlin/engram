@@ -91,3 +91,38 @@
 - [x] 全量测试 + clippy -D warnings + fmt（双 feature）
 - [x] README/CHANGELOG 更新（含 reflection 措辞修正）
 - [x] 迁移注册表：v2 FTS 重建（rowid + 新分词）、v3 reflection re-arm
+
+---
+
+# 第二轮迭代（2026-09-08 晚）：功能方向 + 工程债
+
+> 评审结论中的提升方向逐点落地 + 全部工程债清理。详细变更见 CHANGELOG [Unreleased]。
+
+## 一、核心价值
+
+- [x] jieba 中文分词（`--features jieba`，meta 表记录 tokenizer、切换自动重建 FTS）
+- [x] 采用信号闭环（get_memory 回写 + mark_relevance 工具 + query_stats 采用率 + stats 命令）
+- [x] engram.distill 精馏 prompt（session-import 原始记忆 → 干净的类型化记忆）
+- [x] 转录错误事件提取（has-errors 标签 → reflection/failure 素材）
+
+## 二、规模化与运维
+
+- [x] engram backup（SQLite 热备 + 保留 N 份）/ export / import（按 id 幂等）
+- [x] 语义规模化：模型懒加载（不阻塞 initialize）+ 按项目向量缓存（写入失效）
+- [x] FTS contentless_delete 化（迁移 v6，去除文本双存，库体积减半）
+- [x] engram stats 观测命令（计数/采用率/top 查询/孤儿实体）
+
+## 三、生态扩展
+
+- [x] HTTP transport（tiny_http，Bearer token 必填，[http] 配置默认关闭）
+- [x] 跨项目全局检索（project_id = "*"，含语义与图路径）
+
+## 四、工程债
+
+- [x] repository.rs 拆分（schema/graph/embeddings；主文件 4600→3200 行）
+- [x] transport 全量测试（run_transport 抽象化：解析区分/版本校验/通知/panic 隔离/16MiB 上限/多 worker）
+- [x] semantic stub 测试（确定性 embedder，CI 可测 fuse/过滤/缓存）
+- [x] decision/procedural importance 字段（迁移 v4；failure 反馈映射 severity）
+- [x] 跨类型 BM25 分数校准（type-relative + 绝对强度衰减）
+- [x] composer 死代码清理 + 预算覆盖 results 数组（低 ranked 先裁 detail）
+- [x] CI test-features job（jieba + semantic 测试套件）

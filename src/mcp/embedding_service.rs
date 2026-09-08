@@ -23,15 +23,34 @@ pub struct ReindexReport {
 
 pub struct EmbeddingService {
     #[cfg(feature = "semantic")]
-    embedder: Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>>,
+    embedder: std::sync::OnceLock<Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>>>,
+    #[cfg(feature = "semantic")]
+    lazy_config: Box<crate::config::SemanticConfig>,
+    /// Per-(project, model) vector cache: brute-force cosine used to
+    /// re-deserialize every vector from SQLite on EVERY query (~15 MB per
+    /// 10k memories). Entries are evicted wholesale on any write — coarse,
+    /// but obviously correct (staleness self-heals: materialization of a
+    /// deleted id returns None and the hit is dropped).
+    #[cfg(feature = "semantic")]
+    vector_cache: std::sync::Mutex<VectorCache>,
 }
+
+/// One cached vector with its memory identity: (memory_id, memory_type, vec).
+#[cfg(feature = "semantic")]
+pub type VectorEntry = (String, String, Vec<f32>);
+
+/// (project_id, model_id) → the project's cached active vectors.
+#[cfg(feature = "semantic")]
+type VectorCache = std::collections::HashMap<(String, String), std::sync::Arc<Vec<VectorEntry>>>;
 
 impl EmbeddingService {
     pub fn new(config: &Config) -> Self {
         #[cfg(feature = "semantic")]
         {
             Self {
-                embedder: Self::init_embedder(config),
+                embedder: std::sync::OnceLock::new(),
+                lazy_config: Box::new(config.semantic.clone()),
+                vector_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
         #[cfg(not(feature = "semantic"))]
@@ -41,46 +60,94 @@ impl EmbeddingService {
         }
     }
 
+    /// Test seam: build the service around a stub embedder (no model files,
+    /// deterministic vectors) so the semantic path is testable in CI.
+    #[cfg(feature = "semantic")]
+    pub fn with_embedder(
+        embedder: Box<dyn crate::retrieval::embedding::EmbeddingProvider>,
+    ) -> Self {
+        Self {
+            embedder: std::sync::OnceLock::from(Some(embedder)),
+            lazy_config: Box::new(crate::config::SemanticConfig::default()),
+            vector_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Lazily resolve the embedder: model download + load happens on FIRST
+    /// USE, not at server startup — it used to block the MCP initialize
+    /// handshake for the whole ~90 MB first-run fetch.
+    #[cfg(feature = "semantic")]
+    fn embedder(&self) -> Option<&dyn crate::retrieval::embedding::EmbeddingProvider> {
+        self.embedder
+            .get_or_init(|| Self::init_embedder(&self.lazy_config))
+            .as_deref()
+    }
+
+    /// Drop cached vectors for a project (any write that can change the
+    /// active vector set). `None` = drop everything (reindex, model change).
+    #[cfg(feature = "semantic")]
+    pub fn invalidate_vectors(&self, project: Option<&str>) {
+        let mut cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
+        match project {
+            Some(p) => {
+                cache.retain(|(proj, _), _| proj != p);
+            }
+            None => cache.clear(),
+        }
+    }
+
+    /// Load the active vectors for (project, model), through the cache.
+    #[cfg(feature = "semantic")]
+    fn cached_vectors(
+        &self,
+        repo: &MemoryRepository,
+        project_id: &str,
+        model_id: &str,
+    ) -> Result<std::sync::Arc<Vec<VectorEntry>>> {
+        let key = (project_id.to_string(), model_id.to_string());
+        {
+            let cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(&key) {
+                return Ok(std::sync::Arc::clone(hit));
+            }
+        }
+        let loaded: Vec<VectorEntry> = repo.load_active_embeddings(project_id, model_id)?;
+        let arc = std::sync::Arc::new(loaded);
+        let mut cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(key, std::sync::Arc::clone(&arc));
+        Ok(arc)
+    }
+
     /// Build the embedding model from config (semantic enabled + model available).
     /// Returns None (logging a warning) on any failure so the server still runs
     /// in pure-BM25 mode.
     #[cfg(feature = "semantic")]
     fn init_embedder(
-        config: &Config,
+        config: &crate::config::SemanticConfig,
     ) -> Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>> {
         use crate::retrieval::embedding::{ensure_model, CandleBertEmbedder};
-        if !config.semantic.enabled {
+        if !config.enabled {
             return None;
         }
-        let dir = config.semantic.model_path.clone().unwrap_or_else(|| {
+        let dir = config.model_path.clone().unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".engram/models")
-                .join(
-                    config
-                        .semantic
-                        .model_id
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("model"),
-                )
+                .join(config.model_id.rsplit('/').next().unwrap_or("model"))
         });
         // Only auto-fetch when no explicit path was given (air-gapped users
         // provide model_path and we never touch the network).
-        if config.semantic.model_path.is_none() {
-            if let Err(e) = ensure_model(&config.semantic.model_id, &dir) {
+        if config.model_path.is_none() {
+            if let Err(e) = ensure_model(&config.model_id, &dir) {
                 tracing::warn!(
                     "semantic enabled but model fetch failed ({e}); disabling semantic search"
                 );
                 return None;
             }
         }
-        match CandleBertEmbedder::from_local(&dir, &config.semantic.model_id) {
+        match CandleBertEmbedder::from_local(&dir, &config.model_id) {
             Ok(e) => {
-                tracing::info!(
-                    "semantic search enabled: model {}",
-                    config.semantic.model_id
-                );
+                tracing::info!("semantic search enabled: model {}", config.model_id);
                 Some(Box::new(e))
             }
             Err(e) => {
@@ -101,7 +168,7 @@ impl EmbeddingService {
         project_id: &str,
         text: &str,
     ) {
-        if let Some(e) = self.embedder.as_ref() {
+        if let Some(e) = self.embedder() {
             match e.embed(&[text]) {
                 Ok(v) if !v.is_empty() => {
                     if let Err(err) = repo.upsert_embedding(
@@ -114,6 +181,7 @@ impl EmbeddingService {
                     ) {
                         tracing::warn!("upsert_embedding failed for {id}: {err}");
                     }
+                    self.invalidate_vectors(Some(project_id));
                 }
                 Ok(_) => {}
                 Err(err) => tracing::warn!("embed failed for {id}: {err}"),
@@ -148,8 +216,7 @@ impl EmbeddingService {
             return;
         }
         let embedder = self
-            .embedder
-            .as_ref()
+            .embedder()
             .expect("embedder presence is checked by reindex_embeddings");
         match embedder.embed(&[text.as_str()]) {
             Ok(v) if !v.is_empty() => {
@@ -191,7 +258,7 @@ impl EmbeddingService {
         force: bool,
         dry_run: bool,
     ) -> Result<ReindexReport> {
-        let embedder = self.embedder.as_ref().ok_or_else(|| {
+        let embedder = self.embedder().ok_or_else(|| {
             anyhow::anyhow!(
                 "semantic search is not active: enable [semantic] in ~/.engram/config.toml \
                  and ensure the model is available"
@@ -260,6 +327,9 @@ impl EmbeddingService {
                 dry_run,
             );
         }
+        if !dry_run {
+            self.invalidate_vectors(None);
+        }
         tracing::info!(
             "reindex: total={} embedded={} skipped={} failed={} dry_run={}",
             report.total,
@@ -299,7 +369,7 @@ impl EmbeddingService {
     ) -> Result<Vec<SearchResult>> {
         use std::collections::HashMap;
 
-        let Some(embedder) = self.embedder.as_ref() else {
+        let Some(embedder) = self.embedder() else {
             return Ok(bm25);
         };
         let query_vec = match embedder.embed(&[query]) {
@@ -312,7 +382,7 @@ impl EmbeddingService {
             }
         };
 
-        let loaded = repo.load_active_embeddings(project_id, embedder.model_id())?;
+        let loaded = self.cached_vectors(repo, project_id, embedder.model_id())?;
         if loaded.is_empty() {
             // Likely a model_id change stranded all vectors: tell the user
             // how to recover instead of silently degrading to BM25.
@@ -327,7 +397,10 @@ impl EmbeddingService {
             .iter()
             .map(|(id, ty, _)| (id.clone(), ty.clone()))
             .collect();
-        let cands: Vec<(String, Vec<f32>)> = loaded.into_iter().map(|(id, _, v)| (id, v)).collect();
+        let cands: Vec<(String, Vec<f32>)> = loaded
+            .iter()
+            .map(|(id, _, v)| (id.clone(), v.clone()))
+            .collect();
         let cosine_of: HashMap<String, f32> =
             crate::retrieval::vector::top_k_cosine(&query_vec, &cands, top_k)
                 .into_iter()
@@ -370,6 +443,166 @@ impl EmbeddingService {
 
     #[cfg(feature = "semantic")]
     pub fn is_active(&self) -> bool {
-        self.embedder.is_some()
+        self.embedder().is_some()
+    }
+}
+
+#[cfg(all(test, feature = "semantic"))]
+mod tests {
+    use super::*;
+    use crate::models::EpisodicMemory;
+    use crate::storage::MemoryRepository;
+
+    /// Deterministic stub: 4-dim vector from a cheap character hash. Similar
+    /// texts produce similar vectors (same prefix), different texts don't.
+    struct StubEmbedder;
+    impl crate::retrieval::embedding::EmbeddingProvider for StubEmbedder {
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let mut v = vec![0.0f32; 4];
+                    for (i, b) in t.bytes().take(16).enumerate() {
+                        v[i % 4] += b as f32;
+                    }
+                    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        v.iter().map(|x| x / norm).collect()
+                    } else {
+                        v
+                    }
+                })
+                .collect())
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &str {
+            "stub-model"
+        }
+    }
+
+    fn mem(id: &str, summary: &str) -> EpisodicMemory {
+        EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: summary.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn fuse_materializes_vector_hits_and_injects_cosine() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        // "rust language features" is the vector target; the query shares its
+        // bytes but BM25 misses it via a tag-only FTS mismatch is hard to
+        // force — instead assert on the union + score-injection directly.
+        let target = mem("v1", "rust language features");
+        repo.create_episodic(&target).unwrap();
+        let other = mem("v2", "completely unrelated words");
+        repo.create_episodic(&other).unwrap();
+
+        let svc = EmbeddingService::with_embedder(Box::new(StubEmbedder));
+        svc.index(&repo, "episodic", "v1", "p", "rust language features");
+        svc.index(&repo, "episodic", "v2", "p", "completely unrelated words");
+
+        // BM25 side finds only the textually matching v2.
+        let bm25 = crate::retrieval::bm25::BM25Retriever::search_by_type(
+            &repo,
+            "unrelated",
+            "p",
+            "episodic",
+            10,
+        )
+        .unwrap();
+        assert_eq!(bm25.len(), 1);
+        assert_eq!(bm25[0].id, "v2");
+
+        // Query embedding equals v1's embedding (same text) → v1 must be
+        // materialized as a vector-only hit with cosine ~1.0 injected.
+        let fused = svc
+            .fuse(
+                &repo,
+                "rust language features",
+                "p",
+                bm25,
+                5,
+                60.0,
+                None,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(fused.len(), 2, "vector-only hit must be materialized");
+        let v1 = fused.iter().find(|r| r.id == "v1").unwrap();
+        assert!(
+            v1.relevance_score > 0.99,
+            "cosine of an identical text must inject ~1.0 relevance, got {}",
+            v1.relevance_score
+        );
+    }
+
+    #[test]
+    fn fuse_respects_explicit_memory_type_filter() {
+        // A vector hit of the WRONG type must not bypass an explicit
+        // memory_type filter (the 2026-09 review's filter-penetration bug).
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let target = mem("v1", "rust language features");
+        repo.create_episodic(&target).unwrap();
+
+        let svc = EmbeddingService::with_embedder(Box::new(StubEmbedder));
+        svc.index(&repo, "episodic", "v1", "p", "rust language features");
+
+        let fused = svc
+            .fuse(
+                &repo,
+                "rust language features",
+                "p",
+                vec![],
+                5,
+                60.0,
+                Some("failure"), // user asked for failures only
+                &[],
+                None,
+            )
+            .unwrap();
+        assert!(
+            fused.is_empty(),
+            "episodic vector hit must not leak through memory_type=failure"
+        );
+    }
+
+    #[test]
+    fn vector_cache_invalidates_on_index() {
+        // Writing a new embedding must evict the project's cached vectors —
+        // otherwise a stale cache would serve the pre-write set forever.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mem("v1", "alpha")).unwrap();
+        repo.create_episodic(&mem("v2", "beta")).unwrap();
+
+        let svc = EmbeddingService::with_embedder(Box::new(StubEmbedder));
+        svc.index(&repo, "episodic", "v1", "p", "alpha");
+        // Prime the cache with an empty vector set.
+        let _ = svc
+            .fuse(&repo, "alpha", "p", vec![], 5, 60.0, None, &[], None)
+            .unwrap();
+        svc.index(&repo, "episodic", "v2", "p", "beta");
+        let fused = svc
+            .fuse(&repo, "beta", "p", vec![], 5, 60.0, None, &[], None)
+            .unwrap();
+        assert!(
+            fused.iter().any(|r| r.id == "v2"),
+            "cache must reflect the newly indexed vector"
+        );
     }
 }
