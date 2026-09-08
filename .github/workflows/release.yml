@@ -42,7 +42,12 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13
+          # macos-13 (the last Intel runner) was retired by GitHub — the job
+          # queued forever and the release shipped without this asset. Build
+          # the Intel target on the arm64 runner instead: the Apple toolchain
+          # cross-compiles x86_64-apple-darwin natively (bundled SQLite's C
+          # code is passed the matching --target by cc-rs; gix is pure Rust).
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: ubuntu-latest
