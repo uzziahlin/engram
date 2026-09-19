@@ -5,7 +5,27 @@ All notable changes to engram are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-09-19
+
+Iteration round 3 — the self-improving loop closes: retrieval quality is
+measured (`eval`), adoption evidence is consumed (`tune`), memory is in
+context without searching (`brief`), decisions age out (`supersedes`),
+writes stop polluting (dedup), and capture spans clients (Codex).
+
+### Added
+- **`engram install-hooks` / `uninstall-hooks`**: one-command wiring for automatic memory capture — merges a `SessionEnd` entry invoking `engram hook` into Claude Code settings (project-level by default, `--global` for all projects). Preserves existing hooks, backs the file up to `settings.json.bak`, refuses to touch settings it cannot parse, and is idempotent. `init-guide` offers the same wiring interactively (`--hooks`/`--no-hooks` flags for scripts). `--brief` additionally wires a `SessionStart` entry running `engram brief` (context injection, see below).
+- **`session_brief` MCP tool / `engram brief`**: one-call context assembly for session start — key decisions, recent failures, active procedures, and pending reflection suggestions as a compact text brief plus structured sections, within the memory token budget. Optional `focus` also returns top search hits for the task at hand. Decisions superseded by a newer one are excluded (current constraints only). Wire it to Claude Code's `SessionStart` hook via `install-hooks --brief` and memory is in context without the agent searching first.
+- **`engram eval`**: retrieval-quality regression harness — seeds a golden engineering corpus into an in-memory DB (never touches the real store) and scores a golden query set (EN + 中文, all four memory types) through the REAL pipeline with the ACTIVE config. Reports per-case rank, MRR, NDCG@5, and primary-hit@3 (`--json` for machine output). Baselines are pinned by unit tests, so ranking changes must move the numbers consciously. The harness already surfaced a known weakness, documented in its tests: on multi-term OR-fallback queries a single-rare-term hit can outrank a lexically stronger match (query-term coverage is the candidate fix for the next ranking iteration).
+- **`engram tune`**: closes the adoption feedback loop automatically — memories served ≥3 times with ≥50% adoption rate get +0.1 importance (severity for failures); served ≥5 times and never adopted get −0.1. Bounded (0.2..0.9), dry-run by default, `--apply` writes via the same path `mark_relevance` uses. Backed by a new per-event `adoptions` table (migration-free standalone table): `query_log.adopted` only counted per-query totals and could not say WHICH memory was adopted.
+- **Decision supersede chain** (migration v7: `decision_memories.superseded_by`): `create_decision` accepts `supersedes` (CLI: `--supersedes`); the replaced decision stays searchable as history but is flagged (`superseded: true`, `superseded_by: <id>`) and score-halved + re-sorted so it cannot outrank its replacement. `architectural_decisions` excludes superseded records by default (`include_superseded: true` for history); re-superseding re-points the chain head. `update_memory` can also patch `superseded_by` directly.
+- **Write-time exact-duplicate guard** (`[retrieval] write_dedup`, default on): `create_*` tools and CLI creates return the existing memory (`status: "duplicate"`) instead of storing a byte-identical copy — agents retry writes, and identical rows were pollution that only `consolidate` would later clean. Byte-exact only (same dedup text consolidation hashes); near-duplicates remain `consolidate --near` territory. Repo-level writers (`session-import` upsert, ingest dedup-by-commit) keep their own idempotency.
+- **Codex CLI transcript support**: `session-import`/`engram hook` now parse both Claude Code and Codex CLI session JSONL (format sniffed per line) — user prompts/assistant conclusions from `message` items, file targets from `apply_patch` `*** Update/Add/Delete File:` markers, error evidence from failed `function_call_output`s. Automatic memory capture is no longer Claude-Code-only.
+
+### Changed
+- `session-import`/`hook` skip Codex-injected `<user_instructions>`/`<environment_context>` blocks, mirroring the Claude wrapper filter.
+- `install-hooks` is idempotent per event (a SessionEnd entry no longer blocks installing a SessionStart entry); `uninstall-hooks` removes both wirings.
+- CLI `USAGE` help now lists all dispatched commands (it previously omitted `get`/`maintain`/`stats`/`backup`/`export`/`import`).
+- `record_adoption` records the memory type alongside the event (feeds `engram tune`).
 
 ## [0.5.0] - 2026-09-08
 

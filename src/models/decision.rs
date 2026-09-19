@@ -14,6 +14,11 @@ pub struct DecisionMemory {
     pub tags: Vec<String>,
     /// Ranking signal used by the reranker (0..=1). Default 0.5.
     pub importance: f32,
+    /// Set when a newer decision replaces this one (the supersede chain):
+    /// id of the replacing decision. Superseded decisions stay searchable as
+    /// history but are downranked and flagged.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -43,6 +48,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             importance: 0.5,
+            superseded_by: None,
         };
         assert_eq!(m.embedding_text(), "pick candle\npure rust offline");
     }

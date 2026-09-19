@@ -16,7 +16,7 @@ use rusqlite::{params, OptionalExtension};
 /// migration runs on a fresh DB — the CREATE statements already encode it).
 /// Bump this whenever a new migration is appended to
 /// [`MemoryRepository::migrations`].
-pub(crate) const CURRENT_SCHEMA_VERSION: i32 = 6;
+pub(crate) const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// DDL for the four FTS5 shadow tables. Shared by `initialize_schema` (fresh
 /// DBs) and the v2 rebuild migration so the two cannot drift.
@@ -86,6 +86,7 @@ impl MemoryRepository {
                 tradeoffs TEXT NOT NULL,
                 related_files TEXT NOT NULL,
                 tags TEXT DEFAULT '[]',
+                superseded_by TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 archived_at INTEGER
@@ -210,6 +211,27 @@ impl MemoryRepository {
                 ON query_log(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_query_log_query
                 ON query_log(project_id, query);",
+        )?;
+
+        // Per-event adoption log: one row each time a memory returned by a
+        // search is actually read (get_memory) or flagged useful
+        // (mark_relevance). query_log.adopted only counts per-query totals —
+        // it cannot say WHICH memory was adopted. This table can, which is
+        // what `engram tune` needs to learn per-memory importance from real
+        // usage. Standalone table like reflection_suggestions: CREATE IF NOT
+        // EXISTS suffices on existing DBs (no user_version bump).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS adoptions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL,
+                memory_id   TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_adoptions_project_time
+                ON adoptions(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_adoptions_memory
+                ON adoptions(project_id, memory_id);",
         )?;
 
         // Reflection proposals: preventive rules distilled from recurring
@@ -670,14 +692,29 @@ impl MemoryRepository {
     /// `CURRENT_SCHEMA_VERSION`; the FTS rebuild only fires when the `tags`
     /// column is actually missing.
     fn migrations() -> &'static [(i32, MigrationFn)] {
-        static REG: [(i32, MigrationFn); 5] = [
+        static REG: [(i32, MigrationFn); 6] = [
             (2, MemoryRepository::migrate_v2_fts_rowid),
             (3, MemoryRepository::migrate_v3_reflection_rearm),
             (4, MemoryRepository::migrate_v4_decision_importance),
             (5, MemoryRepository::migrate_v5_query_log_adoption),
             (6, MemoryRepository::migrate_v6_fts_contentless),
+            (7, MemoryRepository::migrate_v7_decision_supersede),
         ];
         &REG
+    }
+
+    /// v7 — `decision_memories.superseded_by`: the decision supersede chain.
+    /// A decision replaced by a newer one keeps its row (searchable history)
+    /// but is downranked and flagged in retrieval.
+    fn migrate_v7_decision_supersede(&self) -> Result<()> {
+        let conn = self.conn()?;
+        let has_col = conn
+            .prepare("SELECT superseded_by FROM decision_memories LIMIT 0")
+            .is_ok();
+        if !has_col {
+            conn.execute_batch("ALTER TABLE decision_memories ADD COLUMN superseded_by TEXT;")?;
+        }
+        Ok(())
     }
 
     /// v6 — rebuild the FTS shadow tables as contentless tables (no text

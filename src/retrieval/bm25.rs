@@ -73,12 +73,16 @@ impl Searchable for DecisionMemory {
         self.tags.clone()
     }
     fn search_detail(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut detail = serde_json::json!({
             "context": self.context,
             "rationale": self.rationale,
             "tradeoffs": self.tradeoffs,
             "related_files": self.related_files,
-        })
+        });
+        if let Some(sb) = &self.superseded_by {
+            detail["superseded_by"] = serde_json::json!(sb);
+        }
+        detail
     }
 }
 
@@ -436,6 +440,7 @@ mod tests {
             related_files: vec![],
             tags: vec![],
             importance: 0.5,
+            superseded_by: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -541,6 +546,7 @@ mod tests {
             related_files: vec![],
             tags: vec![],
             importance: 0.5,
+            superseded_by: None,
             created_at: 3,
             updated_at: 3,
         };

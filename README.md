@@ -184,7 +184,17 @@ consolidate duplicates and prune the query log.
 recommended wiring. `Stop` (every agent turn) also works: imports are
 **idempotent per session** — re-importing refreshes the existing memory in
 place instead of stacking near-duplicates, so the memory tracks the session
-as it grows.
+as it grows. Transcripts from Codex CLI (`~/.codex/sessions/**/rollout-*.jsonl`)
+are parsed too — the format is sniffed per line.
+
+**Read-side automation (`--brief`)**: `engram install-hooks --brief` additionally
+wires a `SessionStart` entry running `engram brief --project <id>`, so every
+new session begins with the project's current decisions, recent failures, and
+procedures already in context — no searching required:
+
+```bash
+engram install-hooks --brief   # SessionEnd (write) + SessionStart (read) in one go
+```
 
 ### Cursor
 
@@ -255,12 +265,13 @@ All tools require a `project_id` parameter for multi-project isolation. `search_
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
+| `session_brief` | One-call context assembly for session start: key decisions, recent failures, active procedures, pending reflection suggestions (+ optional focused search hits) as a text brief + structured sections, within the memory token budget | `project_id`, `focus` |
 | `search_memory` | Full-text search across all memory types — results carry each memory's full payload (root_cause/fix, rationale/tradeoffs, steps…) | `query`, `limit`, `memory_type`, `tags`, `before` |
 | `get_memory` | Fetch one memory's complete record by id | `memory_type`, `id` |
 | `related_files` | Find entities related to a file via relationship graph | `file`, `project_id` |
 | `timeline` | Get a timeline of memory events for the past N days | `days`, `project_id` |
 | `recent_failures` | List recent failure/incident memories | `limit`, `project_id` |
-| `architectural_decisions` | List architecture decision records | `limit`, `project_id` |
+| `architectural_decisions` | List architecture decision records (current by default — superseded ones only with `include_superseded`) | `limit`, `include_superseded`, `project_id` |
 | `query_stats` | Aggregate past search queries by frequency, avg hit count, and adoption (retrieval feedback) | `days`, `limit`, `project_id` |
 | `mark_relevance` | Feedback on a search result: `useful` (+0.1 importance, counts as adopted) / `irrelevant` (−0.1) — tunes future rankings | `project_id`, `memory_type`, `id`, `feedback` |
 
@@ -269,11 +280,13 @@ All tools require a `project_id` parameter for multi-project isolation. `search_
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `create_episodic` | Record a task, debug session, or feature implementation | `summary`, `content`, `files_touched`, `importance`, `tags` |
-| `create_decision` | Record an architectural or design decision | `title`, `context`, `rationale`, `tradeoffs`, `related_files` |
+| `create_decision` | Record an architectural or design decision; pass `supersedes` when it replaces an earlier one (old record is flagged + downranked, kept as history) | `title`, `context`, `rationale`, `tradeoffs`, `related_files`, `supersedes` |
 | `create_failure` | Record an incident with root cause analysis | `incident`, `root_cause`, `fix`, `prevention`, `severity` |
 | `create_procedural` | Record a workflow or convention | `workflow_name`, `steps`, `related_tools` |
 | `ingest_commits` | Distill git history into one episodic memory per (type, scope) milestone | `repo_path`, `count`, `project_id` |
 | `collect_sources` | Gather structured evidence from a project for bootstrap (no writes) | `repo_path`, `dimensions`, `max_commits`, `project_id` |
+
+> **Write dedup**: the `create_*` tools refuse byte-identical duplicates — they return the existing memory with `status: "duplicate"` instead of writing (toggle with `[retrieval] write_dedup`). Near-duplicate cleanup stays a job for `consolidate_memories`.
 
 ### Lifecycle Tools
 
@@ -311,6 +324,7 @@ default_limit = 10                       # Default result count when a tool omit
 recency_half_life_days = 30              # Recency decay half-life (days) for reranking
 intent_routing = true                    # Intent keywords adjust ranking weights (soft); every memory type is always searched
 graph_expansion = true                   # Append up to 2 graph-adjacent memories (shared files/tools) below the ranked hits
+write_dedup = true                       # create_* returns the existing memory instead of writing a byte-identical copy
 # Ranking-signal weights, normalized to sum 1 at load. Relevance (the BM25 /
 # semantic match) is the dominant signal; the others only break ties.
 weight_relevance = 0.5
@@ -354,7 +368,7 @@ Data is stored in `~/.engram/memory.db` by default.
 └──────────────────────────┬──────────────────────────────────┘
                            │ JSON-RPC
 ┌──────────────────────────▼──────────────────────────────────┐
-│                      MCP Server (23 tools)                   │
+│                      MCP Server (25 tools)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                   MemoryToolProvider trait                    │
 ├─────────────┬─────────────────┬─────────────────────────────┤
@@ -376,7 +390,7 @@ Data is stored in `~/.engram/memory.db` by default.
 - **Project isolation** — all memories scoped by `project_id`, supporting multi-project workflows
 - **BM25 via FTS5** — built into SQLite, no external search engine needed
 - **CJK-aware search** — Chinese/Japanese/Korean queries get character-level segmentation (spaces inserted between CJK runes), and FTS5 reserved words in a query are escaped so terms like `UNIQUE` or `AND` match as text rather than column filters. The intent classifier recognizes Chinese keywords too (e.g. 调试/修复, 架构/决策).
-- **Ranking signals** — `search_memory` reranks BM25 results with weights normalized to sum 1: relevance (the normalized BM25 — or fused semantic — score) dominates; recency (exponential half-life decay against the real clock), per-record `importance`, and a narrow memory-type prior only break ties. Classified intents raise *relevance* (the query matched that domain), never the static priors. The relationship graph contributes second-tier candidates: memories sharing a file/tool entity with the top hits are appended at low rank, marked `graph_neighbor: true`.
+- **Ranking signals** — `search_memory` reranks BM25 results with weights normalized to sum 1: relevance (the normalized BM25 — or fused semantic — score) dominates; recency (exponential half-life decay against the real clock), per-record `importance`, and a narrow memory-type prior only break ties. Classified intents raise *relevance* (the query matched that domain), never the static priors. The relationship graph contributes second-tier candidates: memories sharing a file/tool entity with the top hits are appended at low rank, marked `graph_neighbor: true`. Decisions replaced via a `supersedes` chain are score-halved and flagged `superseded: true` — history stays reachable but never outranks its replacement.
 - **Connection pool + concurrency** — the repository uses an r2d2 pool over WAL-mode SQLite (multi-reader, single-writer via `busy_timeout`); concurrent reads no longer serialize. MCP request handling dispatches to a bounded worker pool (`[mcp] worker_threads`, default 1 = FIFO sequential — safe for stdio clients that pipeline dependent requests; raise only for independent workloads).
 - **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. Vectors are stored as BLOBs in SQLite and scored by brute-force cosine over the active set (no separate vector index), so semantic search suits thousands — not millions — of memories per project. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
 
@@ -402,8 +416,22 @@ engram ingest --project myproj --repo .
 # Fetch one memory's full record by id
 engram get --project myproj --type failure --id <id>
 
-# Distill a Claude Code session transcript into a memory (wire to a Stop/SessionEnd hook)
+# Session-start brief: decisions + recent failures + procedures + suggestions
+engram brief --project myproj                     # plain text (what a SessionStart hook injects)
+engram brief --project myproj --focus "auth"      # also include top search hits for the task
+
+# Retrieval quality: score the golden corpus through the active config
+engram eval                                       # per-case table + MRR/NDCG@5/hit@3
+engram eval --json                                # machine-readable
+
+# Adoption feedback → importance: dry-run proposals, then apply
+engram tune --project myproj --days 30            # evidence-backed ±0.1 proposals
+engram tune --project myproj --apply
+
+# Distill a session transcript into a memory (Claude Code or Codex CLI JSONL;
+# wire to a Stop/SessionEnd hook)
 engram session-import --project myproj --transcript ~/.claude/projects/.../session.jsonl --dry-run
+engram session-import --project myproj --transcript ~/.codex/sessions/.../rollout-*.jsonl --dry-run
 
 # One-shot health pass: dedup + FTS repair + query-log prune + staleness
 # report + orphan-entity preview + knowledge gaps (frequent zero-hit queries)
@@ -499,6 +527,12 @@ Re-running is idempotent — commits already stored as episodic memories are ski
 - [x] Word-level Chinese tokenization (`--features jieba`, auto FTS rebuild on switch)
 - [x] Adoption feedback loop (get_memory tracking + `mark_relevance` tool)
 - [x] Backup / export / import
+- [x] Retrieval eval harness (`engram eval` — golden corpus + MRR/NDCG, pinned regression baselines)
+- [x] Feedback-driven tuning (`engram tune` — adoption evidence → bounded importance adjustments)
+- [x] Session brief (`session_brief` tool + `engram brief`; SessionStart hook wiring via `install-hooks --brief`)
+- [x] Decision supersede chains (`create_decision supersedes=…`)
+- [x] Write-time exact-duplicate guard
+- [x] Codex CLI transcript import (automatic memory capture beyond Claude Code)
 - [ ] Multi-agent memory sharing (auth/scoping design first)
 
 ---

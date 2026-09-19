@@ -123,12 +123,15 @@ pub struct RecentFailuresInput {
 /// architectural_decisions tool input.
 #[derive(Debug, Deserialize)]
 pub struct ArchitecturalDecisionsInput {
-    project_id: String,
+    pub project_id: String,
     #[serde(default)]
     topic: Option<String>,
     /// None → `[retrieval].default_limit` from config.
     #[serde(default)]
     limit: Option<usize>,
+    /// Superseded decisions are history: excluded unless explicitly requested.
+    #[serde(default)]
+    include_superseded: bool,
 }
 
 /// query_stats tool input — retrieval feedback aggregated by query string.
@@ -140,6 +143,15 @@ pub struct QueryStatsInput {
     /// None → `[retrieval].default_limit` from config.
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// session_brief tool input — one-call context assembly for session start.
+#[derive(Debug, Deserialize)]
+pub struct SessionBriefInput {
+    pub project_id: String,
+    /// Optional focus topic: also runs a search and includes the top hits.
+    #[serde(default)]
+    pub focus: Option<String>,
 }
 
 /// reflect tool input — scan a project's active failures for recurring tags and
@@ -190,7 +202,7 @@ fn default_importance() -> f32 {
 }
 
 /// create_decision tool input.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CreateDecisionInput {
     pub project_id: String,
     pub title: String,
@@ -204,6 +216,10 @@ pub struct CreateDecisionInput {
     /// Ranking signal (0..=1, default 0.5).
     #[serde(default)]
     pub importance: Option<f32>,
+    /// Id of the decision this one replaces (supersede chain): the old
+    /// decision stays searchable as history but is flagged and downranked.
+    #[serde(default)]
+    pub supersedes: Option<String>,
 }
 
 /// create_failure tool input.
@@ -357,6 +373,7 @@ pub trait MemoryToolProvider: Send + Sync {
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value>;
     fn recent_failures(&self, input: RecentFailuresInput) -> Result<serde_json::Value>;
     fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value>;
+    fn session_brief(&self, input: SessionBriefInput) -> Result<serde_json::Value>;
     fn architectural_decisions(
         &self,
         input: ArchitecturalDecisionsInput,
@@ -500,7 +517,7 @@ impl DefaultMemoryProvider {
         if has_filters {
             results.retain(|r| {
                 let tags_ok = tags.is_empty() || r.tags.iter().any(|t| tags.contains(t));
-                let before_ok = before.map_or(true, |b| r.created_at < b);
+                let before_ok = before.is_none_or(|b| r.created_at < b);
                 tags_ok && before_ok
             });
         }
@@ -530,6 +547,33 @@ impl DefaultMemoryProvider {
         self.reranker
             .rerank(&mut results, &plan, now_ts, half_life_seconds);
         results.truncate(limit);
+
+        // Supersede chain: a replaced decision stays searchable as history,
+        // but must not outrank the decision that replaced it — halve its
+        // score, flag it, and re-sort (the halving happens after the
+        // reranker's ordering pass, so the order must be re-derived).
+        let mut supersede_adjusted = false;
+        for r in results.iter_mut().filter(|r| r.memory_type == "decision") {
+            let superseded = r
+                .detail
+                .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if superseded {
+                r.relevance_score *= 0.5;
+                supersede_adjusted = true;
+                if let Some(obj) = r.detail.as_object_mut() {
+                    obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+                }
+            }
+        }
+        if supersede_adjusted {
+            results.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         // Graph-based second tier: memories that share an entity (file/tool)
         // with the top hits are contextually related even when their text
@@ -696,6 +740,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             if let Err(e) = repo.record_adoption(
                 &input.project_id,
                 fetched_id,
+                kind.as_str(),
                 chrono::Utc::now().timestamp(),
                 24 * 3600,
             ) {
@@ -804,6 +849,174 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         Ok(serde_json::json!({ "failures": failures }))
     }
 
+    fn session_brief(&self, input: SessionBriefInput) -> Result<serde_json::Value> {
+        let repo = self.lock_repo();
+        let now = chrono::Utc::now().timestamp();
+
+        let decisions: Vec<_> = repo
+            .list_recent_decisions(&input.project_id, 8)?
+            .into_iter()
+            // Superseded decisions are history — the brief carries CURRENT
+            // constraints only.
+            .filter(|d| d.superseded_by.is_none())
+            .take(5)
+            .collect();
+        let failures = repo.list_recent_failures(&input.project_id, 5)?;
+        let procedures = repo.list_top_procedural(&input.project_id, 5)?;
+        let pending = repo.list_pending_suggestions(&input.project_id)?;
+
+        // Optional focused context: run the query through the same pipeline
+        // search_memory uses (intent → BM25 → rerank), capped at 3 hits.
+        let focused = match input.focus.as_deref() {
+            Some(q) if !q.trim().is_empty() => Some(
+                self.search_core(q, &input.project_id, None, &[], None, 3)
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        };
+
+        // ── Text brief: the section order is the priority order; over
+        // budget, lines drop from the END (suggestions first, decisions last).
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "=== Engram Session Brief: {} ===",
+            input.project_id
+        ));
+        if !decisions.is_empty() {
+            lines.push("-- Decisions (constraints to respect) --".into());
+            for d in &decisions {
+                lines.push(format!(
+                    "[decision] {} — {}",
+                    d.title,
+                    first_sentence(&d.rationale)
+                ));
+            }
+        }
+        if !failures.is_empty() {
+            lines.push("-- Recent failures (do not repeat) --".into());
+            for f in &failures {
+                lines.push(format!(
+                    "[failure s{}/5] {} → prevention: {}",
+                    f.severity,
+                    f.incident,
+                    first_sentence(&f.prevention)
+                ));
+            }
+        }
+        if !procedures.is_empty() {
+            lines.push("-- Procedures (how this project works) --".into());
+            for p in &procedures {
+                lines.push(format!(
+                    "[procedure] {}: {}",
+                    p.workflow_name,
+                    p.steps.join(" → ")
+                ));
+            }
+        }
+        if !pending.is_empty() {
+            lines.push(format!(
+                "-- Pending reflection suggestions ({}) awaiting confirmation --",
+                pending.len()
+            ));
+            for s in &pending {
+                lines.push(format!(
+                    "[suggestion x{}] {} — confirm or reject via list_suggestions",
+                    s.occurrence_count, s.suggested_workflow_name
+                ));
+            }
+        }
+        if let Some(hits) = &focused {
+            lines.push(format!(
+                "-- Focused context: {:?} --",
+                input.focus.as_deref().unwrap_or("")
+            ));
+            for r in hits {
+                lines.push(format!(
+                    "[{}] {} (score {:.2})",
+                    r.memory_type,
+                    r.summary,
+                    r.relevance_score.clamp(0.0, 1.0)
+                ));
+            }
+        }
+        lines.push("=== End Brief ===".into());
+
+        let budget = ContextBudget::new(
+            self.config.context.context_window_tokens,
+            self.config.context.memory_budget_percent,
+        );
+        while lines.len() > 2
+            && ContextComposer::estimate_tokens(&lines.join("\n")) > budget.reserved_for_memory
+        {
+            // Drop the lowest-priority line (never the framing header/footer).
+            lines.pop();
+            // Keep section headers from dangling empty.
+            if lines.last().is_some_and(|l| l.starts_with("--")) {
+                lines.pop();
+            }
+        }
+
+        // ── Structured sections: full payloads for agents that want fields.
+        let decisions_out: Vec<_> = decisions
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": d.id, "title": d.title, "rationale": d.rationale,
+                    "importance": d.importance, "tags": d.tags, "created_at": d.created_at,
+                })
+            })
+            .collect();
+        let failures_out: Vec<_> = failures
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id, "incident": f.incident, "root_cause": f.root_cause,
+                    "fix": f.fix, "prevention": f.prevention, "severity": f.severity,
+                    "tags": f.tags, "created_at": f.created_at,
+                })
+            })
+            .collect();
+        let procedures_out: Vec<_> = procedures
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id, "workflow_name": p.workflow_name, "steps": p.steps,
+                    "related_tools": p.related_tools, "importance": p.importance,
+                })
+            })
+            .collect();
+        let suggestions_out: Vec<_> = pending
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id, "workflow_name": s.suggested_workflow_name,
+                    "occurrence_count": s.occurrence_count, "pattern_tag": s.pattern_tag,
+                })
+            })
+            .collect();
+        let focused_out: Option<Vec<_>> = focused.as_ref().map(|hits| {
+            hits.iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id, "memory_type": r.memory_type, "summary": r.summary,
+                        "relevance_score": r.relevance_score.clamp(0.0, 1.0),
+                    })
+                })
+                .collect()
+        });
+
+        Ok(serde_json::json!({
+            "project_id": input.project_id,
+            "brief": lines.join("\n"),
+            "decisions": decisions_out,
+            "failures": failures_out,
+            "procedures": procedures_out,
+            "pending_suggestions": suggestions_out,
+            "focused": focused_out,
+            "generated_at": now,
+        }))
+    }
+
     fn architectural_decisions(
         &self,
         input: ArchitecturalDecisionsInput,
@@ -811,21 +1024,27 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.lock_repo();
         let limit = clamp_limit(input.limit, self.config.retrieval.default_limit);
         let query = input.topic.as_deref().unwrap_or("");
-        let results = if query.is_empty() {
-            repo.list_recent_decisions(&input.project_id, limit)?
+        let mut results = if query.is_empty() {
+            repo.list_recent_decisions(&input.project_id, limit * 2)?
                 .into_iter()
                 .map(|m| ScoredMemory {
                     memory: m,
                     bm25_score: 0.0,
                 })
-                .collect()
+                .collect::<Vec<_>>()
         } else {
-            repo.search_decisions(query, &input.project_id, limit)?
+            repo.search_decisions(query, &input.project_id, limit * 2)?
         };
+        // Superseded decisions are excluded by default (they are history, not
+        // current constraints); over-fetch above keeps the page full.
+        if !input.include_superseded {
+            results.retain(|d| d.memory.superseded_by.is_none());
+        }
+        results.truncate(limit);
         let decisions: Vec<serde_json::Value> = results
             .iter()
             .map(|d| {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "id": d.memory.id,
                     "title": d.memory.title,
                     "context": d.memory.context,
@@ -834,7 +1053,11 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                     "related_files": d.memory.related_files,
                     "tags": d.memory.tags,
                     "created_at": d.memory.created_at,
-                })
+                });
+                if let Some(sb) = &d.memory.superseded_by {
+                    item["superseded_by"] = serde_json::json!(sb);
+                }
+                item
             })
             .collect();
 
@@ -851,6 +1074,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             );
         }
         let repo = self.lock_repo();
+        // Write-time exact-dup guard: an identical active memory is returned,
+        // not re-created (agents retry writes; near-dups stay consolidate's job).
+        if self.config.retrieval.write_dedup {
+            let text = format!("{}\n{}", input.summary, input.content);
+            if let Some(existing) =
+                repo.find_exact_duplicate(MemoryKind::Episodic, &input.project_id, &text)?
+            {
+                return Ok(serde_json::json!({
+                    "id": existing,
+                    "status": "duplicate",
+                    "detail": "identical active memory already exists; nothing written",
+                }));
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -887,12 +1124,29 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn create_decision(&self, input: CreateDecisionInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
+        // Write-time exact-dup guard (see create_episodic).
+        if self.config.retrieval.write_dedup {
+            let text = format!(
+                "{}\n{}\n{}\n{}",
+                input.title, input.context, input.rationale, input.tradeoffs
+            );
+            if let Some(existing) =
+                repo.find_exact_duplicate(MemoryKind::Decision, &input.project_id, &text)?
+            {
+                return Ok(serde_json::json!({
+                    "id": existing,
+                    "status": "duplicate",
+                    "detail": "identical active decision already exists; nothing written \
+                               (pass `supersedes` when intentionally replacing a decision)",
+                }));
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
         let memory = DecisionMemory {
             id: id.clone(),
-            project_id: input.project_id,
+            project_id: input.project_id.clone(),
             title: input.title,
             context: input.context,
             rationale: input.rationale,
@@ -900,6 +1154,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             related_files: input.related_files,
             tags: input.tags,
             importance: input.importance.unwrap_or(0.5).clamp(0.0, 1.0),
+            superseded_by: None,
             created_at: now,
             updated_at: now,
         };
@@ -914,9 +1169,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             &memory.embedding_text(),
         );
 
+        // Supersede chain: point the replaced decision at this one (the old
+        // record stays searchable as history, flagged + downranked).
+        let superseded = match &input.supersedes {
+            Some(old_id) => {
+                repo.supersede_decision(&input.project_id, old_id, &id, now)?;
+                serde_json::json!(old_id)
+            }
+            None => serde_json::Value::Null,
+        };
+
         Ok(serde_json::json!({
             "id": id,
             "status": "created",
+            "superseded": superseded,
             "created_at": now,
         }))
     }
@@ -926,6 +1192,22 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             anyhow::bail!("severity must be between 1 and 5, got {}", input.severity);
         }
         let repo = self.lock_repo();
+        // Write-time exact-dup guard (see create_episodic).
+        if self.config.retrieval.write_dedup {
+            let text = format!(
+                "{}\n{}\n{}\n{}",
+                input.incident, input.root_cause, input.fix, input.prevention
+            );
+            if let Some(existing) =
+                repo.find_exact_duplicate(MemoryKind::Failure, &input.project_id, &text)?
+            {
+                return Ok(serde_json::json!({
+                    "id": existing,
+                    "status": "duplicate",
+                    "detail": "identical active failure already exists; nothing written",
+                }));
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -962,6 +1244,24 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn create_procedural(&self, input: CreateProceduralInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
+        // Write-time exact-dup guard (see create_episodic). The steps column
+        // stores the JSON array string, so the candidate text must match it.
+        if self.config.retrieval.write_dedup {
+            let text = format!(
+                "{}\n{}",
+                input.workflow_name,
+                serde_json::to_string(&input.steps)?
+            );
+            if let Some(existing) =
+                repo.find_exact_duplicate(MemoryKind::Procedural, &input.project_id, &text)?
+            {
+                return Ok(serde_json::json!({
+                    "id": existing,
+                    "status": "duplicate",
+                    "detail": "identical active procedure already exists; nothing written",
+                }));
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -1288,7 +1588,8 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         // Explicit "useful" is also an adoption event for retrieval feedback.
         if step > 0.0 {
-            let _ = repo.record_adoption(&input.project_id, &input.id, now, 24 * 3600);
+            let _ =
+                repo.record_adoption(&input.project_id, &input.id, kind.as_str(), now, 24 * 3600);
         }
 
         Ok(serde_json::json!({
@@ -1396,6 +1697,20 @@ where
     Ok(serde_json::from_value(serde_json::Value::Object(obj))?)
 }
 
+/// First sentence (or the first ~200 chars) of a longer text — brief entries
+/// stay one line each; full payloads live in the structured sections.
+fn first_sentence(text: &str) -> String {
+    let t = text.trim();
+    if let Some(i) = t.find(". ").filter(|i| *i <= 200) {
+        return t[..i + 1].trim_end().to_string();
+    }
+    if t.chars().count() <= 200 {
+        return t.to_string();
+    }
+    let cut = t.char_indices().nth(197).map_or(200, |(i, _)| i);
+    format!("{}…", &t[..cut])
+}
+
 /// Resolve an optional memory_type into the kinds to operate on.
 fn resolve_kinds(memory_type: &Option<String>) -> Result<Vec<MemoryKind>> {
     match memory_type {
@@ -1461,6 +1776,7 @@ impl McpServer {
                 timeline, TimelineInput, {"events": []};
                 recent_failures, RecentFailuresInput, {"failures": []};
                 query_stats, QueryStatsInput, {"queries": []};
+                session_brief, SessionBriefInput, {"brief": "", "decisions": [], "failures": [], "procedures": [], "pending_suggestions": []};
                 architectural_decisions, ArchitecturalDecisionsInput, {"decisions": []};
                 create_episodic, CreateEpisodicInput, {"id": "", "status": "noop"};
                 create_decision, CreateDecisionInput, {"id": "", "status": "noop"};
@@ -1588,14 +1904,27 @@ impl McpServer {
                 }),
             },
             ToolDefinition {
+                name: "session_brief".into(),
+                description: "One-call context assembly for session start: the project's key decisions, recent failures, active procedures, and pending reflection suggestions — rendered as a compact text brief plus structured sections, within the memory token budget. Call this at the start of a session instead of guessing which searches to run; pass `focus` to also include top search hits for the task at hand.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "focus": { "type": "string", "description": "Optional task/topic: also returns the top search hits for it" },
+                    },
+                    "required": ["project_id"],
+                }),
+            },
+            ToolDefinition {
                 name: "architectural_decisions".into(),
-                description: "Get architectural decision memories for a project".into(),
+                description: "Get architectural decision memories for a project. Current decisions by default — superseded (replaced) decisions only appear with include_superseded=true, marked with superseded_by.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "topic": { "type": "string", "description": "Filter by topic keyword" },
                         "limit": { "type": "integer", "description": "Max results", "default": 10 },
+                        "include_superseded": { "type": "boolean", "description": "Also include decisions replaced by a newer one (default false)", "default": false },
                     },
                     "required": ["project_id"],
                 }),
@@ -1621,7 +1950,7 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "create_decision".into(),
-                description: "Record an architectural or design decision with rationale and tradeoffs".into(),
+                description: "Record an architectural or design decision with rationale and tradeoffs. When this decision REPLACES an earlier one, pass that decision's id as `supersedes` — the old record stays searchable as history but is flagged and downranked.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1632,6 +1961,8 @@ impl McpServer {
                         "tradeoffs": { "type": "string", "description": "Tradeoffs considered" },
                         "related_files": { "type": "array", "items": { "type": "string" }, "description": "Related files" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorization" },
+                        "importance": { "type": "number", "description": "Ranking signal 0-1 (default 0.5)" },
+                        "supersedes": { "type": "string", "description": "Id of the decision this one replaces (starts a supersede chain)" },
                     },
                     "required": ["project_id", "title", "context", "rationale", "tradeoffs"],
                 }),
@@ -2044,6 +2375,9 @@ impl McpServer {
                     ),
                     "query_stats" => {
                         dispatch_tool!(arguments, QueryStatsInput, self.provider, query_stats)
+                    }
+                    "session_brief" => {
+                        dispatch_tool!(arguments, SessionBriefInput, self.provider, session_brief)
                     }
                     "architectural_decisions" => dispatch_tool!(
                         arguments,

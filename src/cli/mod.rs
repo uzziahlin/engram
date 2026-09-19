@@ -5,9 +5,49 @@ use anyhow::Result;
 /// Usage text for `engram help`/`--help`/`-h`. (No-argument invocation starts
 /// the MCP server — see `main.rs` — so this is reached only via an explicit
 /// help flag or an unknown command.)
-const USAGE: &str = "Usage: engram <command> [options]\n\nCommands:\n  search            Search memories\n  create-episodic   Create episodic memory\n  create-decision   Create decision memory\n  create-failure    Create failure memory\n  create-procedural Create procedural memory\n  ingest            Ingest git commits\n  collect           Collect bootstrap evidence from a project\n  recent-failures   List recent failures\n  decisions         List architectural decisions\n  timeline          Show project timeline\n  queries           Show popular search queries (retrieval feedback)\n  forget            Archive (soft-delete) a memory by id\n  restore           Un-archive a memory by id\n  update            Patch fields of a memory (--set key=value)\n  forget-batch      Archive memories by --tag/--before (dry-run; --apply to commit)\n  list-archived     List archived memories\n  gc                Garbage-collect archived memories + reclaim WAL space (dry-run; --apply)\n  consolidate       Find/merge duplicate memories (--near, --apply)\n  reflect           Propose preventive rules from recurring failures (dry-run; --apply)\n  suggestions       List pending reflection proposals awaiting confirmation\n  confirm-suggestion Promote a pending proposal into a searchable procedural memory\n  reject-suggestion Discard a pending proposal without creating a procedural memory\n  reindex           Backfill embeddings for existing memories (semantic build)\n  init              Initialize database\n  session-import    Distill a Claude Code session transcript into a memory
-  hook              Claude Code hook entry point (reads hook JSON on stdin; auto session-import)
-  init-guide        Generate ENGRAM.md agent guide; optionally @import into CLAUDE.md\n\nRun 'engram' with no arguments to start the MCP server (stdio).";
+const USAGE: &str = "Usage: engram <command> [options]\n\
+\n\
+Commands:\n\
+  search            Search memories (full MCP pipeline)\n\
+  get               Fetch one memory's full record by id\n\
+  create-episodic   Create episodic memory\n\
+  create-decision   Create decision memory\n\
+  create-failure    Create failure memory\n\
+  create-procedural Create procedural memory\n\
+  ingest            Ingest git commits\n\
+  collect           Collect bootstrap evidence from a project\n\
+  recent-failures   List recent failures\n\
+  decisions         List architectural decisions\n\
+  timeline          Show project timeline\n\
+  queries           Show popular search queries (retrieval feedback)\n\
+  brief             Assemble a session-start brief (decisions, failures, procedures)\n\
+  eval              Score retrieval quality on a golden corpus (in-memory; MRR/NDCG)\n\
+  tune              Propose importance updates from adoption feedback (dry-run; --apply)\n\
+  forget            Archive (soft-delete) a memory by id\n\
+  restore           Un-archive a memory by id\n\
+  update            Patch fields of a memory (--set key=value)\n\
+  forget-batch      Archive memories by --tag/--before (dry-run; --apply to commit)\n\
+  list-archived     List archived memories\n\
+  gc                Garbage-collect archived memories + reclaim WAL space (dry-run; --apply)\n\
+  consolidate       Find/merge duplicate memories (--near, --apply)\n\
+  maintain          One-shot health pass (dedup, FTS repair, prune, gaps)\n\
+  stats             Store observability: counts, feedback, adoption rates\n\
+  backup            Hot-backup the database (safe while the server runs)\n\
+  export            Export memories as JSON (idempotent by id)\n\
+  import            Import memories from a JSON export\n\
+  reflect           Propose preventive rules from recurring failures (dry-run; --apply)\n\
+  suggestions       List pending reflection proposals awaiting confirmation\n\
+  confirm-suggestion Promote a pending proposal into a searchable procedural memory\n\
+  reject-suggestion Discard a pending proposal without creating a procedural memory\n\
+  reindex           Backfill embeddings for existing memories (semantic build)\n\
+  init              Initialize database\n\
+  session-import    Distill a session transcript (Claude Code or Codex JSONL) into a memory\n\
+  hook              Agent hook entry point (reads hook JSON on stdin; auto session-import)\n\
+  install-hooks     Wire `engram hook` into Claude Code settings (SessionEnd; merge + backup + idempotent)\n\
+  uninstall-hooks   Remove engram hook entries from Claude Code settings\n\
+  init-guide        Generate ENGRAM.md agent guide; optionally @import into CLAUDE.md\n\
+\n\
+Run 'engram' with no arguments to start the MCP server (stdio).";
 
 /// Run the CLI with the given arguments.
 pub fn run(args: &[String]) -> Result<()> {
@@ -28,6 +68,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         "search" => commands::search(cmd_args),
         "get" => commands::get(cmd_args),
+        "eval" => commands::eval(cmd_args),
         "create-episodic" => commands::create_episodic(cmd_args),
         "create-decision" => commands::create_decision(cmd_args),
         "create-failure" => commands::create_failure(cmd_args),
@@ -38,6 +79,8 @@ pub fn run(args: &[String]) -> Result<()> {
         "decisions" => commands::decisions(cmd_args),
         "timeline" => commands::timeline(cmd_args),
         "queries" => commands::queries(cmd_args),
+        "tune" => commands::tune(cmd_args),
+        "brief" => commands::brief(cmd_args),
         "forget" => commands::forget(cmd_args),
         "restore" => commands::restore(cmd_args),
         "update" => commands::update(cmd_args),
@@ -57,6 +100,8 @@ pub fn run(args: &[String]) -> Result<()> {
         "import" => commands::import(cmd_args),
         "session-import" => commands::session_import(cmd_args),
         "hook" => commands::hook(cmd_args),
+        "install-hooks" => commands::install_hooks(cmd_args),
+        "uninstall-hooks" => commands::uninstall_hooks(cmd_args),
         "init" => commands::init(cmd_args),
         "init-guide" => commands::init_guide(cmd_args),
         _ => anyhow::bail!("Unknown command: {command}\nRun 'engram help' for usage."),

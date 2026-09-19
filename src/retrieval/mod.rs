@@ -1,10 +1,12 @@
 pub mod bm25;
 #[cfg(feature = "semantic")]
 pub mod embedding;
+pub mod eval;
 pub mod fusion;
 pub mod intent_classifier;
 pub mod planner;
 pub mod reranker;
+pub mod tuning;
 pub mod vector;
 
 pub use bm25::BM25Retriever;

@@ -160,6 +160,11 @@ pub struct RetrievalConfig {
     /// tool) with the top search hits are appended as low-rank context.
     #[serde(default = "RetrievalConfig::default_graph_expansion")]
     pub graph_expansion: bool,
+    /// Write-time exact-duplicate guard: create_* returns the existing
+    /// memory instead of storing a byte-identical copy (same normalized
+    /// dedup text as consolidation uses). Off restores unconditional writes.
+    #[serde(default = "RetrievalConfig::default_write_dedup")]
+    pub write_dedup: bool,
     /// Global ranking-signal weights. Defaults reproduce the pre-config
     /// hard-coded values, so an absent `[retrieval]` section is a no-op.
     /// `weight_relevance` scales the BM25 score; the other three are the base
@@ -181,6 +186,7 @@ impl Default for RetrievalConfig {
             recency_half_life_days: Self::default_recency_half_life_days(),
             intent_routing: Self::default_intent_routing(),
             graph_expansion: Self::default_graph_expansion(),
+            write_dedup: Self::default_write_dedup(),
             weight_relevance: Self::default_weight_relevance(),
             weight_recency: Self::default_weight_recency(),
             weight_importance: Self::default_weight_importance(),
@@ -200,6 +206,9 @@ impl RetrievalConfig {
         true
     }
     fn default_graph_expansion() -> bool {
+        true
+    }
+    fn default_write_dedup() -> bool {
         true
     }
     // Defaults sum to 1.0: relevance is the dominant signal (the query terms

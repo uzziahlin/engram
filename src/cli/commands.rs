@@ -227,8 +227,320 @@ pub fn init_guide(args: &[String]) -> Result<()> {
         }
     }
 
+    // 4. Offer the SessionEnd hook (automatic memory capture) — the same
+    // one-command wiring `engram install-hooks` provides.
+    let do_hooks = if args.iter().any(|a| a == "--hooks") {
+        true
+    } else if args.iter().any(|a| a == "--no-hooks") {
+        false
+    } else if io::stdin().is_terminal() {
+        prompt_yes_no("Install the SessionEnd hook (automatic memory capture)?")?
+    } else {
+        println!(
+            "Not a terminal; skipping hook install. Run `engram install-hooks --project {project_id}` to enable automatic memory capture."
+        );
+        false
+    };
+    if do_hooks {
+        let settings = dir.join(".claude").join("settings.json");
+        match install_hooks_impl(&settings, &project_id, false)? {
+            "installed" => println!("Installed SessionEnd hook in {}", settings.display()),
+            "already" => println!("SessionEnd hook already present in {}", settings.display()),
+            _ => unreachable!(),
+        }
+    }
+
     println!("Done. Ensure engram is registered (claude mcp add) and restart your editor for the guide to take effect.");
     Ok(())
+}
+
+/// ─── Claude Code hook installation ─────────────────────────────────────
+///
+/// One-command wiring for automatic memory capture: instead of hand-editing
+/// `.claude/settings.json`, `engram install-hooks` merges a `SessionEnd`
+/// entry (invoking `engram hook`) into the existing settings — preserving
+/// any other hooks, backing up the file first, and skipping when engram is
+/// already wired (idempotent).
+/// Marker identifying engram's own hook entries among all others. The brief
+/// command is a separate marker so each event installs/uninstalls cleanly.
+const HOOK_COMMAND_MARKER: &str = "engram hook";
+const BRIEF_COMMAND_MARKER: &str = "engram brief";
+
+/// Whether a hook command string belongs to engram (either wiring).
+fn is_engram_command(cmd: &str) -> bool {
+    cmd.contains(HOOK_COMMAND_MARKER) || cmd.contains(BRIEF_COMMAND_MARKER)
+}
+
+/// Install one hook entry (command string) under `event` in a Claude Code
+/// settings file, preserving other entries. Returns "installed", "already",
+/// or "dry-run". Idempotent per event: a second engram command under the
+/// same event is skipped.
+fn install_hook_entry(
+    settings_path: &Path,
+    event: &str,
+    command: &str,
+    dry_run: bool,
+) -> Result<&'static str> {
+    let mut settings = read_settings_object(settings_path)?;
+
+    if settings
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .is_some_and(|_| settings_has_engram_hook_for_event(&settings, event))
+    {
+        return Ok("already");
+    }
+
+    let entry = serde_json::json!({
+        "hooks": [{ "type": "command", "command": command }]
+    });
+    let obj = settings
+        .as_object_mut()
+        .context("settings must be an object")?;
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let hook_events = hooks
+        .as_object_mut()
+        .context("`hooks` in settings.json must be an object")?;
+    let list = hook_events
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    list.as_array_mut()
+        .with_context(|| format!("`hooks.{event}` in settings.json must be an array"))?
+        .push(entry);
+
+    if dry_run {
+        return Ok("dry-run");
+    }
+    backup_then_write(settings_path, &settings)?;
+    Ok("installed")
+}
+
+/// Install the SessionEnd hook (automatic memory capture via `engram hook`).
+/// Returns "installed", "already", or "dry-run".
+fn install_hooks_impl(
+    settings_path: &Path,
+    project_id: &str,
+    dry_run: bool,
+) -> Result<&'static str> {
+    install_hook_entry(
+        settings_path,
+        "SessionEnd",
+        &format!("{HOOK_COMMAND_MARKER} --project {project_id}"),
+        dry_run,
+    )
+}
+
+/// Install the SessionStart hook (context injection: `engram brief` prints
+/// the session brief, which Claude Code adds to the session context).
+/// Returns "installed", "already", or "dry-run".
+fn install_brief_hook_impl(
+    settings_path: &Path,
+    project_id: &str,
+    dry_run: bool,
+) -> Result<&'static str> {
+    install_hook_entry(
+        settings_path,
+        "SessionStart",
+        &format!("{BRIEF_COMMAND_MARKER} --project {project_id}"),
+        dry_run,
+    )
+}
+
+/// Whether `event` already carries any engram hook command.
+fn settings_has_engram_hook_for_event(settings: &serde_json::Value, event: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .and_then(|events| events.get(event))
+        .and_then(|groups| groups.as_array())
+        .is_some_and(|gs| {
+            gs.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|entries| {
+                        entries.iter().any(|e| {
+                            e.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(is_engram_command)
+                        })
+                    })
+            })
+        })
+}
+
+/// Remove every engram hook entry (any event) from a settings file.
+/// Returns how many hook commands were removed.
+fn uninstall_hooks_impl(settings_path: &Path) -> Result<usize> {
+    if !settings_path.exists() {
+        return Ok(0);
+    }
+    let mut settings = read_settings_object(settings_path)?;
+    let mut removed = 0usize;
+
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, groups) in hooks.iter_mut() {
+            let Some(groups) = groups.as_array_mut() else {
+                continue;
+            };
+            for group in groups.iter_mut() {
+                if let Some(entries) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    let before = entries.len();
+                    entries.retain(|e| {
+                        !e.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_engram_command)
+                    });
+                    removed += before - entries.len();
+                }
+            }
+            // Drop groups that no longer carry any hook command.
+            groups.retain(|g| {
+                g.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|a| !a.is_empty())
+            });
+        }
+        // Drop events with no remaining groups.
+        hooks.retain(|_, groups| groups.as_array().is_some_and(|a| !a.is_empty()));
+        if settings
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .is_some_and(|o| o.is_empty())
+        {
+            settings.as_object_mut().unwrap().remove("hooks");
+        }
+    }
+
+    if removed > 0 {
+        backup_then_write(settings_path, &settings)?;
+    }
+    Ok(removed)
+}
+
+/// Read a settings file as a JSON object; a missing file is an empty object.
+/// A malformed file is a hard error — never clobber user config we can't
+/// parse.
+fn read_settings_object(settings_path: &Path) -> Result<serde_json::Value> {
+    if !settings_path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let text = std::fs::read_to_string(settings_path)
+        .with_context(|| format!("read {}", settings_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} is not valid JSON — fix or remove it manually, then re-run \
+             (engram will not overwrite a settings file it cannot parse)",
+            settings_path.display()
+        )
+    })?;
+    if !value.is_object() {
+        anyhow::bail!(
+            "{} must contain a JSON object at the top level",
+            settings_path.display()
+        );
+    }
+    Ok(value)
+}
+
+/// Back up the current file (if any), then write the new settings pretty-
+/// printed with a trailing newline.
+fn backup_then_write(settings_path: &Path, settings: &serde_json::Value) -> Result<()> {
+    if settings_path.exists() {
+        let backup = settings_path.with_extension("json.bak");
+        std::fs::copy(settings_path, &backup).with_context(|| {
+            format!("backup {} -> {}", settings_path.display(), backup.display())
+        })?;
+    }
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = serde_json::to_string_pretty(settings)?;
+    text.push('\n');
+    std::fs::write(settings_path, text)
+        .with_context(|| format!("write {}", settings_path.display()))?;
+    Ok(())
+}
+
+/// `engram install-hooks [--global] [--dir <path>] [--project <id>] [--brief]
+/// [--dry-run]` — SessionEnd memory capture; `--brief` additionally wires
+/// SessionStart to `engram brief` (context injection at session start).
+pub fn install_hooks(args: &[String]) -> Result<()> {
+    let global = args.iter().any(|a| a == "--global");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let with_brief = args.iter().any(|a| a == "--brief");
+
+    let (settings_path, project_id) = hooks_target(args, global)?;
+    let status = install_hooks_impl(&settings_path, &project_id, dry_run)?;
+    let brief_status = if with_brief {
+        Some(install_brief_hook_impl(
+            &settings_path,
+            &project_id,
+            dry_run,
+        )?)
+    } else {
+        None
+    };
+    print_json(&serde_json::json!({
+        "settings": settings_path.to_string_lossy(),
+        "status": status,
+        "command": format!("{HOOK_COMMAND_MARKER} --project {project_id}"),
+        "event": "SessionEnd",
+        "brief": if with_brief {
+            serde_json::json!({
+                "status": brief_status,
+                "command": format!("{BRIEF_COMMAND_MARKER} --project {project_id}"),
+                "event": "SessionStart",
+            })
+        } else {
+            serde_json::Value::Null
+        },
+    }));
+    Ok(())
+}
+
+/// `engram uninstall-hooks [--global] [--dir <path>]`
+pub fn uninstall_hooks(args: &[String]) -> Result<()> {
+    let global = args.iter().any(|a| a == "--global");
+    let (settings_path, _project_id) = hooks_target(args, global)?;
+    let removed = uninstall_hooks_impl(&settings_path)?;
+    print_json(&serde_json::json!({
+        "settings": settings_path.to_string_lossy(),
+        "removed": removed,
+    }));
+    Ok(())
+}
+
+/// Resolve the settings file path (and the project id for install).
+fn hooks_target(args: &[String], global: bool) -> Result<(PathBuf, String)> {
+    let project_id = match optional_str(args, "project") {
+        Some(p) => p,
+        None => {
+            let dir = optional_str(args, "dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let abs = std::fs::canonicalize(&dir)
+                .with_context(|| format!("failed to resolve {}", dir.display()))?;
+            abs.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .context("could not derive project id from directory; pass --project")?
+        }
+    };
+    let settings_path = if global {
+        dirs::home_dir()
+            .context("could not determine home directory for --global")?
+            .join(".claude")
+            .join("settings.json")
+    } else {
+        let dir = optional_str(args, "dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        dir.join(".claude").join("settings.json")
+    };
+    Ok((settings_path, project_id))
 }
 
 pub fn search(args: &[String]) -> Result<()> {
@@ -295,6 +607,45 @@ pub fn search(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `engram brief --project <id> [--focus <query>] [--json]` — print the
+/// session-start brief: key decisions, recent failures, active procedures,
+/// pending reflection suggestions (and, with --focus, top search hits).
+/// Default output is the plain text brief (what a SessionStart hook should
+/// inject); --json returns the structured sections.
+pub fn brief(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let focus = optional_str(args, "focus");
+    let as_json = args.iter().any(|a| a == "--json");
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+    use crate::mcp::server::MemoryToolProvider as _;
+    let value =
+        provider.session_brief(crate::mcp::server::SessionBriefInput { project_id, focus })?;
+    if as_json {
+        print_json(&value);
+    } else if let Some(text) = value["brief"].as_str() {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// Write-time exact-dup guard shared by the CLI creates (mirrors the MCP
+/// create_* tools): returns the existing identical memory's id, if any.
+fn duplicate_guard(
+    repo: &MemoryRepository,
+    config: &Config,
+    kind: crate::storage::MemoryKind,
+    project_id: &str,
+    text: &str,
+) -> Result<Option<String>> {
+    if !config.retrieval.write_dedup {
+        return Ok(None);
+    }
+    repo.find_exact_duplicate(kind, project_id, text)
+}
+
 pub fn create_episodic(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let session_id = optional_str(args, "session").unwrap_or_else(|| "cli".into());
@@ -307,6 +658,17 @@ pub fn create_episodic(args: &[String]) -> Result<()> {
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
+
+    if let Some(existing) = duplicate_guard(
+        &repo,
+        &config,
+        crate::storage::MemoryKind::Episodic,
+        &project_id,
+        &format!("{summary}\n{content}"),
+    )? {
+        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
+        return Ok(());
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
@@ -339,9 +701,21 @@ pub fn create_decision(args: &[String]) -> Result<()> {
     let tradeoffs = optional_str(args, "tradeoffs").unwrap_or_default();
     let files = comma_list(args, "files");
     let tags = repeated_args(args, "tag");
+    let supersedes = optional_str(args, "supersedes");
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
+
+    if let Some(existing) = duplicate_guard(
+        &repo,
+        &config,
+        crate::storage::MemoryKind::Decision,
+        &project_id,
+        &format!("{title}\n{context}\n{rationale}\n{tradeoffs}"),
+    )? {
+        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
+        return Ok(());
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
@@ -355,7 +729,7 @@ pub fn create_decision(args: &[String]) -> Result<()> {
     };
     let memory = DecisionMemory {
         id: id.clone(),
-        project_id,
+        project_id: project_id.clone(),
         title,
         context,
         rationale,
@@ -363,13 +737,26 @@ pub fn create_decision(args: &[String]) -> Result<()> {
         related_files: files,
         tags,
         importance,
+        superseded_by: None,
         created_at: now,
         updated_at: now,
     };
 
     repo.create_decision(&memory)?;
 
-    print_json(&serde_json::json!({"id": id, "status": "created", "created_at": now}));
+    // Supersede chain: point the replaced decision at this one.
+    let mut superseded = serde_json::Value::Null;
+    if let Some(old_id) = &supersedes {
+        repo.supersede_decision(&project_id, old_id, &id, now)?;
+        superseded = serde_json::json!(old_id);
+    }
+
+    print_json(&serde_json::json!({
+        "id": id,
+        "status": "created",
+        "superseded": superseded,
+        "created_at": now,
+    }));
     Ok(())
 }
 
@@ -390,6 +777,17 @@ pub fn create_failure(args: &[String]) -> Result<()> {
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
+
+    if let Some(existing) = duplicate_guard(
+        &repo,
+        &config,
+        crate::storage::MemoryKind::Failure,
+        &project_id,
+        &format!("{incident}\n{root_cause}\n{fix}\n{prevention}"),
+    )? {
+        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
+        return Ok(());
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
@@ -425,6 +823,19 @@ pub fn create_procedural(args: &[String]) -> Result<()> {
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
+
+    // Steps are stored as their JSON array string — the guard must compare
+    // against the same serialization.
+    if let Some(existing) = duplicate_guard(
+        &repo,
+        &config,
+        crate::storage::MemoryKind::Procedural,
+        &project_id,
+        &format!("{workflow_name}\n{}", serde_json::to_string(&steps)?),
+    )? {
+        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
+        return Ok(());
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ts();
@@ -569,31 +980,42 @@ pub fn decisions(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let topic = optional_str(args, "topic");
     let limit = (optional_num(args, "limit").unwrap_or(5.0) as usize).clamp(1, 1000);
+    // Current decisions by default — superseded (replaced) ones only with
+    // --all, mirroring the MCP architectural_decisions tool.
+    let include_superseded = args.iter().any(|a| a == "--all");
 
     let config = load_config()?;
     let repo = open_repo(&config)?;
 
     let query = topic.as_deref().unwrap_or("");
-    let results = if query.is_empty() {
-        repo.list_recent_decisions(&project_id, limit)?
+    let mut results = if query.is_empty() {
+        repo.list_recent_decisions(&project_id, limit * 2)?
     } else {
-        repo.search_decisions(query, &project_id, limit)?
+        repo.search_decisions(query, &project_id, limit * 2)?
             .into_iter()
             .map(|s| s.memory)
             .collect()
     };
+    if !include_superseded {
+        results.retain(|d| d.superseded_by.is_none());
+    }
+    results.truncate(limit);
 
     let decisions: Vec<serde_json::Value> = results
         .iter()
         .map(|d| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "id": d.id,
                 "title": d.title,
                 "context": d.context,
                 "rationale": d.rationale,
                 "tradeoffs": d.tradeoffs,
                 "created_at": d.created_at,
-            })
+            });
+            if let Some(sb) = &d.superseded_by {
+                item["superseded_by"] = serde_json::json!(sb);
+            }
+            item
         })
         .collect();
 
@@ -1269,6 +1691,121 @@ pub fn stats(args: &[String]) -> Result<()> {
     print_json(&snapshot);
     Ok(())
 }
+/// `engram eval [--json]` — retrieval-quality regression harness. Seeds the
+/// golden corpus into an IN-MEMORY database (the user's store is never
+/// touched) and scores the golden query set through the full search pipeline
+/// using the ACTIVE config — so it also measures what custom `[retrieval]`
+/// weights do to ranking quality.
+pub fn eval(args: &[String]) -> Result<()> {
+    let as_json = args.iter().any(|a| a == "--json");
+    let config = load_config()?;
+    let provider = crate::retrieval::eval::harness(config)?;
+    let report = crate::retrieval::eval::run_eval(&provider)?;
+
+    if as_json {
+        print_json(&serde_json::to_value(report_summary(&report))?);
+        return Ok(());
+    }
+
+    println!(
+        "Golden retrieval eval — {} cases, top-{} window",
+        report.case_count,
+        crate::retrieval::eval::EVAL_K
+    );
+    println!(
+        "{:<26} {:<6} {:<38} RANK   RR     NDCG",
+        "CASE", "HIT", "QUERY"
+    );
+    for c in &report.cases {
+        println!(
+            "{:<26} {:<6} {:<38} {:<6} {:.2}   {:.2}",
+            c.case_id,
+            if c.primary_rank.is_some() {
+                "yes"
+            } else {
+                "MISS"
+            },
+            c.query,
+            c.primary_rank
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".into()),
+            c.reciprocal_rank,
+            c.ndcg,
+        );
+    }
+    println!(
+        "\nMRR {:.3} | NDCG@{} {:.3} | primary hit@3 {:.0}%",
+        report.mrr,
+        crate::retrieval::eval::EVAL_K,
+        report.ndcg,
+        report.primary_hit_at_3 * 100.0
+    );
+    println!(
+        "Compare against the committed baseline (see retrieval::eval tests) \
+         before/after ranking changes."
+    );
+    Ok(())
+}
+
+/// JSON shape for `engram eval --json` (kept separate so the human table and
+/// the machine output can evolve independently).
+fn report_summary(report: &crate::retrieval::eval::EvalReport) -> serde_json::Value {
+    serde_json::json!({
+        "case_count": report.case_count,
+        "mrr": (report.mrr * 1000.0).round() / 1000.0,
+        "ndcg_at_5": (report.ndcg * 1000.0).round() / 1000.0,
+        "primary_hit_at_3": (report.primary_hit_at_3 * 1000.0).round() / 1000.0,
+        "cases": report.cases.iter().map(|c| serde_json::json!({
+            "case_id": c.case_id,
+            "query": c.query,
+            "expected": c.expected,
+            "ranked": c.ranked,
+            "primary_rank": c.primary_rank,
+            "reciprocal_rank": (c.reciprocal_rank * 1000.0).round() / 1000.0,
+            "ndcg": (c.ndcg * 1000.0).round() / 1000.0,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// `engram tune --project <id> [--days N] [--apply]` — close the adoption
+/// feedback loop automatically: memories that keep getting adopted move up in
+/// importance, memories that keep getting served and ignored move down.
+/// Dry-run by default (prints the evidence-backed proposals); --apply writes
+/// bounded ±0.1 adjustments (severity for failures) via the same path
+/// `mark_relevance` uses.
+pub fn tune(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let days = (optional_num(args, "days").unwrap_or(30.0) as i64).clamp(1, 3650);
+    let apply = args.iter().any(|a| a == "--apply");
+
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let now = now_ts();
+
+    let mut report = crate::retrieval::tuning::compute_proposals(&repo, &project_id, days, now)?;
+    let applied = if apply {
+        crate::retrieval::tuning::apply_proposals(&repo, &project_id, &report.proposals, now)?
+    } else {
+        0
+    };
+    report.applied = apply;
+
+    print_json(&serde_json::json!({
+        "applied": apply,
+        "applied_count": applied,
+        "window_days": days,
+        "window_queries": report.window_queries,
+        "proposal_count": report.proposals.len(),
+        "proposals": report.proposals,
+        "hint": if !apply && !report.proposals.is_empty() {
+            "dry-run: re-run with --apply to write these adjustments"
+        } else {
+            ""
+        },
+    }));
+    Ok(())
+}
+
 /// `engram maintain [--project <id>] [--repo <path>] [--apply]` — one-shot
 /// memory health pass for hook/cron: consolidate duplicates, repair FTS,
 /// prune query_log, staleness report (--repo), gc/orphan-entity preview, and
@@ -1438,9 +1975,10 @@ fn report_stale_memories(
 }
 
 /// `engram session-import --project <id> --transcript <path> [--session <sid>]
-/// [--dry-run]` — distill a Claude Code session transcript (JSONL) into one
-/// episodic memory. Meant to be wired to a SessionEnd/Stop hook so memories
-/// form without depending on the agent remembering to write them.
+/// [--dry-run]` — distill a Claude Code or Codex CLI session transcript
+/// (JSONL; format sniffed per line) into one episodic memory. Meant to be
+/// wired to a SessionEnd/Stop hook so memories form without depending on the
+/// agent remembering to write them.
 pub fn session_import(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let transcript = require_str(args, "transcript")?;
@@ -1740,10 +2278,12 @@ struct SessionDigest {
     errors: Vec<String>,
 }
 
-/// Parse a Claude Code transcript (JSONL, one message object per line).
+/// Parse a Claude Code or Codex CLI session transcript (JSONL, one object
+/// per line). Format is sniffed per line: Claude Code lines carry `message`
+/// (role/content), Codex rollout lines carry `payload` (Responses-API items).
 /// Tolerant of schema drift: unknown line shapes are skipped, never fatal.
 /// Tool-result payloads are ignored (noise); only real user prompts, visible
-/// assistant text, and tool_use file targets are kept.
+/// assistant text, and file-edit targets are kept.
 fn parse_transcript(text: &str) -> SessionDigest {
     let mut digest = SessionDigest::default();
 
@@ -1768,6 +2308,10 @@ fn parse_transcript(text: &str) -> SessionDigest {
                         digest.user_prompts.push(format!("[session] {s}"));
                     }
                 }
+            }
+            // Codex CLI rollout shape: {"type": "...", "payload": {...}}.
+            if v.get("payload").is_some() {
+                parse_codex_line(&v, &mut digest);
             }
             continue;
         };
@@ -1846,6 +2390,100 @@ fn parse_transcript(text: &str) -> SessionDigest {
 fn push_unique(list: &mut Vec<String>, item: &str) {
     if !list.iter().any(|s| s == item) {
         list.push(item.to_string());
+    }
+}
+
+/// Codex CLI rollout line: `{"timestamp": …, "type": …, "payload": {…}}` where
+/// a `response_item` payload is a Responses-API item (`message`,
+/// `function_call`, `function_call_output`, …). Files come from `apply_patch`
+/// arguments (`*** Update File: <path>` markers); error evidence from failed
+/// tool outputs. Heuristic and bounded, like the Claude path — a malformed
+/// payload is skipped, never fatal.
+fn parse_codex_line(v: &serde_json::Value, digest: &mut SessionDigest) {
+    let Some(payload) = v.get("payload") else {
+        return;
+    };
+    match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "message" => {
+            let role = payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let text = codex_content_text(payload.get("content"));
+            let t = text.trim();
+            if t.is_empty() || t.starts_with('<') {
+                // Codex injects <user_instructions>/<environment_context>
+                // blocks as user input_text — same wrapper filter as Claude.
+                return;
+            }
+            match role {
+                "user" => push_unique(&mut digest.user_prompts, t),
+                "assistant" => push_unique(&mut digest.assistant_texts, t),
+                _ => {}
+            }
+        }
+        "function_call" => {
+            // apply_patch arguments embed "*** (Update|Add|Delete) File: path"
+            // markers — the reliable file-touch signal in Codex transcripts.
+            let args = payload
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                let mut rest = args;
+                while let Some(pos) = rest.find(marker) {
+                    let after = &rest[pos + marker.len()..];
+                    // Path runs to end of line. Also cut at a literal "\n"
+                    // two-char sequence — arguments are a JSON string, and
+                    // some emitters leave the newline escaped.
+                    let line_end = after
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split("\\n")
+                        .next()
+                        .unwrap_or("");
+                    let path: String = line_end.trim().chars().take(400).collect();
+                    if !path.is_empty() {
+                        push_unique(&mut digest.files, &path);
+                    }
+                    rest = after;
+                }
+            }
+        }
+        "function_call_output" => {
+            if digest.errors.len() >= 20 {
+                return;
+            }
+            // Codex marks some outputs success=false; older/newer variants
+            // only carry the text — fall back to common error markers.
+            let failed = payload.get("success") == Some(&serde_json::json!(false));
+            let output = payload
+                .get("output")
+                .and_then(|o| o.as_str())
+                .unwrap_or("")
+                .replace('\n', " ");
+            let output = output.trim();
+            let marked = ["error:", "Error:", "ERROR:", "panic:", "failed:"]
+                .iter()
+                .any(|m| output.starts_with(m));
+            if (failed || marked) && !output.is_empty() {
+                let bounded: String = output.chars().take(300).collect();
+                push_unique(&mut digest.errors, &bounded);
+            }
+        }
+        _ => {} // session_meta / event_msg / reasoning / … — no digest signal
+    }
+}
+
+/// Flatten a Responses-API `content` value (string, or array of
+/// `{type: input_text|output_text, text}` items) into one text blob.
+fn codex_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -1944,6 +2582,123 @@ mod tests {
             "demo".to_string(),
             "--no-import".to_string(),
         ]
+    }
+
+    #[test]
+    fn install_hooks_creates_settings_with_sessionend_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude/settings.json");
+        let status = install_hooks_impl(&settings, "demo", false).unwrap();
+        assert_eq!(status, "installed");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let cmd = v["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cmd, "engram hook --project demo");
+        // No backup when the file didn't exist before.
+        assert!(!dir.path().join(".claude/settings.json.bak").exists());
+    }
+
+    #[test]
+    fn install_hooks_preserves_existing_hooks_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        // A user's existing PostToolUse formatter hook must survive the merge.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"rustfmt --emit files"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_hooks_impl(&settings, "demo", false).unwrap(),
+            "installed"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "rustfmt --emit files",
+            "existing hooks must be preserved"
+        );
+        assert_eq!(v["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+        // A backup of the pre-install file was made.
+        assert!(dir.path().join(".claude/settings.json.bak").exists());
+
+        // Second install is a no-op.
+        assert_eq!(
+            install_hooks_impl(&settings, "demo", false).unwrap(),
+            "already"
+        );
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v2, v, "idempotent install must not change the file");
+    }
+
+    #[test]
+    fn install_hooks_refuses_malformed_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "not json").unwrap();
+        let err = install_hooks_impl(&settings, "demo", false).unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"));
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "not json",
+            "must not clobber a file it cannot parse"
+        );
+    }
+
+    #[test]
+    fn uninstall_hooks_removes_only_engram_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{
+                "SessionEnd":[
+                    {"hooks":[{"type":"command","command":"engram hook --project demo"}]},
+                    {"hooks":[{"type":"command","command":"other-tool session-end"}]}
+                ],
+                "PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"rustfmt --emit files"}]}]
+            }}"#,
+        )
+        .unwrap();
+
+        let removed = uninstall_hooks_impl(&settings).unwrap();
+        assert_eq!(removed, 1);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        // engram's entry is gone; the unrelated SessionEnd entry and the
+        // PostToolUse group survive.
+        let session_cmds: Vec<_> = v["hooks"]["SessionEnd"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(session_cmds, vec!["other-tool session-end"]);
+        assert_eq!(
+            v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "rustfmt --emit files"
+        );
+
+        // Uninstalling again is a clean no-op.
+        assert_eq!(uninstall_hooks_impl(&settings).unwrap(), 0);
+    }
+
+    #[test]
+    fn init_guide_hooks_flag_installs_sessionend_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = no_import_args(dir.path());
+        args.push("--hooks".to_string());
+        init_guide(&args).unwrap();
+        let settings = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        assert!(settings.contains("engram hook --project demo"));
     }
 
     #[test]
@@ -2143,4 +2898,64 @@ not json at all
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("d").is_err()); // no number
     }
+}
+
+#[test]
+fn parse_transcript_handles_codex_rollout_lines() {
+    // Codex CLI rollout shape: {"timestamp","type","payload"} where
+    // response_item payloads are Responses-API items.
+    let jsonl = concat!(
+        // session_meta: recognized, no digest signal, must not break parsing.
+        r#"{"timestamp":"2026-09-19T00:00:00Z","type":"session_meta","payload":{"id":"s-1","cwd":"/repo"}}"#,
+        "\n",
+        // Injected environment context: filtered like Claude's wrappers.
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>os: macOS</environment_context>"}]}}"#,
+        "\n",
+        // Real user prompt.
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the flaky sqlite test"}]}}"#,
+        "\n",
+        // Assistant conclusion.
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fixed by adding a busy_timeout"}]}}"#,
+        "\n",
+        // apply_patch call: file markers.
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/storage/repository.rs\\n@@…\\n*** End Patch\"}"}}"#,
+        "\n",
+        // Failed tool output (success:false) + marked-error output.
+        r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"command exited 1","success":false}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"error: cannot find crate `foo`"}}"#,
+        "\n",
+        // Reasoning item: skipped.
+        r#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+        "\n",
+    );
+    let d = parse_transcript(jsonl);
+    assert_eq!(
+        d.user_prompts,
+        vec!["fix the flaky sqlite test".to_string()],
+        "env context must be filtered: {:?}",
+        d.user_prompts
+    );
+    assert_eq!(d.assistant_texts.len(), 1);
+    assert!(d.assistant_texts[0].contains("busy_timeout"));
+    assert_eq!(d.files, vec!["src/storage/repository.rs".to_string()]);
+    assert_eq!(d.errors.len(), 2, "{:?}", d.errors);
+    assert!(d.errors.iter().any(|e| e.contains("command exited 1")));
+    assert!(d.errors.iter().any(|e| e.contains("cannot find crate")));
+}
+
+#[test]
+fn parse_transcript_mixed_format_lines_do_not_interfere() {
+    // A single file should never contain both, but per-line sniffing must
+    // still leave unknown shapes alone.
+    let jsonl = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"claude prompt"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex prompt"}]}}"#,
+        "\n",
+        r#"{"type":"mystery","shape":{"no":"payload"}}"#,
+        "\n",
+    );
+    let d = parse_transcript(jsonl);
+    assert_eq!(d.user_prompts.len(), 2);
 }

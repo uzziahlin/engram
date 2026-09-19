@@ -185,7 +185,7 @@ fn reindex_backfills_then_recalls() {
 #[test]
 fn test_list_tools() {
     let tools = McpServer::list_tools();
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"search_memory"));
@@ -265,7 +265,7 @@ fn test_handle_tools_list() {
     assert!(response.result.is_some());
     let result = response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 }
 
 #[test]
@@ -417,6 +417,7 @@ fn test_create_decision_with_provider() {
             related_files: vec!["auth.ts".into()],
             tags: vec!["architecture".into()],
             importance: None,
+            supersedes: None,
         })
         .unwrap();
 
@@ -491,12 +492,14 @@ fn test_reflection_reflect_list_confirm_closed_loop() {
     let provider = make_provider();
     let project = "test-project";
 
-    // Seed three auth failures → one recurring tag.
-    for _ in 0..3 {
+    // Seed three auth failures → one recurring tag. Each occurrence is a
+    // DISTINCT incident (byte-identical repeats are stopped by the
+    // write-time dedup guard — recurrence is about the shared tag).
+    for i in 0..3 {
         provider
             .create_failure(CreateFailureInput {
                 project_id: project.into(),
-                incident: "token expired".into(),
+                incident: format!("token expired (occurrence {i})"),
                 root_cause: "clock skew".into(),
                 fix: "tolerance window".into(),
                 prevention: "monitor clock sync".into(),
@@ -594,11 +597,11 @@ fn test_reflection_reflect_list_confirm_closed_loop() {
 fn test_reflection_reject_drops_pending() {
     let provider = make_provider();
     let project = "test-project";
-    for _ in 0..3 {
+    for i in 0..3 {
         provider
             .create_failure(CreateFailureInput {
                 project_id: project.into(),
-                incident: "x".into(),
+                incident: format!("x (occurrence {i})"),
                 root_cause: "y".into(),
                 fix: "z".into(),
                 prevention: "rotate token".into(),
@@ -1423,9 +1426,15 @@ fn test_forget_batch_dry_run_then_apply_and_list() {
 #[test]
 fn test_consolidate_memories_tool_dry_run() {
     let provider = make_provider();
-    for _ in 0..2 {
+    // Seed through the repo: the create_* tools now stop byte-identical
+    // duplicates at write time, but consolidation must still clean up exact
+    // dups written before that guard existed (legacy stores, repo-level writers).
+    for i in 0..2 {
+        let now = chrono::Utc::now().timestamp() + i;
         provider
-            .create_episodic(CreateEpisodicInput {
+            .repo_for_test()
+            .create_episodic(&crate::models::EpisodicMemory {
+                id: format!("dup-{i}"),
                 project_id: "p".into(),
                 session_id: "s".into(),
                 summary: "dup".into(),
@@ -1434,6 +1443,8 @@ fn test_consolidate_memories_tool_dry_run() {
                 related_commits: vec![],
                 importance: 0.5,
                 tags: vec![],
+                created_at: now,
+                updated_at: now,
             })
             .unwrap();
     }
@@ -1636,4 +1647,300 @@ fn search_memory_carries_full_detail_and_supports_tag_filter() {
     let arr = res["results"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["summary"], "crash on startup");
+}
+
+// ─── session_brief ──────────────────────────────────────────────────
+
+#[test]
+fn session_brief_assembles_all_sections() {
+    let provider = make_provider();
+    provider
+        .create_decision(CreateDecisionInput {
+            project_id: "p".into(),
+            title: "Use SQLite".into(),
+            context: "local-first".into(),
+            rationale: "zero config. No server needed.".into(),
+            tradeoffs: "single writer".into(),
+            related_files: vec![],
+            tags: vec![],
+            importance: None,
+            supersedes: None,
+        })
+        .unwrap();
+    provider
+        .create_failure(CreateFailureInput {
+            project_id: "p".into(),
+            incident: "FTS5 crash on keywords".into(),
+            root_cause: "unescaped MATCH".into(),
+            fix: "phrase quoting".into(),
+            prevention: "always sanitize".into(),
+            severity: 4,
+            tags: vec![],
+        })
+        .unwrap();
+    provider
+        .create_procedural(CreateProceduralInput {
+            project_id: "p".into(),
+            workflow_name: "Release".into(),
+            steps: vec!["test".into(), "tag".into(), "push".into()],
+            related_tools: vec![],
+            tags: vec![],
+            importance: None,
+        })
+        .unwrap();
+
+    let out = provider
+        .session_brief(SessionBriefInput {
+            project_id: "p".into(),
+            focus: Some("FTS5 crash".into()),
+        })
+        .unwrap();
+
+    let brief = out["brief"].as_str().unwrap();
+    assert!(brief.contains("Use SQLite"), "decision missing: {brief}");
+    assert!(
+        brief.contains("FTS5 crash on keywords"),
+        "failure missing: {brief}"
+    );
+    assert!(brief.contains("Release"), "procedure missing: {brief}");
+    assert!(
+        brief.contains("Focused context"),
+        "focus section missing: {brief}"
+    );
+    assert_eq!(out["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(out["failures"].as_array().unwrap().len(), 1);
+    assert_eq!(out["procedures"].as_array().unwrap().len(), 1);
+    assert!(
+        out["focused"].as_array().is_some_and(|a| !a.is_empty()),
+        "focused search must surface the failure: {out}"
+    );
+
+    // One decision entry stays one line: the rationale's second sentence is
+    // dropped in the text brief but kept in the structured section.
+    assert!(
+        !brief.contains("No server needed"),
+        "rationale not truncated: {brief}"
+    );
+    assert!(out["decisions"][0]["rationale"]
+        .as_str()
+        .is_some_and(|r| r.contains("No server needed")));
+}
+
+#[test]
+fn session_brief_empty_project_returns_frame_only() {
+    let provider = make_provider();
+    let out = provider
+        .session_brief(SessionBriefInput {
+            project_id: "ghost".into(),
+            focus: None,
+        })
+        .unwrap();
+    let brief = out["brief"].as_str().unwrap();
+    assert!(brief.contains("=== Engram Session Brief: ghost ==="));
+    assert!(brief.ends_with("=== End Brief ==="));
+    assert_eq!(out["decisions"].as_array().unwrap().len(), 0);
+    assert!(out["focused"].is_null());
+}
+
+// ─── write-time dedup + decision supersede ──────────────────────────
+
+#[test]
+fn create_duplicate_returns_existing_without_writing() {
+    let provider = make_provider();
+    let input = CreateDecisionInput {
+        project_id: "p".into(),
+        title: "Use SQLite".into(),
+        context: "c".into(),
+        rationale: "r".into(),
+        tradeoffs: "t".into(),
+        related_files: vec![],
+        tags: vec![],
+        importance: None,
+        supersedes: None,
+    };
+    let first = provider.create_decision(input.clone()).unwrap();
+    assert_eq!(first["status"], "created");
+    let second = provider.create_decision(input).unwrap();
+    assert_eq!(second["status"], "duplicate", "{second}");
+    assert_eq!(
+        second["id"], first["id"],
+        "must return the existing memory's id"
+    );
+    // Only one row exists.
+    assert_eq!(
+        provider
+            .repo_for_test()
+            .list_recent_decisions("p", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn write_dedup_can_be_disabled_by_config() {
+    let repo = MemoryRepository::new_in_memory().unwrap();
+    repo.initialize_schema().unwrap();
+    let mut config = Config::default();
+    config.retrieval.write_dedup = false;
+    let provider = DefaultMemoryProvider::new(repo, config);
+
+    for _ in 0..2 {
+        let out = provider
+            .create_failure(CreateFailureInput {
+                project_id: "p".into(),
+                incident: "same".into(),
+                root_cause: "rc".into(),
+                fix: "f".into(),
+                prevention: "p".into(),
+                severity: 3,
+                tags: vec![],
+            })
+            .unwrap();
+        assert_eq!(out["status"], "created", "disabled guard must write");
+    }
+    assert_eq!(
+        provider
+            .repo_for_test()
+            .list_recent_failures("p", 10)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn decision_supersede_chain_flags_downranks_and_filters() {
+    let provider = make_provider();
+    let old = provider
+        .create_decision(CreateDecisionInput {
+            project_id: "p".into(),
+            title: "Use Redis for cache".into(),
+            context: "session cache".into(),
+            rationale: "fast reads".into(),
+            tradeoffs: "ops burden".into(),
+            related_files: vec![],
+            tags: vec!["cache".into()],
+            importance: Some(0.9),
+            supersedes: None,
+        })
+        .unwrap();
+    let old_id = old["id"].as_str().unwrap().to_string();
+
+    let new = provider
+        .create_decision(CreateDecisionInput {
+            project_id: "p".into(),
+            title: "Use in-process cache instead of Redis".into(),
+            context: "session cache".into(),
+            rationale: "no infra dependency".into(),
+            tradeoffs: "single node only".into(),
+            related_files: vec![],
+            tags: vec!["cache".into()],
+            importance: Some(0.5),
+            supersedes: Some(old_id.clone()),
+        })
+        .unwrap();
+    assert_eq!(new["superseded"], serde_json::json!(old_id.clone()));
+    let new_id = new["id"].as_str().unwrap().to_string();
+
+    // Chain recorded on the old decision.
+    let stored_old = provider
+        .repo_for_test()
+        .get_decision(&old_id, "p")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_old.superseded_by.as_deref(), Some(new_id.as_str()));
+
+    // architectural_decisions: current only by default; both with the flag.
+    let current = provider
+        .architectural_decisions(ArchitecturalDecisionsInput {
+            project_id: "p".into(),
+            topic: None,
+            limit: None,
+            include_superseded: false,
+        })
+        .unwrap();
+    let ids: Vec<&str> = current["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![new_id.as_str()],
+        "superseded must be excluded: {current}"
+    );
+    let all = provider
+        .architectural_decisions(ArchitecturalDecisionsInput {
+            project_id: "p".into(),
+            topic: None,
+            limit: None,
+            include_superseded: true,
+        })
+        .unwrap();
+    assert_eq!(all["decisions"].as_array().unwrap().len(), 2);
+
+    // Search: both surface (history stays reachable), the superseded one is
+    // flagged and cannot outrank its replacement despite higher importance.
+    let res = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "cache".into(),
+            memory_type: Some("decision".into()),
+            limit: Some(10),
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let arr = res["results"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "{res}");
+    assert_eq!(
+        arr[0]["id"],
+        serde_json::json!(new_id.clone()),
+        "replacement ranks first: {res}"
+    );
+    let old_row = arr
+        .iter()
+        .find(|r| r["id"] == serde_json::json!(old_id))
+        .unwrap();
+    assert_eq!(old_row["superseded"], serde_json::json!(true));
+    assert_eq!(old_row["superseded_by"], serde_json::json!(new_id));
+
+    // Session brief carries CURRENT constraints only.
+    let brief = provider
+        .session_brief(SessionBriefInput {
+            project_id: "p".into(),
+            focus: None,
+        })
+        .unwrap();
+    let brief_ids: Vec<&str> = brief["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(brief_ids, vec![new_id.as_str()]);
+}
+
+#[test]
+fn superseding_a_missing_decision_fails_loudly() {
+    let provider = make_provider();
+    let err = provider
+        .create_decision(CreateDecisionInput {
+            project_id: "p".into(),
+            title: "t".into(),
+            context: "c".into(),
+            rationale: "r".into(),
+            tradeoffs: "t".into(),
+            related_files: vec![],
+            tags: vec![],
+            importance: None,
+            supersedes: Some("no-such-id".into()),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no decision no-such-id"),
+        "unexpected error: {err}"
+    );
 }

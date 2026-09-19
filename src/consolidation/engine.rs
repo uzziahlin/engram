@@ -420,6 +420,7 @@ mod tests {
             related_files: vec![],
             tags: vec![],
             importance: 0.5,
+            superseded_by: None,
             created_at: ts,
             updated_at: ts,
         };

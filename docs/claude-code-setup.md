@@ -94,7 +94,18 @@ Claude Code 会调用 `recent_failures` 工具查找相关故障记忆。
 
 ## 7. 自动记忆闭环（推荐）：Claude Code hooks
 
-依赖 agent "自觉" 写记忆不可靠。用 Claude Code 的 hooks 在会话结束时自动蒸馏记忆：
+依赖 agent "自觉" 写记忆不可靠。用 Claude Code 的 hooks 在会话结束时自动蒸馏记忆。
+
+最快路径（自动合并进现有 settings、写前备份、幂等可重跑；`init-guide` 交互模式也会询问是否安装）：
+
+```bash
+engram install-hooks             # 装到当前项目 .claude/settings.json
+engram install-hooks --brief     # 额外接线 SessionStart → engram brief（每次新会话自动注入记忆摘要）
+engram install-hooks --global    # 装到 ~/.claude/settings.json（所有项目）
+engram uninstall-hooks           # 移除 engram 的 hook 条目
+```
+
+手动配置等价于：
 
 ```json
 {

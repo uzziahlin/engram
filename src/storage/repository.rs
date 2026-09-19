@@ -125,7 +125,7 @@ pub struct ReflectionSuggestionRow {
 /// Used by lifecycle ops (archive/restore/list/consolidate) so a single
 /// generic implementation serves all four tables. Table names come only from
 /// this whitelist — never from user input — so interpolating them into SQL is safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryKind {
     Episodic,
     Decision,
@@ -367,16 +367,16 @@ impl MemoryRepository {
         search_fn = search_decisions,
         list_active_fn = list_active_decision,
 
-        select_cols = "id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, created_at, updated_at",
-        search_cols = "m.id, m.project_id, m.title, m.context, m.rationale, m.tradeoffs, m.related_files, m.tags, m.importance, m.created_at, m.updated_at",
+        select_cols = "id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at",
+        search_cols = "m.id, m.project_id, m.title, m.context, m.rationale, m.tradeoffs, m.related_files, m.tags, m.importance, m.superseded_by, m.created_at, m.updated_at",
 
-        insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
 
         fts_insert_sql = "INSERT INTO decision_memories_fts (title, context, rationale, tradeoffs, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6)",
 
-        update_sql = "UPDATE decision_memories SET title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, importance=?9, updated_at=?10 WHERE id=?1 AND project_id=?2",
+        update_sql = "UPDATE decision_memories SET title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, importance=?9, updated_at=?10, superseded_by=?11 WHERE id=?1 AND project_id=?2",
 
-        score_col_idx = 11,
+        score_col_idx = 12,
 
         insert_params = {
             params![
@@ -385,6 +385,7 @@ impl MemoryRepository {
                 serde_json::to_string(&mem.related_files)?,
                 serde_json::to_string(&mem.tags)?,
                 mem.importance,
+                mem.superseded_by,
                 mem.created_at, mem.updated_at,
             ]
         },
@@ -408,6 +409,7 @@ impl MemoryRepository {
                 serde_json::to_string(&mem.tags)?,
                 mem.importance,
                 mem.updated_at,
+                mem.superseded_by,
             ]
         },
 
@@ -422,8 +424,9 @@ impl MemoryRepository {
                 related_files: row_get_json!(row, 6, Vec<String>),
                 tags: row_get_json!(row, 7, Vec<String>),
                 importance: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                superseded_by: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             }
         },
 
@@ -864,10 +867,13 @@ impl MemoryRepository {
     /// query_log row (within `window_seconds`) whose result set contains the
     /// id. Quoted-substring match against the JSON array is exact: memory ids
     /// are fixed-length UUIDs, so `"id"` cannot substring-match another id.
+    /// Also appends a row to the per-event `adoptions` log — query_log cannot
+    /// say WHICH memory was adopted, and `engram tune` needs exactly that.
     pub fn record_adoption(
         &self,
         project_id: &str,
         memory_id: &str,
+        memory_type: &str,
         now: i64,
         window_seconds: i64,
     ) -> Result<usize> {
@@ -884,7 +890,54 @@ impl MemoryRepository {
              )",
             params![project_id, since, needle],
         )?;
+        conn.execute(
+            "INSERT INTO adoptions (project_id, memory_id, memory_type, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, memory_id, memory_type, now],
+        )?;
         Ok(updated)
+    }
+
+    /// Adoption events per memory over a window, most-adopted first — the
+    /// per-memory signal `engram tune` learns from (query_log.adopted only
+    /// aggregates per query string).
+    pub fn adoption_counts(
+        &self,
+        project_id: &str,
+        since: i64,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT memory_id, memory_type, COUNT(*) AS cnt FROM adoptions \
+             WHERE project_id = ?1 AND created_at >= ?2 \
+             GROUP BY memory_id, memory_type \
+             ORDER BY cnt DESC, memory_id",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Raw `result_ids` JSON arrays from query_log over a window — the
+    /// impression side of the tuning signal (how often each memory was
+    /// SERVED to the agent, regardless of whether it was read).
+    pub fn recent_result_ids(&self, project_id: &str, since: i64) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT result_ids FROM query_log \
+             WHERE project_id = ?1 AND created_at >= ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Group non-archived episodic memories by UTC day over a time window,
@@ -975,7 +1028,7 @@ impl MemoryRepository {
     ) -> Result<Vec<DecisionMemory>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, created_at, updated_at
+            "SELECT id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at
              FROM decision_memories
              WHERE project_id = ?1 AND archived_at IS NULL
              ORDER BY created_at DESC
@@ -992,8 +1045,97 @@ impl MemoryRepository {
                 related_files: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                 tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
                 importance: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                superseded_by: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Write-time dedup guard: return the id of the ACTIVE memory of `kind`
+    /// in `project_id` whose dedup text (the same concatenation
+    /// consolidation hashes: `MemoryKind::dedup_text_expr`) is byte-identical
+    /// to `candidate_text`, or None. One indexed scan of the project's active
+    /// rows of that kind — creates are rare, this is not a hot path.
+    pub fn find_exact_duplicate(
+        &self,
+        kind: MemoryKind,
+        project_id: &str,
+        candidate_text: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT id FROM {} \
+             WHERE project_id = ?1 AND archived_at IS NULL AND {} = ?2 \
+             ORDER BY created_at ASC LIMIT 1",
+            kind.table(),
+            kind.dedup_text_expr()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(params![project_id, candidate_text], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(match rows.next() {
+            Some(r) => Some(r?),
+            None => None,
+        })
+    }
+
+    /// Mark decision `old_id` as superseded by `new_id`: the old decision
+    /// stays searchable as history but is flagged and downranked in retrieval.
+    /// Fails loudly when the old id does not exist in this project. An already
+    /// superseded decision is re-pointed at the newest one (chain flattening —
+    /// "current" is always one hop from any replaced decision).
+    pub fn supersede_decision(
+        &self,
+        project_id: &str,
+        old_id: &str,
+        new_id: &str,
+        now: i64,
+    ) -> Result<()> {
+        let mut old = self.get_decision(old_id, project_id)?.with_context(|| {
+            format!("cannot supersede: no decision {old_id} in project {project_id}")
+        })?;
+        if old.superseded_by.is_some() {
+            tracing::info!("decision {old_id} was already superseded; re-pointing it to {new_id}");
+        }
+        old.superseded_by = Some(new_id.to_string());
+        old.updated_at = now;
+        self.update_decision(&old)
+    }
+
+    /// List a project's procedural memories, highest importance first, then
+    /// most recent. Powers the session brief: procedures a team actually
+    /// follows are the ones importance feedback (mark_relevance/tune) raised.
+    pub fn list_top_procedural(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProceduralMemory>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, workflow_name, steps, related_tools, tags, importance, created_at, updated_at
+             FROM procedural_memories
+             WHERE project_id = ?1 AND archived_at IS NULL
+             ORDER BY importance DESC, created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit], |row| {
+            Ok(ProceduralMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                workflow_name: row.get(2)?,
+                steps: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+                related_tools: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                importance: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })?;
         let mut results = Vec::new();
@@ -1668,6 +1810,7 @@ mod tests {
             tradeoffs: "Added infrastructure complexity".into(),
             related_files: vec!["auth.ts".into()],
             tags: vec!["architecture".into()],
+            superseded_by: None,
             created_at: now(),
             updated_at: now(),
             importance: 0.5,
@@ -1824,6 +1967,7 @@ mod tests {
             tradeoffs: "Higher latency than NoSQL".into(),
             related_files: vec![],
             tags: vec![],
+            superseded_by: None,
             created_at: now(),
             updated_at: now(),
             importance: 0.5,
@@ -3235,6 +3379,7 @@ mod tests {
             tradeoffs: "t".into(),
             related_files: vec![],
             tags: vec![],
+            superseded_by: None,
             created_at: 1,
             updated_at: 1,
             importance: 0.5,
