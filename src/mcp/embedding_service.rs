@@ -417,9 +417,9 @@ impl EmbeddingService {
             .filter_map(|id| type_of.get(id).map(|ty| (ty.clone(), id.clone())))
             .collect();
         for sr in crate::retrieval::bm25::BM25Retriever::fetch_by_ids(repo, &missing, project_id)? {
-            let type_ok = memory_type.map_or(true, |mt| sr.memory_type == mt);
+            let type_ok = memory_type.is_none_or(|mt| sr.memory_type == mt);
             let tags_ok = tags.is_empty() || sr.tags.iter().any(|t| tags.contains(t));
-            let before_ok = before.map_or(true, |b| sr.created_at < b);
+            let before_ok = before.is_none_or(|b| sr.created_at < b);
             if type_ok && tags_ok && before_ok {
                 by_id.entry(sr.id.clone()).or_insert(sr);
             }
