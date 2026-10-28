@@ -5,6 +5,60 @@ use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_JACCARD_THRESHOLD: f64 = 0.85;
 
+// ─── Session-import template scaffold ─────────────────────────────────
+//
+// `engram session-import` stitches every imported episodic memory's content
+// from these fixed phrases (see `cli::commands::session_import_content`,
+// which builds from THESE constants). They are scaffold, not session
+// content: every import carries them verbatim, so near-dup comparison must
+// exclude them — two templated imports from DIFFERENT sessions share ~15
+// scaffold tokens, and with a single real word of difference the Jaccard
+// cleared the default 0.85 threshold (s / (s + 2r) >= 0.85 holds at r <= 1),
+// silently archiving one of them. One source of truth: the builder and the
+// exclusion list below must not drift apart.
+pub const SESSION_IMPORT_TPL_PROMPTS: &str = "User prompts:";
+pub const SESSION_IMPORT_TPL_CONCLUSIONS: &str = "Assistant conclusions (latest last):";
+pub const SESSION_IMPORT_TPL_FILES: &str = "Files touched";
+pub const SESSION_IMPORT_TPL_ERRORS: &str = "Errors encountered";
+pub const SESSION_IMPORT_TPL_FAILURE_CANDIDATES: &str = "failure-memory candidates";
+pub const SESSION_IMPORT_TEMPLATE_PHRASES: &[&str] = &[
+    SESSION_IMPORT_TPL_PROMPTS,
+    SESSION_IMPORT_TPL_CONCLUSIONS,
+    SESSION_IMPORT_TPL_FILES,
+    SESSION_IMPORT_TPL_ERRORS,
+    SESSION_IMPORT_TPL_FAILURE_CANDIDATES,
+];
+
+/// Punctuation-trimmed, lowercased forms of the template phrases above.
+/// `scaffold_words_cover_template_phrases` pins the derivation.
+pub(crate) const SESSION_IMPORT_SCAFFOLD_WORDS: &[&str] = &[
+    "user",
+    "prompts",
+    "assistant",
+    "conclusions",
+    "latest",
+    "last",
+    "files",
+    "touched",
+    "errors",
+    "encountered",
+    "failure-memory",
+    "candidates",
+];
+
+/// Whether a whitespace token is template scaffold rather than content:
+/// its trimmed form is one of [`SESSION_IMPORT_SCAFFOLD_WORDS`], or it is
+/// pure punctuation / digits (the "-" list bullets, the "—" dash, the
+/// "(3):" section counts — numbers of prompts/files, not session content).
+pub(crate) fn is_session_import_scaffold(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+    if !trimmed.chars().any(|c| c.is_alphabetic()) {
+        return true;
+    }
+    let norm = trimmed.to_lowercase();
+    SESSION_IMPORT_SCAFFOLD_WORDS.contains(&norm.as_str())
+}
+
 /// One group of duplicate memories: keeper kept active, others to be archived.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConsolidationGroup {
@@ -21,8 +75,8 @@ pub struct ConsolidationPlan {
     pub archived: usize,
 }
 
-/// Consolidation engine (MVP stub).
-/// Basic rule-based deduplication: content hash + word-set near-dup.
+/// Consolidation engine: exact content-hash dedup + near-duplicate detection
+/// (word-set Jaccard; step-sequence similarity for procedures).
 pub struct ConsolidationEngine;
 
 impl Default for ConsolidationEngine {
@@ -58,21 +112,128 @@ impl ConsolidationEngine {
         include_near_dup: bool,
         threshold: f64,
     ) -> Result<ConsolidationPlan> {
-        // (id, created_at, canonical_text) for active memories, oldest first.
-        let sql = format!(
-            "SELECT id, created_at, {} AS dedup_text FROM {} \
-             WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
-            kind.dedup_text_expr(),
-            kind.table()
-        );
+        // (id, canonical dedup text) for active memories, oldest first. The
+        // dedup text is assembled in Rust with the same per-kind builders the
+        // content_hash write path uses (storage::repository::dedup_text_*) —
+        // the old SQL `dedup_text_expr` concatenation is gone, so the hash
+        // column and this scan share ONE formula.
+        use crate::storage::repository::{
+            dedup_text_decision, dedup_text_episodic, dedup_text_failure, dedup_text_procedural,
+        };
+        let (sql, text_of): (String, fn(&rusqlite::Row<'_>) -> rusqlite::Result<String>) =
+            match kind {
+                MemoryKind::Episodic => (
+                    format!(
+                        "SELECT id, summary, content FROM {} \
+                         WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
+                        kind.table()
+                    ),
+                    |row| {
+                        Ok(dedup_text_episodic(
+                            &row.get::<_, String>(1)?,
+                            &row.get::<_, String>(2)?,
+                        ))
+                    },
+                ),
+                MemoryKind::Decision => (
+                    format!(
+                        "SELECT id, title, context, rationale, tradeoffs FROM {} \
+                         WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
+                        kind.table()
+                    ),
+                    |row| {
+                        Ok(dedup_text_decision(
+                            &row.get::<_, String>(1)?,
+                            &row.get::<_, String>(2)?,
+                            &row.get::<_, String>(3)?,
+                            &row.get::<_, String>(4)?,
+                        ))
+                    },
+                ),
+                MemoryKind::Failure => (
+                    format!(
+                        "SELECT id, incident, root_cause, fix, prevention FROM {} \
+                         WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
+                        kind.table()
+                    ),
+                    |row| {
+                        Ok(dedup_text_failure(
+                            &row.get::<_, String>(1)?,
+                            &row.get::<_, String>(2)?,
+                            &row.get::<_, String>(3)?,
+                            &row.get::<_, String>(4)?,
+                        ))
+                    },
+                ),
+                MemoryKind::Procedural => (
+                    format!(
+                        "SELECT id, workflow_name, steps FROM {} \
+                         WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at ASC",
+                        kind.table()
+                    ),
+                    |row| {
+                        Ok(dedup_text_procedural(
+                            &row.get::<_, String>(1)?,
+                            &row.get::<_, String>(2)?,
+                        ))
+                    },
+                ),
+            };
         let conn = repo.connection()?;
         let mut stmt = conn.prepare(&sql)?;
         let recs: Vec<(String, String)> = stmt
             .query_map(params![project_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(2)?))
+                Ok((row.get::<_, String>(0)?, text_of(row)?))
             })?
             .collect::<std::result::Result<_, _>>()?;
         drop(stmt);
+
+        // Near-duplicate comparison key, materialized ONCE per record. The
+        // previous implementation rebuilt both records' word HashSets for
+        // every pair — with N same-scale memories that is N²/2 set builds
+        // (the O(N²) pairing is inherent; the per-pair allocation was not).
+        //
+        // Procedural memories compare by STEP SEQUENCE, not word set: steps
+        // are order-sensitive (`test → build → deploy` is not `deploy → test`),
+        // but Jaccard is order-blind — two procedures with identical steps in
+        // different order scored 1.0 and one got archived. Sequence
+        // similarity (LCS-based) preserves the order signal.
+        enum NearKey {
+            Words(HashSet<String>, usize),
+            Steps(Vec<String>),
+        }
+        let near_key = |kind: MemoryKind, text: &str| -> NearKey {
+            if kind == MemoryKind::Procedural {
+                // dedup text = "workflow_name\n[step json]"; recover the steps.
+                let steps: Vec<String> = text
+                    .split_once('\n')
+                    .and_then(|(_, json)| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                NearKey::Steps(steps)
+            } else {
+                // Episodic only: drop the session-import template scaffold
+                // (see the constants above) so templated imports are compared
+                // on session content alone. Decision/failure texts never
+                // carry the template, and excluding plain English words
+                // ("user", "files") there would change their near-dup
+                // semantics for no benefit.
+                let exclude_scaffold = kind == MemoryKind::Episodic;
+                let mut kept = 0usize;
+                let set: HashSet<String> = text
+                    .split_whitespace()
+                    .filter(|w| {
+                        let keep = !(exclude_scaffold && is_session_import_scaffold(w));
+                        if keep {
+                            kept += 1;
+                        }
+                        keep
+                    })
+                    .map(str::to_string)
+                    .collect();
+                NearKey::Words(set, kept.max(1))
+            }
+        };
+        let keys: Vec<NearKey> = recs.iter().map(|(_, t)| near_key(kind, t)).collect();
 
         let mut grouped: HashSet<usize> = HashSet::new();
         let mut groups: Vec<ConsolidationGroup> = Vec::new();
@@ -100,7 +261,8 @@ impl ConsolidationEngine {
             }
         }
 
-        // Optional near-duplicates among the still-ungrouped, by Jaccard.
+        // Optional near-duplicates among the still-ungrouped, by Jaccard
+        // (word set) or step-sequence similarity for procedures.
         if include_near_dup {
             let remaining: Vec<usize> = (0..recs.len()).filter(|i| !grouped.contains(i)).collect();
             for (pos, &a) in remaining.iter().enumerate() {
@@ -108,20 +270,36 @@ impl ConsolidationEngine {
                     continue;
                 }
                 let mut dups = Vec::new();
-                let a_words = recs[a].1.split_whitespace().count().max(1);
                 for &b in &remaining[pos + 1..] {
                     if grouped.contains(&b) {
                         continue;
                     }
-                    // Cheap length pre-filter: Jaccard of word sets cannot
-                    // reach a >=0.6 threshold when one text has >2.5x the
-                    // words of the other — skips the set-building cost (the
-                    // O(n²) hot path) for obviously-unrelated pairs.
-                    let b_words = recs[b].1.split_whitespace().count().max(1);
-                    if a_words.max(b_words) as f64 > 2.5 * a_words.min(b_words) as f64 {
-                        continue;
-                    }
-                    if Self::jaccard_similarity(&recs[a].1, &recs[b].1, threshold) {
+                    let similar = match (&keys[a], &keys[b]) {
+                        // Cheap length pre-filter: Jaccard of word sets
+                        // cannot reach a >=0.6 threshold when one text has
+                        // >2.5x the words of the other.
+                        (NearKey::Words(set_a, words_a), NearKey::Words(set_b, words_b)) => {
+                            if *words_a.max(words_b) as f64 > 2.5 * *words_a.min(words_b) as f64 {
+                                false
+                            } else {
+                                set_similar(set_a, set_b, threshold)
+                            }
+                        }
+                        // Step lists: same length pre-filter on step counts.
+                        (NearKey::Steps(sa), NearKey::Steps(sb)) => {
+                            if sa.len().max(sb.len()) as f64
+                                > 2.5 * sa.len().min(sb.len()).max(1) as f64
+                            {
+                                false
+                            } else {
+                                sequence_similar(sa, sb, threshold)
+                            }
+                        }
+                        // Mixed keys cannot happen (per-kind comparison), but
+                        // fall back to false rather than panic if it ever did.
+                        _ => false,
+                    };
+                    if similar {
                         dups.push(recs[b].0.clone());
                         grouped.insert(b);
                     }
@@ -131,7 +309,11 @@ impl ConsolidationEngine {
                     groups.push(ConsolidationGroup {
                         keeper_id: recs[a].0.clone(),
                         duplicate_ids: dups,
-                        reason: format!("near(jaccard>={threshold})"),
+                        reason: if kind == MemoryKind::Procedural {
+                            format!("near(sequence>={threshold})")
+                        } else {
+                            format!("near(jaccard>={threshold})")
+                        },
                     });
                 }
             }
@@ -187,26 +369,47 @@ impl ConsolidationEngine {
         }
         Ok(plans)
     }
+}
 
-    /// Check if two texts are near-duplicates using Jaccard similarity.
-    /// Returns true if similarity exceeds the threshold.
-    pub fn jaccard_similarity(a: &str, b: &str, threshold: f64) -> bool {
-        let set_a: HashSet<&str> = a.split_whitespace().collect();
-        let set_b: HashSet<&str> = b.split_whitespace().collect();
-
-        if set_a.is_empty() && set_b.is_empty() {
-            return true;
-        }
-
-        let intersection = set_a.intersection(&set_b).count() as f64;
-        let union = set_a.union(&set_b).count() as f64;
-
-        if union == 0.0 {
-            return false;
-        }
-
-        (intersection / union) >= threshold
+/// Jaccard over prebuilt word sets: |A ∩ B| / |A ∪ B| >= threshold, with
+/// empty-set equality. Module-level so `plan_for_kind` and the tests below
+/// exercise the SAME comparison (the old string-based `jaccard_similarity`
+/// existed only for tests and read as dead code once made private).
+fn set_similar(a: &HashSet<String>, b: &HashSet<String>, threshold: f64) -> bool {
+    if a.is_empty() && b.is_empty() {
+        return true;
     }
+    let intersection = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    union > 0.0 && (intersection / union) >= threshold
+}
+
+/// Order-aware sequence similarity: 2·LCS / (len_a + len_b).
+/// Classic DP over short step lists (< 50 steps typical).
+fn sequence_similar(a: &[String], b: &[String], threshold: f64) -> bool {
+    if a.is_empty() && b.is_empty() {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![0u32; m + 1];
+    for i in 1..=n {
+        let mut prev_diag = 0;
+        for j in 1..=m {
+            let tmp = dp[j];
+            dp[j] = if a[i - 1] == b[j - 1] {
+                prev_diag + 1
+            } else {
+                dp[j].max(dp[j - 1])
+            };
+            prev_diag = tmp;
+        }
+    }
+    let lcs = dp[m] as f64;
+    (2.0 * lcs / (n + m) as f64) >= threshold
 }
 
 #[cfg(test)]
@@ -289,26 +492,46 @@ mod tests {
     }
 
     #[test]
-    fn test_jaccard_similarity() {
-        assert!(ConsolidationEngine::jaccard_similarity(
-            "hello world foo",
-            "hello world bar",
+    fn test_set_similar_over_word_sets() {
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect();
+        assert!(set_similar(
+            &words("hello world foo"),
+            &words("hello world bar"),
             0.4,
         ));
-        assert!(!ConsolidationEngine::jaccard_similarity(
-            "completely different text",
-            "totally unrelated words",
+        assert!(!set_similar(
+            &words("completely different text"),
+            &words("totally unrelated words"),
             0.5,
         ));
     }
 
     #[test]
-    fn test_jaccard_identical() {
-        assert!(ConsolidationEngine::jaccard_similarity(
-            "same text",
-            "same text",
-            0.99
-        ));
+    fn test_set_similar_identical() {
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect();
+        assert!(set_similar(&words("same text"), &words("same text"), 0.99));
+    }
+
+    #[test]
+    fn scaffold_words_cover_template_phrases() {
+        // Every whitespace token of every template phrase (as the session-
+        // import builder actually emits them, punctuation included) must be
+        // classified as scaffold — otherwise the builder and the exclusion
+        // list have drifted apart and templated imports regain phantom
+        // shared words.
+        for phrase in SESSION_IMPORT_TEMPLATE_PHRASES {
+            for token in phrase.split_whitespace() {
+                assert!(
+                    is_session_import_scaffold(token),
+                    "template token {token:?} (from {phrase:?}) is not excluded from \
+                     near-dup word sets"
+                );
+            }
+        }
+        // Real content words must NOT be excluded.
+        for token in ["revert", "src/auth.rs", "panic:", "timeout"] {
+            assert!(!is_session_import_scaffold(token), "{token:?} is content");
+        }
     }
     // 构造一条 episodic 记录（可指定 project_id），便于跨项目/近义场景复用。
     fn mk_episodic(summary: &str, content: &str, ts: i64, project_id: &str) -> EpisodicMemory {
@@ -328,17 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn test_jaccard_threshold_boundary_ge_semantics() {
-        // 两个文本：交集 2 词、并集 4 词 → Jaccard 恰好 0.5。
+    fn test_set_similar_threshold_boundary_ge_semantics() {
+        // 两个集合：交集 2 词、并集 4 词 → Jaccard 恰好 0.5。
         // 验证 `>=` 闭区间语义：threshold=0.5 判相似，threshold=0.6 判不相似。
-        let a = "alpha beta gamma delta";
-        let b = "alpha beta";
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect();
+        let a = words("alpha beta gamma delta");
+        let b = words("alpha beta");
         assert!(
-            ConsolidationEngine::jaccard_similarity(a, b, 0.5),
+            set_similar(&a, &b, 0.5),
             "Jaccard 恰好等于 threshold 应判为 near-dup（闭区间）"
         );
         assert!(
-            !ConsolidationEngine::jaccard_similarity(a, b, 0.6),
+            !set_similar(&a, &b, 0.6),
             "Jaccard 低于 threshold 应判为非 near-dup"
         );
     }
@@ -371,6 +595,48 @@ mod tests {
         let keeper = repo.get_episodic(&g.keeper_id, "p").unwrap().unwrap();
         assert_eq!(keeper.created_at, 100, "near-dup keeper 仍应为最早创建者");
         assert_eq!(plan.archived, 0, "plan_for_kind 不应归档");
+    }
+
+    #[test]
+    fn procedural_near_dup_respects_step_order() {
+        // Same steps, different order = different procedure. Word-set
+        // Jaccard scored these 1.0 (order-blind) and archived the newer one;
+        // sequence similarity (LCS) must NOT group them.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |steps: Vec<&str>, ts: i64| crate::models::ProceduralMemory {
+            id: format!("proc-{ts}"),
+            project_id: "p".into(),
+            workflow_name: "release".into(),
+            steps: steps.iter().map(|s| s.to_string()).collect(),
+            related_tools: vec![],
+            tags: vec![],
+            importance: 0.5,
+            created_at: ts,
+            updated_at: ts,
+        };
+        repo.create_procedural(&mk(vec!["test", "build", "deploy"], 100))
+            .unwrap();
+        repo.create_procedural(&mk(vec!["deploy", "build", "test"], 200))
+            .unwrap();
+        // Genuine near-dup: last step reworded → LCS 2·2/(3+3) ≈ 0.67 ≥ 0.6.
+        repo.create_procedural(&mk(vec!["test", "build", "publish"], 300))
+            .unwrap();
+
+        let engine = ConsolidationEngine::new();
+        let plan = engine
+            .plan_for_kind(&repo, "p", MemoryKind::Procedural, true, 0.6)
+            .unwrap();
+
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        let g = &plan.groups[0];
+        assert_eq!(g.keeper_id, "proc-100");
+        assert_eq!(g.duplicate_ids, vec!["proc-300".to_string()]);
+        assert!(
+            g.reason.starts_with("near(sequence>="),
+            "procedural groups use sequence similarity, got: {}",
+            g.reason
+        );
     }
 
     #[test]

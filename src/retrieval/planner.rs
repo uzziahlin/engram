@@ -46,10 +46,15 @@ impl PlanWeights {
     }
 }
 
-/// Retrieval plan defining which memory sources to query and ranking weights.
+/// Retrieval plan: ranking weights adjusted for the classified intent.
+///
+/// There is deliberately NO source-routing field anymore: the computed
+/// "which memory types to query" was never consumed (search always fans out
+/// to all four types and the intent only adjusts weights) — a soft-weight
+/// design chosen because hard narrowing cost recall. Keeping the dead field
+/// invited readers to believe routing existed.
 #[derive(Debug, Clone)]
 pub struct RetrievalPlan {
-    pub sources: Vec<MemorySource>,
     pub relevance_weight: f32,
     pub recency_weight: f32,
     pub importance_weight: f32,
@@ -77,6 +82,20 @@ impl MemorySource {
         }
     }
 
+    /// Parse the `memory_type` string from MCP/CLI input. NOT named
+    /// `from_str` on purpose: avoids clippy `should_implement_trait`.
+    pub fn from_type_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "episodic" => Ok(MemorySource::Episodic),
+            "decision" => Ok(MemorySource::Decision),
+            "failure" => Ok(MemorySource::Failure),
+            "procedural" => Ok(MemorySource::Procedural),
+            other => anyhow::bail!(
+                "unknown memory_type {other:?}; valid: episodic, decision, failure, procedural"
+            ),
+        }
+    }
+
     /// All four sources, in canonical order.
     pub fn all() -> &'static [MemorySource] {
         &[
@@ -100,18 +119,24 @@ impl RetrievalPlanner {
 
     /// Generate a retrieval plan based on classified intents.
     pub fn plan(&self, intents: &[MemoryIntent]) -> RetrievalPlan {
-        let mut sources = Vec::new();
         // Start from configured base weights. Each intent only ever raises a
         // weight (max), so a single intent reproduces its target value and
         // compound intents keep the strongest signal instead of last-wins.
         //
-        // Intents raise RELEVANCE (and sometimes recency) — the classified
-        // intent means the query terms matched that domain, which is evidence
-        // the BM25 score is meaningful. The type weight is NEVER raised: the
-        // static type prior already favors failure/decision records
-        // unconditionally, and amplifying a query-independent prior under
-        // intent is exactly the inversion the 2026-09 review flagged (intents
-        // used to raise only the priors, letting them outvote relevance).
+        // Intents raise RELEVANCE — the classified intent means the query
+        // terms matched that domain, which is evidence the BM25 score is
+        // meaningful. The type weight is NEVER raised: the static type prior
+        // already favors failure/decision records unconditionally, and
+        // amplifying a query-independent prior under intent is exactly the
+        // inversion the 2026-09 review flagged (intents used to raise only
+        // the priors, letting them outvote relevance).
+        //
+        // Recency is raised ONLY for Workflow queries ("how do we deploy?")
+        // where stale procedures are genuinely less valuable. Deployment no
+        // longer raises it: CJK keywords like 「迁移」 classify as Deployment,
+        // and "数据库迁移方案" queries are usually after historical DECISIONS —
+        // raising recency there actively suppressed the records being asked
+        // for (a 30-day half-life leaves a 40-day-old decision at ~0.40).
         let mut relevance_weight = self.base.relevance;
         let mut recency_weight = self.base.recency;
         // Per-record importance and the type prior are never intent-adjusted:
@@ -122,79 +147,27 @@ impl RetrievalPlanner {
         for intent in intents {
             match intent {
                 MemoryIntent::Debugging => {
-                    if !sources.contains(&MemorySource::Failure) {
-                        sources.push(MemorySource::Failure);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
                     relevance_weight = relevance_weight.max(0.6);
                 }
                 MemoryIntent::Architecture => {
-                    if !sources.contains(&MemorySource::Decision) {
-                        sources.push(MemorySource::Decision);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
                     relevance_weight = relevance_weight.max(0.6);
                 }
                 MemoryIntent::Workflow => {
-                    if !sources.contains(&MemorySource::Procedural) {
-                        sources.push(MemorySource::Procedural);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
                     relevance_weight = relevance_weight.max(0.55);
                     recency_weight = recency_weight.max(0.25);
                 }
                 MemoryIntent::Refactor => {
-                    if !sources.contains(&MemorySource::Decision) {
-                        sources.push(MemorySource::Decision);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
                     relevance_weight = relevance_weight.max(0.55);
                 }
                 MemoryIntent::Deployment => {
-                    if !sources.contains(&MemorySource::Procedural) {
-                        sources.push(MemorySource::Procedural);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
-                    if !sources.contains(&MemorySource::Failure) {
-                        sources.push(MemorySource::Failure);
-                    }
                     relevance_weight = relevance_weight.max(0.55);
-                    recency_weight = recency_weight.max(0.3);
                 }
                 MemoryIntent::Incident => {
-                    if !sources.contains(&MemorySource::Failure) {
-                        sources.push(MemorySource::Failure);
-                    }
-                    if !sources.contains(&MemorySource::Episodic) {
-                        sources.push(MemorySource::Episodic);
-                    }
                     relevance_weight = relevance_weight.max(0.65);
                 }
-                MemoryIntent::General => {
-                    // General queries search all sources
-                    sources = vec![
-                        MemorySource::Episodic,
-                        MemorySource::Decision,
-                        MemorySource::Failure,
-                        MemorySource::Procedural,
-                    ];
-                }
+                MemoryIntent::General => {}
             }
         }
-
-        // Deduplicate sources
-        sources.sort();
-        sources.dedup();
 
         // Renormalize after intent adjustments so the final weights always
         // sum to 1 — comparable across intents and directly interpretable
@@ -208,7 +181,6 @@ impl RetrievalPlanner {
         .normalized();
 
         RetrievalPlan {
-            sources,
             relevance_weight: w.relevance,
             recency_weight: w.recency,
             importance_weight: w.importance,
@@ -225,8 +197,6 @@ mod tests {
     fn test_debugging_plan() {
         let planner = RetrievalPlanner::new(PlanWeights::default());
         let plan = planner.plan(&[MemoryIntent::Debugging]);
-        assert!(plan.sources.contains(&MemorySource::Failure));
-        assert!(plan.sources.contains(&MemorySource::Episodic));
         // Debugging raises relevance (the query matched debugging terms).
         assert!(plan.relevance_weight > PlanWeights::default().relevance);
     }
@@ -235,21 +205,48 @@ mod tests {
     fn test_architecture_plan() {
         let planner = RetrievalPlanner::new(PlanWeights::default());
         let plan = planner.plan(&[MemoryIntent::Architecture]);
-        assert!(plan.sources.contains(&MemorySource::Decision));
+        assert!(plan.relevance_weight > PlanWeights::default().relevance);
     }
 
     #[test]
-    fn test_general_plan_searches_all() {
+    fn test_general_plan_is_base_weights() {
+        // General intent leaves the configured base weights untouched.
         let planner = RetrievalPlanner::new(PlanWeights::default());
         let plan = planner.plan(&[MemoryIntent::General]);
-        assert_eq!(plan.sources.len(), 4);
+        let base = PlanWeights::default().normalized();
+        assert!((plan.relevance_weight - base.relevance).abs() < 1e-6);
+        assert!((plan.recency_weight - base.recency).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deployment_does_not_raise_recency() {
+        // 「迁移」-style queries classify as Deployment but usually want
+        // historical decisions; raising recency suppressed exactly those.
+        // Only Workflow may raise recency. Compare against the General plan
+        // (base weights, renormalized) so the check measures a real raise,
+        // not the share shrink that follows any relevance raise.
+        let planner = RetrievalPlanner::new(PlanWeights::default());
+        let general = planner.plan(&[MemoryIntent::General]);
+        for intents in [
+            vec![MemoryIntent::Deployment],
+            vec![MemoryIntent::Deployment, MemoryIntent::Refactor],
+        ] {
+            let plan = planner.plan(&intents);
+            assert!(
+                plan.recency_weight <= general.recency_weight + 1e-6,
+                "{intents:?} must not raise recency (got {}, base {})",
+                plan.recency_weight,
+                general.recency_weight
+            );
+        }
+        let wf = planner.plan(&[MemoryIntent::Workflow]);
+        assert!(wf.recency_weight > general.recency_weight);
     }
 
     #[test]
     fn test_compound_intent_plan() {
         let planner = RetrievalPlanner::new(PlanWeights::default());
         let plan = planner.plan(&[MemoryIntent::Debugging, MemoryIntent::Incident]);
-        assert!(plan.sources.contains(&MemorySource::Failure));
         // Incident raises relevance more than Debugging; max wins.
         assert!(plan.relevance_weight > PlanWeights::default().relevance);
         // The type weight's share never grows under intent (static priors

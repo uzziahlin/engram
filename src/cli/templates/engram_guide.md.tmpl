@@ -8,7 +8,8 @@ proactively, don't wait to be asked. Every call needs project_id: "{{PROJECT_ID}
 the project's decisions, recent failures, procedures, and pending reflection
 suggestions — pass the task as `focus` to also get top search hits); before
 starting a task, search_memory for prior context; after finishing meaningful
-work, write the matching memory below.
+work, write the matching memory below. When a search result actually helped,
+call `mark_relevance` on it — that is the signal future rankings learn from.
 
 ## When to WRITE
 - Finished a feature/task → create_episodic
@@ -20,9 +21,19 @@ work, write the matching memory below.
 ## When to READ
 - At session start → session_brief (one call: decisions + failures + procedures + suggestions)
 - Before a new task → search_memory
-- Before modifying a file → related_files
+- Before modifying a file → related_files (returns the touching memories with
+  type + summary — fetch more via get_memory)
 - Need design background → architectural_decisions
 - Avoid repeating past bugs → recent_failures
+
+## When to REFINE (turn raw into knowledge)
+- session_brief reports "N raw session-import memories awaiting distillation"
+  → fetch the `engram.distill` prompt and follow it: convert raw session dumps
+  into typed memories (decisions, failures with root cause, procedures), then
+  forget/merge the raw ones.
+- session_brief lists pending reflection suggestions → review via
+  `list_suggestions`, then `confirm_suggestion` / `reject_suggestion`
+  (quality bar: only confirm rules you would actually follow).
 
 ## Search tips (`search_memory`)
 

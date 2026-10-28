@@ -192,6 +192,7 @@ mod tests {
                 created_at: 1716940800 + i as i64 * 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             })
             .collect();
 
@@ -220,6 +221,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "2".into(),
@@ -230,6 +232,7 @@ mod tests {
                 created_at: 2000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "3".into(),
@@ -240,6 +243,7 @@ mod tests {
                 created_at: 1500,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
         ];
 
@@ -266,6 +270,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "dup".into(),
@@ -276,6 +281,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "unique".into(),
@@ -286,6 +292,7 @@ mod tests {
                 created_at: 2000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
         ];
 
@@ -330,6 +337,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             })
             .collect();
         let context = composer.compose_context(&results, &budget);
@@ -364,6 +372,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "high".into(),
@@ -374,6 +383,7 @@ mod tests {
                 created_at: 2000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
         ];
         let context = composer.compose_context(&results, &budget);
@@ -400,6 +410,7 @@ mod tests {
             created_at: 1000,
             tags: vec![],
             detail: serde_json::Value::Null,
+            project_id: "p".into(),
         }];
         let context = composer.compose_context(&results, &budget);
         assert!(

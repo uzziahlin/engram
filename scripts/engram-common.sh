@@ -95,7 +95,13 @@ data = {}
 if os.path.exists(path):
     try:
         with open(path) as f: data = json.load(f)
-    except Exception: data = {}
+    except Exception as e:
+        # Refuse to touch an unparseable config: overwriting it with {} would
+        # silently destroy the user's existing MCP registrations (a stray
+        # trailing comma was enough). The Rust install-hooks path made the
+        # same call — back up and abort instead.
+        print(f"  ERROR: {path} is not valid JSON ({e}); refusing to rewrite it")
+        sys.exit(1)
 servers = data.setdefault("mcpServers", {})
 if "engram" in servers:
     print(f"  engram already present in {path}")

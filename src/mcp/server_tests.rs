@@ -265,7 +265,46 @@ fn test_handle_tools_list() {
     assert!(response.result.is_some());
     let result = response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 25);
+    // Every tool the dispatcher knows must appear exactly once. A hardcoded
+    // exact count made every tool addition a test edit; uniqueness + coverage
+    // of the known set catches the actual regressions (dupes/dropouts).
+    let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let total = names.len();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), total, "duplicate tool names in tools/list");
+    for expected in [
+        "search_memory",
+        "get_memory",
+        "related_files",
+        "timeline",
+        "recent_failures",
+        "query_stats",
+        "session_brief",
+        "architectural_decisions",
+        "create_episodic",
+        "create_decision",
+        "create_failure",
+        "create_procedural",
+        "ingest_commits",
+        "collect_sources",
+        "forget_memory",
+        "restore_memory",
+        "update_memory",
+        "mark_relevance",
+        "forget_batch",
+        "list_archived",
+        "consolidate_memories",
+        "reflect",
+        "list_suggestions",
+        "confirm_suggestion",
+        "reject_suggestion",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "tool {expected} missing from tools/list"
+        );
+    }
 }
 
 #[test]
@@ -318,7 +357,7 @@ fn related_files_resolves_via_repo_index() {
     repo.initialize_schema().unwrap();
     let provider = Arc::new(DefaultMemoryProvider::new(repo, Config::default()));
 
-    provider
+    let created = provider
         .create_episodic(CreateEpisodicInput {
             project_id: "p".into(),
             session_id: "s".into(),
@@ -330,6 +369,7 @@ fn related_files_resolves_via_repo_index() {
             tags: vec![],
         })
         .unwrap();
+    let created_id = created["id"].as_str().unwrap().to_string();
 
     let result = provider
         .related_files(RelatedFilesInput {
@@ -338,15 +378,34 @@ fn related_files_resolves_via_repo_index() {
         })
         .unwrap();
 
-    let entities = result["entities"].as_array().unwrap();
-    assert_eq!(entities.len(), 1);
-    assert_eq!(entities[0]["type"], "File");
-    assert_eq!(entities[0]["name"], "auth.ts");
-    let relations = entities[0]["relations"].as_array().unwrap();
+    // The file resolves and is reported as found.
+    assert_eq!(result["file"], "auth.ts");
+    assert_eq!(result["found"], true);
+    // The primary payload: the touching memory is CONSUMABLE — its type and
+    // label are present, so an agent can act on it (get_memory) instead of
+    // staring at a bare UUID (the pre-fix output was exactly that).
+    let memories = result["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0]["memory_type"], "episodic");
+    assert_eq!(memories[0]["id"], created_id);
+    assert_eq!(memories[0]["summary"], "summary");
+    assert_eq!(memories[0]["relation"], "Touches");
+    // Graph edges remain visible for completeness.
+    let related = result["related_entities"].as_array().unwrap();
     assert!(
-        relations.iter().any(|r| r["type"] == "Touches"),
-        "expected a Touches relation, got: {relations:?}"
+        related.iter().any(|r| r["relation"] == "Touches"),
+        "expected a Touches relation, got: {related:?}"
     );
+
+    // An unknown file reports not-found explicitly (not an empty success).
+    let missing = provider
+        .related_files(RelatedFilesInput {
+            project_id: "p".into(),
+            file: "nope.rs".into(),
+        })
+        .unwrap();
+    assert_eq!(missing["found"], false);
+    assert!(missing["detail"].is_string());
 }
 
 #[test]
@@ -927,6 +986,317 @@ fn search_surfaces_graph_neighbors() {
     assert_eq!(
         neighbor.get("graph_neighbor").and_then(|v| v.as_bool()),
         Some(true)
+    );
+}
+
+/// Wire a memory into the entity graph against a File entity another memory
+/// created via `files_touched`. Failures link no entities on the MCP create
+/// path, so a failure sharing a file with an episodic is constructed here
+/// explicitly (the graph linker can produce such edges for failures recorded
+/// against a file).
+fn link_memory_to_file(repo: &MemoryRepository, project: &str, memory_id: &str, file: &str) {
+    let (file_eid, _) = repo
+        .related_files_for(file, project)
+        .expect("file entity must exist (created via files_touched)");
+    let file_eid = file_eid.expect("File entity id for the shared file");
+    repo.create_entity(&crate::models::Entity {
+        id: memory_id.into(),
+        project_id: project.into(),
+        entity_type: crate::models::EntityType::Memory,
+        name: memory_id.into(),
+        metadata: serde_json::json!({}),
+        created_at: 1,
+        updated_at: 1,
+    })
+    .unwrap();
+    repo.create_relation(&crate::models::GraphRelation {
+        id: 0, // auto-increment (INTEGER PRIMARY KEY)
+        project_id: Some(project.into()),
+        from_entity: memory_id.into(),
+        to_entity: file_eid,
+        relation_type: crate::models::RelationType::Touches,
+        weight: 1.0,
+        created_at: 1,
+    })
+    .unwrap();
+}
+
+#[test]
+fn global_search_results_carry_project_id_for_followup() {
+    // A `project_id = "*"` hit must travel with its OWNING project: the
+    // follow-up tools (get_memory / mark_relevance / forget_memory) all
+    // require the exact project, so a cross-project hit without project_id
+    // was a dead end — visible but not actionable.
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+    let mk = |id: &str, project: &str| crate::models::EpisodicMemory {
+        id: id.into(),
+        project_id: project.into(),
+        session_id: "s".into(),
+        summary: format!("global marker {id} PROJFIELDX"),
+        content: "c".into(),
+        files_touched: vec![],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec![],
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create_episodic(&mk("pa", "proj-a")).unwrap();
+    repo.create_episodic(&mk("pb", "proj-b")).unwrap();
+
+    let resp = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "*".into(),
+            query: "PROJFIELDX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let results = resp["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "both projects' memories must surface");
+
+    let mut owner_of = std::collections::HashMap::new();
+    for r in results {
+        let pid = r["project_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("global hit must carry its owning project_id: {r}"));
+        owner_of.insert(r["id"].as_str().unwrap().to_string(), pid.to_string());
+    }
+    assert_eq!(
+        owner_of.get("pa").map(String::as_str),
+        Some("proj-a"),
+        "project_id must be the memory's owner, not the '*' wildcard"
+    );
+    assert_eq!(owner_of.get("pb").map(String::as_str), Some("proj-b"));
+
+    // The returned project_id is exactly what get_memory needs: the
+    // cross-project hit round-trips with it.
+    let fetched = provider
+        .get_memory(GetMemoryInput {
+            project_id: owner_of["pb"].clone(),
+            memory_type: "episodic".into(),
+            id: "pb".into(),
+        })
+        .unwrap();
+    assert_eq!(fetched["memory"]["summary"], "global marker pb PROJFIELDX");
+}
+
+#[test]
+fn graph_neighbors_respect_memory_type_filter() {
+    // An episodic sharing a File entity with a failure hit must NOT surface
+    // in a memory_type="failure" search — graph expansion used to append
+    // neighbors without checking the caller's explicit filters.
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+
+    // Graph-neighbor candidate: episodic touching shared.rs, text unrelated
+    // to the query.
+    repo.create_episodic(&crate::models::EpisodicMemory {
+        id: "e-nb".into(),
+        project_id: "p".into(),
+        session_id: "s".into(),
+        summary: "auth refactor notes".into(),
+        content: "c".into(),
+        files_touched: vec!["shared.rs".into()],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec![],
+        created_at: 1,
+        updated_at: 1,
+    })
+    .unwrap();
+    // The failure hit: matches the query and is linked to the same file.
+    repo.create_failure(&crate::models::FailureMemory {
+        id: "f-hit".into(),
+        project_id: "p".into(),
+        incident: "crash on boot TYPEFILTERX".into(),
+        root_cause: "rc".into(),
+        fix: "fx".into(),
+        prevention: "pv".into(),
+        severity: 3,
+        tags: vec![],
+        created_at: 2,
+        updated_at: 2,
+    })
+    .unwrap();
+    link_memory_to_file(repo, "p", "f-hit", "shared.rs");
+
+    // Sanity: the shared-file edge is real — the failure's graph neighbors
+    // include the episodic (guards against the test passing vacuously
+    // because the edge was never wired).
+    let nb = repo
+        .neighbor_memories("p", &["f-hit".to_string()], 2)
+        .unwrap();
+    assert_eq!(
+        nb,
+        vec![("episodic".to_string(), "e-nb".to_string())],
+        "scenario must actually produce a foreign-type neighbor"
+    );
+
+    let resp = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "TYPEFILTERX".into(),
+            memory_type: Some("failure".into()),
+            limit: Some(10),
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    let results = resp["results"].as_array().unwrap();
+    assert!(
+        results.iter().any(|r| r["id"] == "f-hit"),
+        "the failure hit must remain: {resp}"
+    );
+    for r in results {
+        if r["graph_neighbor"].as_bool() == Some(true) {
+            assert_eq!(
+                r["memory_type"], "failure",
+                "typed search must not leak foreign-type graph neighbors: {r}"
+            );
+        }
+    }
+    assert!(
+        results.iter().all(|r| r["id"] != "e-nb"),
+        "the episodic neighbor must be filtered out of the failure search: {resp}"
+    );
+}
+
+#[test]
+fn graph_neighbors_respect_tag_filter() {
+    // The tags filter applies to graph neighbors with the same semantics as
+    // the vector path: a neighbor carrying none of the requested tags is
+    // dropped, not appended as "context".
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+    let mk = |id: &str, summary: &str, tags: Vec<&str>| crate::models::EpisodicMemory {
+        id: id.into(),
+        project_id: "p".into(),
+        session_id: "s".into(),
+        summary: summary.into(),
+        content: summary.into(),
+        files_touched: vec!["shared.rs".into()],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: tags.into_iter().map(String::from).collect(),
+        created_at: 1,
+        updated_at: 1,
+    };
+    // e-hit matches the query and carries "auth"; e-nb shares the file but
+    // carries only "deploy".
+    repo.create_episodic(&mk("e-hit", "login flow TAGFILTERX", vec!["auth"]))
+        .unwrap();
+    repo.create_episodic(&mk("e-nb", "unrelated deploy work", vec!["deploy"]))
+        .unwrap();
+
+    // Sanity: without the filter the neighbor does surface — graph
+    // expansion is live in this scenario.
+    let unfiltered = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "TAGFILTERX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    assert!(
+        unfiltered["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "e-nb" && r["graph_neighbor"] == serde_json::json!(true)),
+        "neighbor must surface without filters (scenario sanity): {unfiltered}"
+    );
+
+    // With tags=["auth"], e-nb must be gone — including as a neighbor.
+    let filtered = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "TAGFILTERX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec!["auth".into()],
+            before: None,
+        })
+        .unwrap();
+    let arr = filtered["results"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|r| r["id"] == "e-hit"),
+        "the true hit must remain: {filtered}"
+    );
+    assert!(
+        arr.iter().all(|r| r["id"] != "e-nb"),
+        "neighbor without any requested tag must be filtered: {filtered}"
+    );
+}
+
+#[test]
+fn graph_neighbors_respect_before_filter() {
+    // Same for the `before` cutoff: a neighbor created AFTER the cutoff must
+    // not leak into a point-in-time search — not even as context.
+    let provider = make_provider();
+    let repo = provider.repo_for_test();
+    let mk = |id: &str, summary: &str, created_at: i64| crate::models::EpisodicMemory {
+        id: id.into(),
+        project_id: "p".into(),
+        session_id: "s".into(),
+        summary: summary.into(),
+        content: summary.into(),
+        files_touched: vec!["shared.rs".into()],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: vec![],
+        created_at,
+        updated_at: created_at,
+    };
+    repo.create_episodic(&mk("e-old", "legacy auth flow BEFOREX", 100))
+        .unwrap();
+    repo.create_episodic(&mk("e-new", "unrelated recent work", 5_000))
+        .unwrap();
+
+    // Sanity: without `before` the newer neighbor surfaces.
+    let unfiltered = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "BEFOREX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: None,
+        })
+        .unwrap();
+    assert!(
+        unfiltered["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "e-new" && r["graph_neighbor"] == serde_json::json!(true)),
+        "neighbor must surface without filters (scenario sanity): {unfiltered}"
+    );
+
+    let filtered = provider
+        .search_memory(SearchMemoryInput {
+            project_id: "p".into(),
+            query: "BEFOREX".into(),
+            limit: Some(10),
+            memory_type: None,
+            tags: vec![],
+            before: Some(200),
+        })
+        .unwrap();
+    let arr = filtered["results"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|r| r["id"] == "e-old"),
+        "the pre-cutoff hit must remain: {filtered}"
+    );
+    assert!(
+        arr.iter().all(|r| r["id"] != "e-new"),
+        "neighbor newer than `before` must be filtered: {filtered}"
     );
 }
 
@@ -1942,5 +2312,560 @@ fn superseding_a_missing_decision_fails_loudly() {
     assert!(
         err.to_string().contains("no decision no-such-id"),
         "unexpected error: {err}"
+    );
+}
+
+// ─── mark_relevance feedback loop ─────────────────────────────────
+
+/// The recommended agent flow is search → get_memory → mark_relevance.
+/// get_memory writes an adoption row; the feedback cooldown must key on
+/// explicit feedback, not on reads — otherwise the flow ALWAYS hit cooldown
+/// and importance never moved.
+#[test]
+fn mark_relevance_after_get_memory_takes_effect() {
+    let provider = make_provider();
+    const P: &str = "fb-flow";
+
+    let created = provider
+        .create_episodic(CreateEpisodicInput {
+            project_id: P.into(),
+            session_id: "s".into(),
+            summary: "cooldown fix".into(),
+            content: "explicit feedback must survive a prior passive read".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // search → get_memory: the read writes an adoption row (the OLD cooldown
+    // trigger — this is the exact sequence that used to eat the feedback).
+    provider
+        .search_memory(SearchMemoryInput {
+            project_id: P.into(),
+            query: "cooldown".into(),
+            memory_type: None,
+            limit: Some(10),
+            before: None,
+            tags: vec![],
+        })
+        .unwrap();
+    provider
+        .get_memory(GetMemoryInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id: id.clone(),
+        })
+        .unwrap();
+
+    // Core assertion: feedback after a read is NOT cooled down.
+    let res = provider
+        .mark_relevance(MarkRelevanceInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id: id.clone(),
+            feedback: "useful".into(),
+        })
+        .unwrap();
+    assert!(
+        (res["importance"].as_f64().unwrap() - 0.6).abs() < 1e-6,
+        "feedback must apply after a read: {res}"
+    );
+
+    // Second feedback inside 24h (either direction) → cooldown, frozen value.
+    let res2 = provider
+        .mark_relevance(MarkRelevanceInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id: id.clone(),
+            feedback: "irrelevant".into(),
+        })
+        .unwrap();
+    assert_eq!(res2["status"], "cooldown", "{res2}");
+    let mem = provider
+        .get_memory(GetMemoryInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id,
+        })
+        .unwrap();
+    let importance = mem["memory"]["importance"].as_f64().unwrap();
+    assert!(
+        (importance - 0.6).abs() < 1e-6,
+        "cooldown must not change importance: {mem}"
+    );
+}
+
+/// 'irrelevant' applies on first call (−0.1) and shares the same 24h
+/// per-memory cooldown.
+#[test]
+fn mark_relevance_irrelevant_applies_then_cools_down() {
+    let provider = make_provider();
+    const P: &str = "fb-irrelevant";
+
+    let created = provider
+        .create_episodic(CreateEpisodicInput {
+            project_id: P.into(),
+            session_id: "s".into(),
+            summary: "irrelevant applies once".into(),
+            content: "negative feedback is rate-limited symmetrically".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let res = provider
+        .mark_relevance(MarkRelevanceInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id: id.clone(),
+            feedback: "irrelevant".into(),
+        })
+        .unwrap();
+    assert!(
+        (res["importance"].as_f64().unwrap() - 0.4).abs() < 1e-6,
+        "first 'irrelevant' must apply: {res}"
+    );
+
+    let res2 = provider
+        .mark_relevance(MarkRelevanceInput {
+            project_id: P.into(),
+            memory_type: "episodic".into(),
+            id,
+            feedback: "irrelevant".into(),
+        })
+        .unwrap();
+    assert_eq!(res2["status"], "cooldown", "{res2}");
+}
+
+/// Failures have no importance field — feedback still adjusts severity
+/// (severity IS their importance signal in the reranker).
+#[test]
+fn mark_relevance_failure_adjusts_severity() {
+    let provider = make_provider();
+    const P: &str = "fb-failure";
+
+    let created = provider
+        .create_failure(CreateFailureInput {
+            project_id: P.into(),
+            incident: "severity feedback".into(),
+            root_cause: "rc".into(),
+            fix: "fix".into(),
+            prevention: "prev".into(),
+            severity: 3,
+            tags: vec![],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let res = provider
+        .mark_relevance(MarkRelevanceInput {
+            project_id: P.into(),
+            memory_type: "failure".into(),
+            id: id.clone(),
+            feedback: "useful".into(),
+        })
+        .unwrap();
+    // severity 3 → 4; the reported importance equivalent is 4/5.
+    assert!(
+        (res["importance"].as_f64().unwrap() - 0.8).abs() < 1e-6,
+        "failure feedback must adjust severity: {res}"
+    );
+    let mem = provider
+        .get_memory(GetMemoryInput {
+            project_id: P.into(),
+            memory_type: "failure".into(),
+            id,
+        })
+        .unwrap();
+    assert_eq!(mem["memory"]["severity"], serde_json::json!(4));
+}
+
+// ─── update_memory contract (patch validation + echo) ─────────────
+
+#[test]
+fn update_memory_patch_applies_and_echoes() {
+    let provider = make_provider();
+    let created = provider
+        .create_episodic(CreateEpisodicInput {
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "old summary".into(),
+            content: "old content".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let mut patch = serde_json::Map::new();
+    patch.insert("content".into(), serde_json::json!("new content"));
+    patch.insert("importance".into(), serde_json::json!(0.9));
+    let res = provider
+        .update_memory(UpdateMemoryInput {
+            project_id: "p".into(),
+            memory_type: "episodic".into(),
+            id: id.clone(),
+            patch,
+        })
+        .unwrap();
+
+    // `applied` echoes exactly the two patched fields…
+    assert_eq!(res["status"], "updated");
+    assert_eq!(res["applied"]["content"], "new content");
+    assert_eq!(res["applied"]["importance"], serde_json::json!(0.9));
+    assert_eq!(
+        res["applied"].as_object().unwrap().len(),
+        2,
+        "applied must contain exactly the patched fields: {res}"
+    );
+    // …nothing was skipped, so no `ignored` key at all.
+    assert!(
+        res.get("ignored").is_none(),
+        "ignored must be omitted when nothing was skipped: {res}"
+    );
+
+    // The row actually changed — this is the anti-silent-success guarantee.
+    let stored = provider
+        .repo_for_test()
+        .get_episodic(&id, "p")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, "new content");
+    assert!(
+        (stored.importance - 0.9).abs() < 1e-6,
+        "importance must be 0.9, got {}",
+        stored.importance
+    );
+}
+
+#[test]
+fn update_memory_empty_patch_errors() {
+    let provider = make_provider();
+    let created = provider
+        .create_episodic(CreateEpisodicInput {
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "old".into(),
+            content: "old".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+        })
+        .unwrap();
+
+    // Only the three fixed params: a strict client that stripped undeclared
+    // schema keys used to produce exactly this call — and got "updated".
+    let err = provider
+        .update_memory(UpdateMemoryInput {
+            project_id: "p".into(),
+            memory_type: "episodic".into(),
+            id: created["id"].as_str().unwrap().to_string(),
+            patch: serde_json::Map::new(),
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("empty patch"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("no fields to update"),
+        "error must state there is nothing to apply: {msg}"
+    );
+}
+
+#[test]
+fn update_memory_protected_only_patch_errors() {
+    let provider = make_provider();
+    let created = provider
+        .create_episodic(CreateEpisodicInput {
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "old".into(),
+            content: "old".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+        })
+        .unwrap();
+
+    let mut patch = serde_json::Map::new();
+    patch.insert("id".into(), serde_json::json!("forged-id"));
+    patch.insert("created_at".into(), serde_json::json!(0));
+    let err = provider
+        .update_memory(UpdateMemoryInput {
+            project_id: "p".into(),
+            memory_type: "episodic".into(),
+            id: created["id"].as_str().unwrap().to_string(),
+            patch,
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("protected"),
+        "must explain the keys are protected: {msg}"
+    );
+    assert!(
+        msg.contains("no fields to update"),
+        "error must state there is nothing to apply: {msg}"
+    );
+    // Distinguishable from the plain empty-patch message so the caller's
+    // retry can be a fix, not another loop.
+    assert!(
+        !msg.contains("empty patch"),
+        "protected-only must have its own message: {msg}"
+    );
+}
+
+#[test]
+fn update_memory_wrong_type_field_reports() {
+    let provider = make_provider();
+    let created = provider
+        .create_failure(CreateFailureInput {
+            project_id: "p".into(),
+            incident: "incident".into(),
+            root_cause: "rc".into(),
+            fix: "old fix".into(),
+            prevention: "pv".into(),
+            severity: 3,
+            tags: vec![],
+        })
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // importance alone against a failure: an error that names the offending
+    // field AND the applicable ones (severity is the failure ranking signal).
+    let mut patch = serde_json::Map::new();
+    patch.insert("importance".into(), serde_json::json!(0.9));
+    let err = provider
+        .update_memory(UpdateMemoryInput {
+            project_id: "p".into(),
+            memory_type: "failure".into(),
+            id: id.clone(),
+            patch,
+        })
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("importance"),
+        "must name the inapplicable field: {msg}"
+    );
+    assert!(
+        msg.contains("memory_type 'failure'"),
+        "must name the memory_type: {msg}"
+    );
+    assert!(
+        msg.contains("severity"),
+        "must list the applicable fields (incl. severity): {msg}"
+    );
+
+    // Mixed patch: the valid field applies, the inapplicable one is reported
+    // in `ignored` with a reason instead of failing the whole call.
+    let mut patch = serde_json::Map::new();
+    patch.insert("fix".into(), serde_json::json!("new fix"));
+    patch.insert("importance".into(), serde_json::json!(0.9));
+    let res = provider
+        .update_memory(UpdateMemoryInput {
+            project_id: "p".into(),
+            memory_type: "failure".into(),
+            id: id.clone(),
+            patch,
+        })
+        .unwrap();
+    assert_eq!(res["applied"]["fix"], "new fix", "{res}");
+    let ignored = res["ignored"].as_object().expect("ignored reported: {res}");
+    assert_eq!(ignored.len(), 1, "{res}");
+    let reason = ignored
+        .get("importance")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("importance must be in ignored: {res}"));
+    assert!(
+        reason.contains("not a field of memory_type 'failure'"),
+        "unexpected reason: {reason}"
+    );
+    // DB: the valid field landed, the row exists.
+    let stored = provider
+        .repo_for_test()
+        .get_failure(&id, "p")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.fix, "new fix");
+}
+
+#[test]
+fn update_memory_schema_declares_all_patch_fields() {
+    // Anti-drift: the update_memory schema must declare EXACTLY the three
+    // fixed params plus every model field a patch can set — the lightweight
+    // stand-in for generating the schema from the models (schemars PoC said
+    // most MCP clients can't digest generated anyOf/$ref). Adding a model
+    // field without updating the schema turns this red: strict clients strip
+    // undeclared keys, which is the silent-empty-patch bug this contract
+    // fixed. Declaring a field the models don't have fails here too (typo
+    // guard — plain superset checking would miss it).
+    let tool = McpServer::list_tools()
+        .into_iter()
+        .find(|t| t.name == "update_memory")
+        .expect("update_memory in tools/list");
+    assert_eq!(
+        tool.input_schema["additionalProperties"],
+        serde_json::json!(false),
+        "unknown keys must be rejected by the schema, not stripped silently"
+    );
+    let schema_keys: std::collections::BTreeSet<&str> = tool.input_schema["properties"]
+        .as_object()
+        .expect("properties object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    let samples = [
+        serde_json::to_value(&crate::models::EpisodicMemory {
+            id: "i".into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "sm".into(),
+            content: "c".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap(),
+        serde_json::to_value(&crate::models::DecisionMemory {
+            id: "i".into(),
+            project_id: "p".into(),
+            title: "t".into(),
+            context: "c".into(),
+            rationale: "r".into(),
+            tradeoffs: "to".into(),
+            related_files: vec![],
+            tags: vec![],
+            importance: 0.5,
+            superseded_by: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap(),
+        serde_json::to_value(&crate::models::FailureMemory {
+            id: "i".into(),
+            project_id: "p".into(),
+            incident: "in".into(),
+            root_cause: "rc".into(),
+            fix: "f".into(),
+            prevention: "pv".into(),
+            severity: 3,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap(),
+        serde_json::to_value(&crate::models::ProceduralMemory {
+            id: "i".into(),
+            project_id: "p".into(),
+            workflow_name: "w".into(),
+            steps: vec![],
+            related_tools: vec![],
+            tags: vec![],
+            importance: 0.5,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap(),
+    ];
+    let mut expected: std::collections::BTreeSet<&str> = Default::default();
+    for sample in &samples {
+        for key in sample.as_object().unwrap().keys() {
+            if !PROTECTED_PATCH_KEYS.contains(&key.as_str()) {
+                expected.insert(key.as_str());
+            }
+        }
+    }
+    // The three fixed routing params share the properties object.
+    expected.insert("project_id");
+    expected.insert("memory_type");
+    expected.insert("id");
+    assert_eq!(
+        schema_keys, expected,
+        "update_memory schema drifted from the model structs' patchable fields"
+    );
+}
+
+#[test]
+fn update_memory_jsonrpc_undeclared_keys_reach_patch() {
+    // The input struct captures patch fields via serde(flatten); this is the
+    // deserialization path every real tools/call takes. Keys the struct does
+    // not declare explicitly (summary/importance/…) must still arrive in
+    // `patch` and apply — proving `additionalProperties: false` in the
+    // SCHEMA (a client-side contract) does not affect server-side parsing.
+    let server = setup_server();
+    let create_resp = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(1)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "create_episodic",
+            "arguments": {
+                "project_id": "p", "session_id": "s",
+                "summary": "old summary", "content": "old content"
+            }
+        })),
+    });
+    let created: serde_json::Value = serde_json::from_str(
+        create_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let resp = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(2)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "update_memory",
+            "arguments": {
+                "project_id": "p", "memory_type": "episodic", "id": id,
+                "summary": "patched via json-rpc",
+                "importance": 0.8
+            }
+        })),
+    });
+    let result = resp.result.expect("update must succeed");
+    assert!(result.get("isError").is_none(), "not an error: {result}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed["status"], "updated");
+    assert_eq!(parsed["applied"]["summary"], "patched via json-rpc");
+    assert_eq!(parsed["applied"]["importance"], serde_json::json!(0.8));
+
+    // The empty-patch error surfaces as MCP isError (result.isError=true),
+    // not a JSON-RPC protocol error — the agent can read and fix it.
+    let empty_resp = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(3)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "update_memory",
+            "arguments": { "project_id": "p", "memory_type": "episodic", "id": id }
+        })),
+    });
+    let empty_result = empty_resp
+        .result
+        .expect("tool errors are results, not protocol errors");
+    assert_eq!(empty_result["isError"], serde_json::json!(true));
+    let text = empty_result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("empty patch"),
+        "unexpected error text: {text}"
     );
 }

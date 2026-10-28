@@ -23,32 +23,73 @@ pub struct ReindexReport {
 
 pub struct EmbeddingService {
     #[cfg(feature = "semantic")]
-    embedder: std::sync::OnceLock<Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>>>,
+    embedder: std::sync::Mutex<EmbedderSlot>,
+    /// One-time initialization gate. The ~90MB model download happens OUTSIDE
+    /// `embedder`'s mutex (double-checked: lock `init_lock`, re-check the
+    /// slot, download, then take `embedder` to publish) so concurrent searches
+    /// don't queue on the model fetch — they queue HERE instead, waiting for
+    /// the winner to succeed or fail (never re-downloading in parallel).
+    /// Lock order is always `init_lock` → `embedder`, never inverted.
+    #[cfg(feature = "semantic")]
+    init_lock: std::sync::Mutex<()>,
     #[cfg(feature = "semantic")]
     lazy_config: Box<crate::config::SemanticConfig>,
     /// Per-(project, model) vector cache: brute-force cosine used to
     /// re-deserialize every vector from SQLite on EVERY query (~15 MB per
     /// 10k memories). Entries are evicted wholesale on any write — coarse,
-    /// but obviously correct (staleness self-heals: materialization of a
-    /// deleted id returns None and the hit is dropped).
+    /// but obviously correct (materialization drops ids that are gone or
+    /// archived; see `get_active_*`).
     #[cfg(feature = "semantic")]
     vector_cache: std::sync::Mutex<VectorCache>,
 }
+
+/// Lazy embedder slot with bounded retry: a failed init (network hiccup
+/// during the one-time model fetch, corrupted download) must not disable
+/// semantic search for the whole process lifetime — retry at most once per
+/// [`RETRY_INTERVAL_SECS`] instead.
+#[cfg(feature = "semantic")]
+struct EmbedderSlot {
+    embedder: Option<std::sync::Arc<dyn crate::retrieval::embedding::EmbeddingProvider>>,
+    next_retry_at: i64,
+}
+
+#[cfg(feature = "semantic")]
+const RETRY_INTERVAL_SECS: i64 = 600;
 
 /// One cached vector with its memory identity: (memory_id, memory_type, vec).
 #[cfg(feature = "semantic")]
 pub type VectorEntry = (String, String, Vec<f32>);
 
-/// (project_id, model_id) → the project's cached active vectors.
+/// One cached vector set: the project's active vectors plus the
+/// `PRAGMA data_version` observed when they were loaded.
 #[cfg(feature = "semantic")]
-type VectorCache = std::collections::HashMap<(String, String), std::sync::Arc<Vec<VectorEntry>>>;
+struct CachedVectors {
+    /// `PRAGMA data_version` of the connection that loaded `vectors`. SQLite
+    /// bumps this on a connection when ANOTHER connection commits — and leaves
+    /// it unchanged for same-connection commits. It is therefore a free
+    /// cross-process invalidation signal (a CLI process writing the DB is seen
+    /// by the MCP server's next search), complementing — not replacing — the
+    /// in-process `invalidate_vectors` (same-process writes do NOT bump it).
+    data_version: i64,
+    vectors: std::sync::Arc<Vec<VectorEntry>>,
+}
+
+/// (project_id, model_id) → the project's cached active vectors.
+/// The `("*", model)` wildcard entry goes through the exact same path, so the
+/// data_version check covers global search too.
+#[cfg(feature = "semantic")]
+type VectorCache = std::collections::HashMap<(String, String), CachedVectors>;
 
 impl EmbeddingService {
     pub fn new(config: &Config) -> Self {
         #[cfg(feature = "semantic")]
         {
             Self {
-                embedder: std::sync::OnceLock::new(),
+                embedder: std::sync::Mutex::new(EmbedderSlot {
+                    embedder: None,
+                    next_retry_at: 0,
+                }),
+                init_lock: std::sync::Mutex::new(()),
                 lazy_config: Box::new(config.semantic.clone()),
                 vector_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
@@ -67,7 +108,11 @@ impl EmbeddingService {
         embedder: Box<dyn crate::retrieval::embedding::EmbeddingProvider>,
     ) -> Self {
         Self {
-            embedder: std::sync::OnceLock::from(Some(embedder)),
+            embedder: std::sync::Mutex::new(EmbedderSlot {
+                embedder: Some(std::sync::Arc::from(embedder)),
+                next_retry_at: i64::MAX,
+            }),
+            init_lock: std::sync::Mutex::new(()),
             lazy_config: Box::new(crate::config::SemanticConfig::default()),
             vector_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -76,27 +121,75 @@ impl EmbeddingService {
     /// Lazily resolve the embedder: model download + load happens on FIRST
     /// USE, not at server startup — it used to block the MCP initialize
     /// handshake for the whole ~90 MB first-run fetch.
+    ///
+    /// Double-checked: the fast path holds `embedder` only to clone the Arc;
+    /// the slow path downloads OUTSIDE both locks. Concurrent first searches
+    /// serialize on `init_lock` — the first caller fetches the model while
+    /// the others WAIT, then observe either the finished embedder or the
+    /// failure's retry backoff (never a second download). A failure keeps
+    /// the existing [`RETRY_INTERVAL_SECS`] backoff.
     #[cfg(feature = "semantic")]
-    fn embedder(&self) -> Option<&dyn crate::retrieval::embedding::EmbeddingProvider> {
-        self.embedder
-            .get_or_init(|| Self::init_embedder(&self.lazy_config))
-            .as_deref()
+    fn embedder(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::retrieval::embedding::EmbeddingProvider>> {
+        {
+            let slot = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(embedder) = slot.embedder.clone() {
+                return Some(embedder);
+            }
+            if chrono::Utc::now().timestamp() < slot.next_retry_at {
+                return None; // a recent init failed: back off instead of retrying
+            }
+        }
+        // Slow path: exactly one thread downloads; latecomers block here
+        // until it finishes (succeeds or fails), then re-check below.
+        let _init_gate = self.init_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check after the wait: the winner may have succeeded…
+        if let Some(embedder) = slot.embedder.clone() {
+            return Some(embedder);
+        }
+        // …or failed and armed the backoff while we were queued.
+        if chrono::Utc::now().timestamp() < slot.next_retry_at {
+            return None;
+        }
+        let initialized = Self::init_embedder(&self.lazy_config);
+        if initialized.is_none() {
+            // Failed: back off instead of re-attempting (and re-fetching) on
+            // every search call.
+            slot.next_retry_at = chrono::Utc::now().timestamp() + RETRY_INTERVAL_SECS;
+        }
+        slot.embedder = initialized;
+        slot.embedder.clone()
     }
 
     /// Drop cached vectors for a project (any write that can change the
     /// active vector set). `None` = drop everything (reindex, model change).
+    ///
+    /// A specific project's write ALSO drops the `("*", model)` global-search
+    /// entry: the wildcard key never equals a real project id, so before this
+    /// fix the global cache survived every invalidation and served stale
+    /// (even archived) vectors for the life of the process.
     #[cfg(feature = "semantic")]
     pub fn invalidate_vectors(&self, project: Option<&str>) {
         let mut cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
         match project {
             Some(p) => {
-                cache.retain(|(proj, _), _| proj != p);
+                cache.retain(|(proj, _), _| proj != p && proj != "*");
             }
             None => cache.clear(),
         }
     }
 
     /// Load the active vectors for (project, model), through the cache.
+    ///
+    /// Cross-process invalidation: `PRAGMA data_version` is read on a pooled
+    /// connection before every lookup (one cheap pragma, no query). A value
+    /// different from the cached entry's means SOME other connection/process
+    /// committed since the load — reload instead of serving stale vectors
+    /// (e.g. an `engram reindex` in a CLI process that the long-lived MCP
+    /// server would otherwise never observe). Same-process writes are handled
+    /// by `invalidate_vectors`, as before.
     #[cfg(feature = "semantic")]
     fn cached_vectors(
         &self,
@@ -105,16 +198,29 @@ impl EmbeddingService {
         model_id: &str,
     ) -> Result<std::sync::Arc<Vec<VectorEntry>>> {
         let key = (project_id.to_string(), model_id.to_string());
+        let data_version: i64 = {
+            let conn = repo.connection()?;
+            conn.query_row("PRAGMA data_version", [], |r| r.get(0))?
+        };
         {
             let cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = cache.get(&key) {
-                return Ok(std::sync::Arc::clone(hit));
+                if hit.data_version == data_version {
+                    return Ok(std::sync::Arc::clone(&hit.vectors));
+                }
+                // Stale: another connection committed since the load — reload.
             }
         }
         let loaded: Vec<VectorEntry> = repo.load_active_embeddings(project_id, model_id)?;
         let arc = std::sync::Arc::new(loaded);
         let mut cache = self.vector_cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(key, std::sync::Arc::clone(&arc));
+        cache.insert(
+            key,
+            CachedVectors {
+                data_version,
+                vectors: std::sync::Arc::clone(&arc),
+            },
+        );
         Ok(arc)
     }
 
@@ -124,7 +230,7 @@ impl EmbeddingService {
     #[cfg(feature = "semantic")]
     fn init_embedder(
         config: &crate::config::SemanticConfig,
-    ) -> Option<Box<dyn crate::retrieval::embedding::EmbeddingProvider>> {
+    ) -> Option<std::sync::Arc<dyn crate::retrieval::embedding::EmbeddingProvider>> {
         use crate::retrieval::embedding::{ensure_model, CandleBertEmbedder};
         if !config.enabled {
             return None;
@@ -140,7 +246,7 @@ impl EmbeddingService {
         if config.model_path.is_none() {
             if let Err(e) = ensure_model(&config.model_id, &dir) {
                 tracing::warn!(
-                    "semantic enabled but model fetch failed ({e}); disabling semantic search"
+                    "semantic enabled but model fetch failed ({e}); retrying later, BM25-only meanwhile"
                 );
                 return None;
             }
@@ -148,10 +254,12 @@ impl EmbeddingService {
         match CandleBertEmbedder::from_local(&dir, &config.model_id) {
             Ok(e) => {
                 tracing::info!("semantic search enabled: model {}", config.model_id);
-                Some(Box::new(e))
+                Some(std::sync::Arc::new(e))
             }
             Err(e) => {
-                tracing::warn!("semantic model load failed ({e}); disabling semantic search");
+                tracing::warn!(
+                    "semantic model load failed ({e}); retrying later, BM25-only meanwhile"
+                );
                 None
             }
         }
@@ -341,16 +449,28 @@ impl EmbeddingService {
         Ok(report)
     }
 
-    /// Semantic fusion: blend vector top-K with the BM25 candidates via RRF.
-    /// Vector-only hits are materialized so they can surface even when BM25
+    /// Semantic fusion: blend vector top-K with the BM25 candidates.
+    /// Vector-only hits are materialized (through the archived-filtering,
+    /// wildcard-aware `fetch_by_ids`) so they can surface even when BM25
     /// missed them entirely.
     ///
-    /// Two invariants fixed in the 2026-09 review:
-    /// - the caller's explicit filters (`memory_type`/`tags`/`before`) apply
-    ///   to vector-only candidates too — the vector path must not bypass them;
-    /// - the cosine score is injected into `relevance_score` (max with the
-    ///   normalized BM25 score) instead of being discarded, so a strong
-    ///   semantic match actually influences the final ranking.
+    /// Fusion semantics — two-arm RRF: a candidate's relevance becomes
+    /// `fusion::rrf_two_arm(bm25_rank, cosine_rank)` — the reciprocal-rank
+    /// fusion of the BM25 ranking (the caller's input order) and the vector
+    /// ranking, each arm contributing only when the candidate actually
+    /// ranked in it (absent arm = missing evidence, not last place —
+    /// semantics is a vector-only candidate's ONLY signal). Normalized to
+    /// [0,1] with a single-signal ceiling of 0.5 (see `rrf_two_arm`).
+    /// Rationale: the previous max-injection (`max(normalized_bm25,
+    /// cosine)`) was scale-blind in the worst way — MiniLM's cosine noise
+    /// floor (0.25-0.45 for unrelated pairs) sits exactly where calibrated
+    /// weak BM25 matches land, so enabling semantic search effectively
+    /// switched BM25 off for the whole vector neighborhood. Ranks cannot
+    /// override each other's scale; they only add. The reranker consumes
+    /// this as its relevance input with unchanged weights.
+    ///
+    /// Explicit filters (`memory_type`/`tags`/`before`) apply to vector-only
+    /// candidates too — the vector path must not bypass them.
     ///
     /// Returns `bm25` unchanged when the embedder is absent or embedding fails.
     #[cfg(feature = "semantic")]
@@ -362,7 +482,6 @@ impl EmbeddingService {
         project_id: &str,
         bm25: Vec<SearchResult>,
         top_k: usize,
-        rrf_k: f32,
         memory_type: Option<&str>,
         tags: &[String],
         before: Option<i64>,
@@ -397,22 +516,23 @@ impl EmbeddingService {
             .iter()
             .map(|(id, ty, _)| (id.clone(), ty.clone()))
             .collect();
-        let cands: Vec<(String, Vec<f32>)> = loaded
-            .iter()
-            .map(|(id, _, v)| (id.clone(), v.clone()))
-            .collect();
-        let cosine_of: HashMap<String, f32> =
-            crate::retrieval::vector::top_k_cosine(&query_vec, &cands, top_k)
-                .into_iter()
-                .collect();
+        // Borrow the vectors instead of cloning every one (the old path
+        // duplicated the whole project's blobs per query). `cosine_ranked`
+        // keeps top_k_cosine's descending order — the vector ARM ranking.
+        let cosine_ranked = crate::retrieval::vector::top_k_cosine(
+            &query_vec,
+            loaded.iter().map(|(id, _, v)| (id.as_str(), v.as_slice())),
+            top_k,
+        );
 
         // Materialize vector-only candidates that survive the caller's
         // explicit filters, exactly like the BM25 side did.
         let bm25_ids: Vec<String> = bm25.iter().map(|r| r.id.clone()).collect();
         let mut by_id: HashMap<String, SearchResult> =
             bm25.into_iter().map(|r| (r.id.clone(), r)).collect();
-        let missing: Vec<(String, String)> = cosine_of
-            .keys()
+        let missing: Vec<(String, String)> = cosine_ranked
+            .iter()
+            .map(|(id, _)| id)
             .filter(|id| !by_id.contains_key(*id))
             .filter_map(|id| type_of.get(id).map(|ty| (ty.clone(), id.clone())))
             .collect();
@@ -425,16 +545,36 @@ impl EmbeddingService {
             }
         }
 
-        // Inject cosine into relevance: take the max with the normalized BM25
-        // score so either signal at full strength carries the result.
-        for (id, cosine) in &cosine_of {
-            if let Some(r) = by_id.get_mut(id) {
-                r.relevance_score = r.relevance_score.max(cosine.clamp(0.0, 1.0));
-            }
+        // RRF relevance: the BM25 arm ranks by the caller's input order
+        // (BM25-sorted — filters retain order), the vector arm by cosine
+        // order. Candidates absent from an arm keep the other arm alone.
+        let bm25_rank_of: HashMap<&str, usize> = bm25_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (id.as_str(), rank))
+            .collect();
+        let cosine_rank_of: HashMap<&str, usize> = cosine_ranked
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .enumerate()
+            .map(|(rank, id)| (id, rank))
+            .collect();
+        for (id, r) in by_id.iter_mut() {
+            r.relevance_score = crate::retrieval::fusion::rrf_two_arm(
+                bm25_rank_of.get(id.as_str()).copied(),
+                cosine_rank_of.get(id.as_str()).copied(),
+            );
         }
 
-        let vec_ids: Vec<String> = cosine_of.into_keys().collect();
-        let fused = crate::retrieval::fusion::rrf_fuse(&[bm25_ids, vec_ids], rrf_k);
+        // Deterministic merged order by the same RRF (tie-break only — the
+        // caller re-sorts). vec_ids in COSINE order, not HashMap order: the
+        // arm's ranks must be real ranks, and HashMap iteration order would
+        // leak random per-process tie-breaks into the caller's stable sort.
+        let vec_ids: Vec<String> = cosine_ranked.into_iter().map(|(id, _)| id).collect();
+        let fused = crate::retrieval::fusion::rrf_fuse(
+            &[bm25_ids, vec_ids],
+            crate::retrieval::fusion::RRF_K,
+        );
         Ok(fused
             .into_iter()
             .filter_map(|id| by_id.remove(&id))
@@ -499,12 +639,9 @@ mod tests {
     }
 
     #[test]
-    fn fuse_materializes_vector_hits_and_injects_cosine() {
+    fn fuse_materializes_vector_hits_with_rrf_relevance() {
         let repo = MemoryRepository::new_in_memory().unwrap();
         repo.initialize_schema().unwrap();
-        // "rust language features" is the vector target; the query shares its
-        // bytes but BM25 misses it via a tag-only FTS mismatch is hard to
-        // force — instead assert on the union + score-injection directly.
         let target = mem("v1", "rust language features");
         repo.create_episodic(&target).unwrap();
         let other = mem("v2", "completely unrelated words");
@@ -527,7 +664,9 @@ mod tests {
         assert_eq!(bm25[0].id, "v2");
 
         // Query embedding equals v1's embedding (same text) → v1 must be
-        // materialized as a vector-only hit with cosine ~1.0 injected.
+        // materialized as a vector-only hit. Under two-arm RRF a single-arm
+        // candidate at rank 0 scores exactly 0.5 (the single-signal ceiling:
+        // half the possible evidence), NOT the old max()'s cosine ~1.0.
         let fused = svc
             .fuse(
                 &repo,
@@ -535,7 +674,6 @@ mod tests {
                 "p",
                 bm25,
                 5,
-                60.0,
                 None,
                 &[],
                 None,
@@ -544,9 +682,71 @@ mod tests {
         assert_eq!(fused.len(), 2, "vector-only hit must be materialized");
         let v1 = fused.iter().find(|r| r.id == "v1").unwrap();
         assert!(
-            v1.relevance_score > 0.99,
-            "cosine of an identical text must inject ~1.0 relevance, got {}",
+            (v1.relevance_score - 0.5).abs() < 1e-4,
+            "single-arm rank-0 candidate must score the 0.5 ceiling, got {}",
             v1.relevance_score
+        );
+        // v2 is BM25 rank 0 AND present in the vector list (rank 1 of 2):
+        // dual evidence must outrank the vector-only perfect match.
+        let v2 = fused.iter().find(|r| r.id == "v2").unwrap();
+        let expected_v2 = crate::retrieval::fusion::rrf_two_arm(Some(0), Some(1));
+        assert!(
+            (v2.relevance_score - expected_v2).abs() < 1e-4,
+            "dual-evidence candidate must score rrf(bm25=0, cosine=1) = {expected_v2}, got {}",
+            v2.relevance_score
+        );
+        assert!(v2.relevance_score > v1.relevance_score);
+    }
+
+    #[test]
+    fn fuse_balances_arms_instead_of_letting_cosine_override_bm25() {
+        // End-to-end (stub embedder, no model download) version of the
+        // fusion.rs shootout: a candidate with BOTH a BM25 rank and a
+        // (weaker) cosine rank must outrank a candidate whose only evidence
+        // is the top cosine slot — the exact ordering max-injection got
+        // wrong when the cosine leader was a noise-floor neighbor.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        // "textual": the true lexical match (BM25 rank 0). "neighbor":
+        // query-identical text → cosine 1.0, but no BM25 hit for the query.
+        repo.create_episodic(&mem("textual", "textual evidence match"))
+            .unwrap();
+        repo.create_episodic(&mem("neighbor", "query twin words here"))
+            .unwrap();
+
+        let svc = EmbeddingService::with_embedder(Box::new(StubEmbedder));
+        svc.index(&repo, "episodic", "textual", "p", "textual evidence match");
+        svc.index(&repo, "episodic", "neighbor", "p", "query twin words here");
+
+        let bm25 = crate::retrieval::bm25::BM25Retriever::search_by_type(
+            &repo, "textual", "p", "episodic", 10,
+        )
+        .unwrap();
+        assert_eq!(bm25[0].id, "textual");
+
+        // Query embeds to the neighbor's exact vector (cosine 1.0 → vector
+        // rank 0) while "textual" keeps only its BM25 arm plus a weak cosine.
+        let fused = svc
+            .fuse(
+                &repo,
+                "query twin words here",
+                "p",
+                bm25,
+                5,
+                None,
+                &[],
+                None,
+            )
+            .unwrap();
+        let textual = fused.iter().find(|r| r.id == "textual").unwrap();
+        let neighbor = fused.iter().find(|r| r.id == "neighbor").unwrap();
+        // Measured arm ranks: textual = (bm25 0, cosine 1); neighbor =
+        // (bm25 absent, cosine 0). Dual evidence must win.
+        assert!(
+            textual.relevance_score > neighbor.relevance_score,
+            "RRF must rank the dual-evidence match ({}) above the cosine-only twin ({})",
+            textual.relevance_score,
+            neighbor.relevance_score
         );
     }
 
@@ -569,7 +769,6 @@ mod tests {
                 "p",
                 vec![],
                 5,
-                60.0,
                 Some("failure"), // user asked for failures only
                 &[],
                 None,
@@ -594,15 +793,62 @@ mod tests {
         svc.index(&repo, "episodic", "v1", "p", "alpha");
         // Prime the cache with an empty vector set.
         let _ = svc
-            .fuse(&repo, "alpha", "p", vec![], 5, 60.0, None, &[], None)
+            .fuse(&repo, "alpha", "p", vec![], 5, None, &[], None)
             .unwrap();
         svc.index(&repo, "episodic", "v2", "p", "beta");
         let fused = svc
-            .fuse(&repo, "beta", "p", vec![], 5, 60.0, None, &[], None)
+            .fuse(&repo, "beta", "p", vec![], 5, None, &[], None)
             .unwrap();
         assert!(
             fused.iter().any(|r| r.id == "v2"),
             "cache must reflect the newly indexed vector"
+        );
+    }
+
+    #[test]
+    fn vector_cache_reloads_when_another_process_writes() {
+        // Cross-process invalidation: a DIFFERENT repository handle (standing
+        // in for the CLI process) commits an embedding after this service
+        // cached its vector set. No in-process invalidation fires, but
+        // `PRAGMA data_version` moves — the next search must reload instead of
+        // serving the stale set forever.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("vectors.db");
+        let repo = MemoryRepository::new(&db).unwrap();
+        repo.initialize_schema().unwrap();
+        repo.create_episodic(&mem("v1", "alpha words")).unwrap();
+        repo.create_episodic(&mem("v2", "beta words")).unwrap();
+
+        let svc = EmbeddingService::with_embedder(Box::new(StubEmbedder));
+        svc.index(&repo, "episodic", "v1", "p", "alpha words");
+        // Prime the cache: only v1 is embedded at this point.
+        let first = svc
+            .fuse(&repo, "beta", "p", vec![], 5, None, &[], None)
+            .unwrap();
+        assert!(
+            !first.iter().any(|r| r.id == "v2"),
+            "precondition: v2 has no vector yet"
+        );
+
+        // "Another process" writes v2's embedding through its own connection.
+        let repo2 = MemoryRepository::new(&db).unwrap();
+        repo2
+            .upsert_embedding(
+                "v2",
+                "episodic",
+                "p",
+                &[0.1, 0.2, 0.3, 0.4],
+                "stub-model",
+                4,
+            )
+            .unwrap();
+
+        let fused = svc
+            .fuse(&repo, "beta", "p", vec![], 5, None, &[], None)
+            .unwrap();
+        assert!(
+            fused.iter().any(|r| r.id == "v2"),
+            "data_version bump from the other process must trigger a reload"
         );
     }
 }

@@ -12,7 +12,9 @@ pub struct CommitEvent {
     pub timestamp: i64,
 }
 
-/// Git integration for monitoring commits and auto-generating memories.
+/// Git integration: read-only access to a repository's commit history for
+/// ingest (`ingest_commits`) and bootstrap collection. (The file was renamed
+/// from `listener.rs` — nothing here listens; every consumer polls history.)
 pub struct GitIntegration {
     repo: gix::Repository,
 }
@@ -139,53 +141,6 @@ impl GitIntegration {
 
         Ok(files)
     }
-
-    /// Auto-generate an episodic memory from a commit event.
-    ///
-    /// Creates a summary from the commit message and records
-    /// files touched and the commit hash.
-    pub fn auto_generate_episodic(
-        &self,
-        event: &CommitEvent,
-        project_id: &str,
-        session_id: &str,
-    ) -> EpisodicMemory {
-        let now = chrono::Utc::now().timestamp();
-
-        // Tag the provenance so ingest-produced memories are distinguishable
-        // from bootstrap / manual ones (see docs/bootstrap.md convention).
-        let mut tags = extract_tags(&event.message);
-        tags.push("source:ingest".into());
-
-        EpisodicMemory {
-            id: uuid::Uuid::new_v4().to_string(),
-            project_id: project_id.to_string(),
-            session_id: session_id.to_string(),
-            summary: event.message.lines().next().unwrap_or("").to_string(),
-            content: event.message.clone(),
-            files_touched: event.files_changed.clone(),
-            related_commits: vec![event.commit_hash.clone()],
-            importance: estimate_importance(&event.message),
-            tags,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    /// Process recent commits and generate episodic memories for each.
-    pub fn process_recent_commits(
-        &self,
-        project_id: &str,
-        session_id: &str,
-        count: usize,
-    ) -> Result<Vec<EpisodicMemory>> {
-        let commits = self.get_recent_commits(count)?;
-        let memories = commits
-            .iter()
-            .map(|event| self.auto_generate_episodic(event, project_id, session_id))
-            .collect();
-        Ok(memories)
-    }
 }
 
 /// Distill (already deduped) commit events into ONE episodic memory per
@@ -304,120 +259,10 @@ fn push_path(files: &mut Vec<String>, location: &gix::bstr::BString) {
     }
 }
 
-/// Estimate importance of a commit based on message keywords.
-/// Uses max-score strategy instead of sequential override to avoid
-/// "fix: update docs" being classified as docs (0.2) instead of fix (0.7).
-/// Keywords match on word boundaries so "fixture" ≠ "fix", "perfect" ≠ "perf".
-fn estimate_importance(message: &str) -> f32 {
-    let lower = message.to_lowercase();
-    let mut max_score: f32 = 0.3;
-
-    if has_word(&lower, "fix") || has_word(&lower, "bug") || has_word(&lower, "patch") {
-        max_score = max_score.max(0.7);
-    }
-    if has_word(&lower, "refactor") || has_word(&lower, "rewrite") {
-        max_score = max_score.max(0.6);
-    }
-    if lower.contains("breaking") || has_word(&lower, "migration") {
-        max_score = max_score.max(0.9);
-    }
-    if has_word(&lower, "docs") || has_word(&lower, "comment") {
-        max_score = max_score.max(0.2);
-    }
-    if has_word(&lower, "test") {
-        max_score = max_score.max(0.4);
-    }
-
-    max_score
-}
-
-/// Extract tags from a commit message based on common prefixes.
-/// Word-boundary matching: "docker" must not produce a docs tag via "doc".
-fn extract_tags(message: &str) -> Vec<String> {
-    let lower = message.to_lowercase();
-    let mut tags = Vec::new();
-
-    if has_word(&lower, "fix") || has_word(&lower, "bug") {
-        tags.push("bugfix".into());
-    }
-    if has_word(&lower, "feat") || has_word(&lower, "feature") {
-        tags.push("feature".into());
-    }
-    if has_word(&lower, "refactor") {
-        tags.push("refactor".into());
-    }
-    if has_word(&lower, "perf") || has_word(&lower, "performance") {
-        tags.push("performance".into());
-    }
-    if has_word(&lower, "security") || has_word(&lower, "cve") {
-        tags.push("security".into());
-    }
-    if has_word(&lower, "doc") || has_word(&lower, "docs") {
-        tags.push("docs".into());
-    }
-    if has_word(&lower, "test") {
-        tags.push("test".into());
-    }
-    if has_word(&lower, "deploy") || has_word(&lower, "release") {
-        tags.push("deployment".into());
-    }
-
-    tags
-}
-
-/// Case-folded whole-word containment on a lowercased haystack.
-fn has_word(haystack_lower: &str, word: &str) -> bool {
-    let bytes = haystack_lower.as_bytes();
-    haystack_lower.match_indices(word).any(|(i, _)| {
-        let end = i + word.len();
-        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
-        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphabetic();
-        before_ok && after_ok
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git_integration::{add_commit, make_test_repo};
-
-    #[test]
-    fn test_estimate_importance() {
-        assert!(estimate_importance("fix: resolve auth bug") > 0.5);
-        assert!(estimate_importance("docs: update README") < 0.4);
-        assert!(estimate_importance("feat: breaking migration") > 0.8);
-        assert!(estimate_importance("chore: update deps") >= 0.3);
-    }
-
-    #[test]
-    fn test_extract_tags() {
-        let tags = extract_tags("fix: resolve auth bug and update docs");
-        assert!(tags.contains(&"bugfix".to_string()));
-        assert!(tags.contains(&"docs".to_string()));
-    }
-
-    #[test]
-    fn test_auto_generate_episodic() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let repo_path = temp_dir.path();
-        make_test_repo(
-            repo_path,
-            "test.txt",
-            "hello",
-            "feat: add initial test file",
-        );
-
-        let git = GitIntegration::new(repo_path).unwrap();
-        let commits = git.get_recent_commits(10).unwrap();
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].files_changed, vec!["test.txt"]);
-
-        let episodic = git.auto_generate_episodic(&commits[0], "test-project", "session-1");
-        assert_eq!(episodic.project_id, "test-project");
-        assert_eq!(episodic.summary, "feat: add initial test file");
-        assert!(episodic.tags.contains(&"feature".to_string()));
-        assert!(episodic.files_touched.contains(&"test.txt".to_string()));
-    }
 
     #[test]
     fn test_recent_commits_diff_against_parent() {

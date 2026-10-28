@@ -6,11 +6,9 @@
 //! stored as memories. The agent turns each milestone into at most one
 //! high-value episodic memory instead of N noisy ones.
 
-use crate::git_integration::{CommitEvent, GitIntegration};
-use anyhow::Result;
+use crate::git_integration::CommitEvent;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 
 use super::CollectOptions;
 
@@ -73,18 +71,11 @@ impl From<&CommitEvent> for CommitRef {
     }
 }
 
-/// Collect git evidence. Returns an empty collection (not an error) if the
-/// path isn't a git repo — `collect()` reports that as a note.
-pub fn collect(repo_path: &Path, opts: &CollectOptions) -> Result<GitCollection> {
-    let git = GitIntegration::new(repo_path)?;
-    let events = git.get_recent_commits(opts.max_commits)?;
-    Ok(collect_from_events(&events, opts))
-}
-
 /// Collect git evidence from pre-walked commit events. The orchestrating
-/// `collect()` walks the history ONCE and shares the events between the git
-/// and failures dimensions — two independent walks doubled the full-history
-/// traversal cost.
+/// `collectors::collect` walks the history ONCE and shares the events between
+/// the git and failures dimensions — two independent walks doubled the
+/// full-history traversal cost. (The path-is-not-a-repo case is handled
+/// upstream and reported as a note.)
 pub fn collect_from_events(events: &[CommitEvent], opts: &CollectOptions) -> GitCollection {
     let mut skipped = 0usize;
     let fresh: Vec<&CommitEvent> = events
@@ -364,7 +355,7 @@ mod tests {
 
     #[test]
     fn cluster_groups_by_type_and_scope() {
-        use crate::git_integration::{add_commit, make_test_repo};
+        use crate::git_integration::{add_commit, make_test_repo, GitIntegration};
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         make_test_repo(p, "a.txt", "1", "feat(auth): login");
@@ -373,7 +364,10 @@ mod tests {
         add_commit(p, "c.txt", "4", "docs: readme");
 
         let opts = CollectOptions::default();
-        let col = collect(p, &opts).unwrap();
+        let events = GitIntegration::new(p)
+            .and_then(|g| g.get_recent_commits(opts.max_commits))
+            .unwrap();
+        let col = collect_from_events(&events, &opts);
         // 4 themes: feat:auth, fix, docs, plus the initial `feat(auth)` root
         // commit doubles up — assert the auth theme has 2 commits.
         let auth = col
@@ -386,17 +380,18 @@ mod tests {
 
     #[test]
     fn collect_skips_ingested_commits() {
-        use crate::git_integration::make_test_repo;
+        use crate::git_integration::{make_test_repo, GitIntegration};
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         make_test_repo(p, "a.txt", "1", "feat: one");
 
         let git = GitIntegration::new(p).unwrap();
-        let first_hash = git.get_recent_commits(1).unwrap()[0].commit_hash.clone();
+        let events = git.get_recent_commits(200).unwrap();
+        let first_hash = events[0].commit_hash.clone();
 
         let mut opts = CollectOptions::default();
         opts.ingested_commit_hashes.insert(first_hash);
-        let col = collect(p, &opts).unwrap();
+        let col = collect_from_events(&events, &opts);
         assert_eq!(col.skipped_ingested, 1);
         assert!(col.recent_commits.is_empty());
     }

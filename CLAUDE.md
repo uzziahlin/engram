@@ -29,7 +29,7 @@
 
 ### 搜索技巧（`search_memory`）
 
-- **自然语言 query**（如「如何调试认证」）→ 按意图路由到相关记忆类型（降噪）
+- **自然语言 query**（如「如何调试认证」）→ 意图分类**软调权**：始终检索全部四类记忆，Debugging 查询抬升 relevance 权重让 failure 更容易靠前（不做硬路由——硬过滤损失召回）
 - **标识符 query**（tag / 文件名 / 符号，如 `auth-utils`、`unique-tag-test-xyz`）→ 全查所有类型（保召回），直接传原文、不要拆词
 - **找不到时**：换 query 形态（自然语言 ↔ 标识符）、放宽措辞、或用 `related_files` 从文件反查关联记忆
 - **反馈工具**：`query_stats` 看哪些 query 命中率低（低 = 该补相关记忆）；`recent_failures` 改 bug 前查同类故障避免重复踩坑

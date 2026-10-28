@@ -40,12 +40,29 @@ fn run_mcp_server() -> anyhow::Result<()> {
     repo.initialize_schema()?;
     tracing::info!("SQLite schema initialized");
 
+    let use_http = config.http.enabled;
     let worker_threads = config.mcp.worker_threads;
+    let http_bind = config.http.bind.clone();
+    let http_token = config.http.auth_token.clone();
     let provider = Arc::new(DefaultMemoryProvider::new(repo, config));
 
     let server = McpServer::with_provider_and_workers(provider, worker_threads);
-    tracing::info!("Starting engram MCP server on stdio ({worker_threads} workers)...");
-    Arc::new(server).run()?;
+    if use_http {
+        // Optional Streamable-HTTP transport ([http] enabled + token, which
+        // Config::load has already validated). Same handler as stdio; the
+        // transports differ only in framing (see src/mcp/http.rs). The
+        // worker count must be passed through: HTTP serializes handler
+        // calls through the same bounded dispatcher as stdio, so the log
+        // line must describe both reader and worker counts truthfully.
+        tracing::info!(
+            "Starting engram MCP server on HTTP {http_bind} ({} accept readers + {worker_threads} workers, token auth)...",
+            engram::mcp::http::ACCEPT_READERS
+        );
+        engram::mcp::http::run_http(Arc::new(server), &http_bind, &http_token, worker_threads)?;
+    } else {
+        tracing::info!("Starting engram MCP server on stdio ({worker_threads} workers)...");
+        Arc::new(server).run()?;
+    }
 
     Ok(())
 }

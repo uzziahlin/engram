@@ -1,10 +1,10 @@
 //! Entity graph: files/tools touched by memories, their relations, and the
 //! neighbor queries that let the graph participate in retrieval.
 
-use super::repository::{MemoryRepository, RelatedFileEdge};
+use super::repository::{MemoryKind, MemoryRepository, RelatedFileEdge, RelatedMemory};
 use crate::models::{Entity, GraphRelation};
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 impl MemoryRepository {
     // ─── Entity Linking Helper ────────────────────────────────────
@@ -53,6 +53,12 @@ impl MemoryRepository {
     }
 
     // ─── Graph-participating retrieval ────────────────────────────
+    /// Memory ids that share a graph entity (file/tool) with any of the
+    /// `seed` memories — the relationship graph's contribution to retrieval.
+    /// Returns `(memory_type, id)` pairs, at most `limit`, excluding seeds.
+    /// Only ACTIVE memories are returned: candidate ids are probed against
+    /// the main tables in ONE batched query per kind (the old path ran a
+    /// 4-EXISTS probe per id — four correlated subqueries per candidate).
     pub fn neighbor_memories(
         &self,
         project_id: &str,
@@ -69,7 +75,8 @@ impl MemoryRepository {
              FROM graph_relations r1 \
              JOIN graph_relations r2 \
                ON r1.to_entity = r2.to_entity AND r2.from_entity <> r1.from_entity \
-             WHERE (?1 = '*' OR r1.project_id = ?1) AND r2.project_id = ?1 \
+             WHERE (?1 = '*' OR r1.project_id = ?1) \
+               AND (?1 = '*' OR r2.project_id = ?1) \
                AND r1.from_entity IN ({placeholders}) \
              LIMIT {limit2}",
             limit2 = limit * 4, // over-fetch; type resolution drops non-memories
@@ -84,32 +91,50 @@ impl MemoryRepository {
             .query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        // Resolve each id to its (active) memory type.
+        // Resolve ids to (active) memories: one IN-batch probe per kind.
+        // Memory ids are UUIDs unique across kinds, so an id can match at
+        // most one kind; `seen` keeps a kind-ambiguous id from being
+        // reported twice anyway.
+        let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut kinds: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
+        for kind in MemoryKind::all() {
+            let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id FROM {} WHERE id IN ({ph}) AND archived_at IS NULL",
+                kind.table()
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            for id in stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))? {
+                let id = id?;
+                if active.insert(id.clone()) {
+                    kinds.insert(id, kind.as_str());
+                }
+            }
+        }
         let mut out = Vec::new();
         for id in ids {
             if out.len() >= limit {
                 break;
             }
-            let ty: Option<String> = conn.query_row(
-                "SELECT CASE \
-                    WHEN EXISTS (SELECT 1 FROM episodic_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'episodic' \
-                    WHEN EXISTS (SELECT 1 FROM decision_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'decision' \
-                    WHEN EXISTS (SELECT 1 FROM failure_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'failure' \
-                    WHEN EXISTS (SELECT 1 FROM procedural_memories m WHERE m.id = ?1 AND m.archived_at IS NULL) THEN 'procedural' \
-                 END",
-                params![id],
-                |r| r.get(0),
-            ).unwrap_or(None);
-            if let Some(ty) = ty {
-                out.push((ty, id));
+            if let Some(kind) = kinds.get(&id) {
+                out.push((kind.to_string(), id));
             }
         }
         Ok(out)
     }
 
-    /// Most recent ACTIVE episodic memory for a (project, session) pair —
-    /// used by session-import to make repeated hook firings idempotent
     // ─── Orphan entity GC ─────────────────────────────────────────
+    /// Physically delete File/Tool entities that no relation references
+    /// anymore. Memories' own entities (type `Memory`) and entities still
+    /// attached to any edge are preserved. Returns the number removed
+    /// (or that would be removed, when `apply=false`).
+    ///
+    /// Before this, deleted/archived memories left their File/Tool entities
+    /// and edges behind forever — the entity table grew unboundedly and
+    /// `related_files` results filled with orphan noise.
     pub fn gc_orphan_entities(&self, apply: bool) -> Result<usize> {
         let conn = self.conn()?;
         let orphan_sql = "SELECT COUNT(*) FROM entities e \
@@ -120,7 +145,8 @@ impl MemoryRepository {
             let n: i64 = conn.query_row(orphan_sql, [], |r| r.get(0))?;
             return Ok(n as usize);
         }
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = tx.execute(
             "DELETE FROM entities WHERE id IN ( \
                 SELECT e.id FROM entities e \
@@ -201,8 +227,8 @@ impl MemoryRepository {
     }
 
     pub fn remove_entity(&self, id: &str) -> Result<bool> {
-        let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Delete related relations first to satisfy foreign key constraints
         tx.execute(
             "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
@@ -214,8 +240,8 @@ impl MemoryRepository {
     }
 
     pub fn create_relation(&self, rel: &GraphRelation) -> Result<()> {
-        let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO graph_relations (project_id, from_entity, to_entity, relation_type, weight, created_at)
              VALUES (?1,?2,?3,?4,?5,?6)",
@@ -301,6 +327,63 @@ impl MemoryRepository {
         };
 
         Ok((entity_id, edges))
+    }
+
+    /// The ACTIVE memories that touch a file, with their type and a
+    /// human-readable label — the consumable form of `related_files_for`.
+    ///
+    /// The old tool output listed neighbor entity NAMES, which for Memory
+    /// entities are memory UUIDs: agents could not act on them (get_memory
+    /// needs a type, and a bare uuid tells the agent nothing). This joins
+    /// each Memory neighbor back to its main-table row for type + label.
+    /// Non-memory neighbors (File/Tool entities) are not included here.
+    pub fn related_memories_for_file(
+        &self,
+        file_name: &str,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RelatedMemory>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT mtype, mid, label, rel FROM ( \
+                SELECT o.name AS mid, r.relation_type AS rel, \
+                    CASE \
+                        WHEN EXISTS (SELECT 1 FROM episodic_memories x WHERE x.id = o.name AND x.archived_at IS NULL) THEN 'episodic' \
+                        WHEN EXISTS (SELECT 1 FROM decision_memories x WHERE x.id = o.name AND x.archived_at IS NULL) THEN 'decision' \
+                        WHEN EXISTS (SELECT 1 FROM failure_memories x WHERE x.id = o.name AND x.archived_at IS NULL) THEN 'failure' \
+                        WHEN EXISTS (SELECT 1 FROM procedural_memories x WHERE x.id = o.name AND x.archived_at IS NULL) THEN 'procedural' \
+                    END AS mtype, \
+                    COALESCE( \
+                        (SELECT summary FROM episodic_memories WHERE id = o.name), \
+                        (SELECT title FROM decision_memories WHERE id = o.name), \
+                        (SELECT incident FROM failure_memories WHERE id = o.name), \
+                        (SELECT workflow_name FROM procedural_memories WHERE id = o.name) \
+                    ) AS label \
+                FROM entities e \
+                JOIN graph_relations r \
+                  ON r.from_entity = e.id OR r.to_entity = e.id \
+                JOIN entities o \
+                  ON o.id = CASE WHEN r.from_entity = e.id \
+                                 THEN r.to_entity ELSE r.from_entity END \
+                WHERE e.name = ?1 AND e.project_id = ?2 AND e.entity_type = 'File' \
+                  AND o.entity_type = 'Memory' \
+             ) WHERE mtype IS NOT NULL \
+             ORDER BY mid \
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![file_name, project_id, limit], |row| {
+            Ok(RelatedMemory {
+                memory_type: row.get(0)?,
+                id: row.get(1)?,
+                label: row.get(2)?,
+                relation: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn remove_relation(&self, id: i64) -> Result<bool> {

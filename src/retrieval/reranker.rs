@@ -86,11 +86,9 @@ impl Reranker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::retrieval::planner::MemorySource;
 
     fn make_plan() -> RetrievalPlan {
         RetrievalPlan {
-            sources: vec![MemorySource::Episodic],
             relevance_weight: 0.4,
             recency_weight: 0.2,
             importance_weight: 0.6,
@@ -113,6 +111,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "2".into(),
@@ -123,6 +122,7 @@ mod tests {
                 created_at: 2000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
         ];
 
@@ -145,6 +145,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "1".into(),
@@ -155,6 +156,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
             SearchResult {
                 id: "2".into(),
@@ -165,6 +167,7 @@ mod tests {
                 created_at: 1000,
                 tags: vec![],
                 detail: serde_json::Value::Null,
+                project_id: "p".into(),
             },
         ];
 
@@ -184,6 +187,7 @@ mod tests {
             created_at,
             tags: vec![],
             detail: serde_json::Value::Null,
+            project_id: "p".into(),
         }
     }
 

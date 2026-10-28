@@ -138,7 +138,6 @@ mod tests {
         let c = SemanticConfig::default();
         assert!(!c.enabled);
         assert_eq!(c.model_id, "sentence-transformers/all-MiniLM-L6-v2");
-        assert_eq!(c.rrf_k, 60.0);
         assert_eq!(c.top_k, 50);
         assert!(c.model_path.is_none());
     }
@@ -279,6 +278,10 @@ impl McpConfig {
 
 /// Semantic / embedding retrieval config. Disabled by default to keep the
 /// release binary self-contained; only takes effect with `--features semantic`.
+///
+/// NOTE: the old `rrf_k` knob was removed — it had no observable effect
+/// (fusion is max-injection of cosine/BM25 and the reranker fully re-sorts).
+/// Configs still carrying `rrf_k` keep parsing; the key is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticConfig {
     #[serde(default)]
@@ -289,8 +292,6 @@ pub struct SemanticConfig {
     /// model is fetched on first run into `~/.engram/models/<model_id>`.
     #[serde(default)]
     pub model_path: Option<PathBuf>,
-    #[serde(default = "SemanticConfig::default_rrf_k")]
-    pub rrf_k: f32,
     #[serde(default = "SemanticConfig::default_top_k")]
     pub top_k: usize,
 }
@@ -301,7 +302,6 @@ impl Default for SemanticConfig {
             enabled: false,
             model_id: Self::default_model_id(),
             model_path: None,
-            rrf_k: Self::default_rrf_k(),
             top_k: Self::default_top_k(),
         }
     }
@@ -310,9 +310,6 @@ impl Default for SemanticConfig {
 impl SemanticConfig {
     fn default_model_id() -> String {
         "sentence-transformers/all-MiniLM-L6-v2".to_string()
-    }
-    fn default_rrf_k() -> f32 {
-        60.0
     }
     fn default_top_k() -> usize {
         50
@@ -328,12 +325,20 @@ pub struct ReflectionConfig {
     /// proposed. Default 3.
     #[serde(default = "ReflectionConfig::default_min_occurrences")]
     pub min_occurrences: usize,
+    /// Whether the AGENT may confirm pending suggestions via the MCP
+    /// `confirm_suggestion` tool. Default true (current behavior). Set false
+    /// to enforce the documented "awaiting human confirmation" model:
+    /// confirmation then happens only via `engram confirm-suggestion` on the
+    /// CLI, and the MCP tool refuses with guidance.
+    #[serde(default = "ReflectionConfig::default_agent_confirm")]
+    pub agent_confirm: bool,
 }
 
 impl Default for ReflectionConfig {
     fn default() -> Self {
         Self {
             min_occurrences: Self::default_min_occurrences(),
+            agent_confirm: Self::default_agent_confirm(),
         }
     }
 }
@@ -341,6 +346,9 @@ impl Default for ReflectionConfig {
 impl ReflectionConfig {
     fn default_min_occurrences() -> usize {
         3
+    }
+    fn default_agent_confirm() -> bool {
+        true
     }
 }
 
@@ -485,16 +493,8 @@ impl Config {
                  unauthenticated memory server"
             );
         }
-        if self.semantic.enabled || cfg!(feature = "semantic") {
-            if !self.semantic.rrf_k.is_finite() || self.semantic.rrf_k <= 0.0 {
-                anyhow::bail!(
-                    "semantic.rrf_k must be a positive number, got {}",
-                    self.semantic.rrf_k
-                );
-            }
-            if self.semantic.top_k == 0 {
-                anyhow::bail!("semantic.top_k must be >= 1, got 0");
-            }
+        if (self.semantic.enabled || cfg!(feature = "semantic")) && self.semantic.top_k == 0 {
+            anyhow::bail!("semantic.top_k must be >= 1, got 0");
         }
         Ok(())
     }

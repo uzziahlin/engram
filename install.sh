@@ -67,11 +67,15 @@ detect() {
 # --- resolve version (default: latest release) ---
 resolve_version() {
   VERSION="${ENGRAM_VERSION:-}"
+  # Users may pin with or without the leading 'v' (v0.6.0 or 0.6.0); strip it
+  # so the download URL is never .../download/vv0.6.0/...
+  VERSION="${VERSION#v}"
   if [ -z "$VERSION" ]; then
     info "Querying latest release..."
     VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
       | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1)"
-    [ -n "$VERSION" ] || die "Could not determine latest version (set ENGRAM_VERSION manually)"
+    [ -n "$VERSION" ] || die "Could not determine latest version (set ENGRAM_VERSION manually; \
+note anonymous GitHub API calls are rate-limited to 60/hour per IP)"
   fi
 }
 
@@ -85,17 +89,20 @@ download_and_install() {
   trap 'rm -rf "$TMP"' EXIT
   curl -fsSL -o "$TMP/$ASSET" "$URL" || die "Download failed: $URL"
 
-  # Optional checksum verification
-  if curl -fsSL -o "$TMP/$ASSET.sha256" "$URL.sha256" 2>/dev/null; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      (cd "$TMP" && sha256sum -c "$ASSET.sha256") >/dev/null 2>&1 || die "Checksum mismatch"
-      ok "Checksum verified"
-    elif command -v shasum >/dev/null 2>&1; then
-      (cd "$TMP" && shasum -a 256 -c "$ASSET.sha256") >/dev/null 2>&1 || die "Checksum mismatch"
-      ok "Checksum verified"
-    else
-      warn "No sha256 tool found; skipping checksum verification"
-    fi
+  # Checksum verification — fail-closed. For a `curl | sh` installer the
+  # checksum file is the only integrity guarantee; a MISSING .sha256 asset
+  # previously fell through silently and installed an unverified binary.
+  if ! curl -fsSL -o "$TMP/$ASSET.sha256" "$URL.sha256" 2>/dev/null; then
+    die "Checksum file not found: $URL.sha256 — refusing to install an unverified binary"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$TMP" && sha256sum -c "$ASSET.sha256") >/dev/null 2>&1 || die "Checksum mismatch"
+    ok "Checksum verified"
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$TMP" && shasum -a 256 -c "$ASSET.sha256") >/dev/null 2>&1 || die "Checksum mismatch"
+    ok "Checksum verified"
+  else
+    die "No sha256 tool found (need sha256sum or shasum) — cannot verify the download"
   fi
 
   case "$ARCHIVE" in

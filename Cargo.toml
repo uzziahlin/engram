@@ -46,6 +46,9 @@ toml = "0.8"
 dirs = "5"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.24"
+# SHA-256 of project ids for the unified FTS table's MATCH filter column:
+# a fixed-length [0-9a-f] token that survives the tokenizer untouched.
+sha2 = "0.10"
 jieba-rs = { version = "0.7", optional = true }
 # Minimal synchronous HTTP server for the optional MCP Streamable-HTTP
 # transport — deliberately NOT axum/tokio: engram is a no-async-runtime

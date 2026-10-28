@@ -1,8 +1,10 @@
+use crate::models::SanitizeMemory;
 use crate::models::*;
+use crate::storage::schema::UNIFIED_BM25_WEIGHTS;
 use anyhow::{Context, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -50,6 +52,18 @@ pub struct RelatedFileEdge {
     pub other_name: String,
     pub relation_type: String,
     pub direction: String,
+}
+
+/// An active memory touching a file, for `related_memories_for_file` / the
+/// MCP `related_files` tool. Unlike `RelatedFileEdge`, this carries the
+/// memory's TYPE and a readable label — agents can consume it directly
+/// (fetch more via `get_memory(memory_type, id)`) instead of a bare UUID.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelatedMemory {
+    pub memory_type: String,
+    pub id: String,
+    pub label: String,
+    pub relation: String,
 }
 
 /// Aggregated feedback for one distinct query string (for `query_stats`).
@@ -185,19 +199,244 @@ impl MemoryKind {
         }
     }
 
-    /// SQL expression concatenating the text columns used for dedup hashing.
-    pub fn dedup_text_expr(self) -> &'static str {
+    /// Slot of this kind in the unified-FTS rowid encoding. MUST stay in
+    /// `MemoryKind::all()` order and in lockstep with
+    /// [`MemoryRepository::encode_fts_rowid`] / `decode_fts_rowid`.
+    pub fn index(self) -> i64 {
         match self {
-            MemoryKind::Episodic => "summary || char(10) || content",
-            MemoryKind::Decision => {
-                "title || char(10) || context || char(10) || rationale || char(10) || tradeoffs"
-            }
-            MemoryKind::Failure => {
-                "incident || char(10) || root_cause || char(10) || fix || char(10) || prevention"
-            }
-            MemoryKind::Procedural => "workflow_name || char(10) || steps",
+            MemoryKind::Episodic => 0,
+            MemoryKind::Decision => 1,
+            MemoryKind::Failure => 2,
+            MemoryKind::Procedural => 3,
         }
     }
+
+    /// Inverse of [`Self::index`].
+    pub fn from_index(i: i64) -> Option<Self> {
+        match i {
+            0 => Some(MemoryKind::Episodic),
+            1 => Some(MemoryKind::Decision),
+            2 => Some(MemoryKind::Failure),
+            3 => Some(MemoryKind::Procedural),
+            _ => None,
+        }
+    }
+}
+
+/// Kind slots packed into the low bits of a unified-FTS rowid.
+pub(crate) const FTS_KIND_SLOTS: i64 = 4;
+
+/// Deterministic, collision-free pack of `(kind, main-table rowid)` into the
+/// single i64 rowid a contentless FTS5 table can be addressed by. The FTS
+/// table stores no column values, so this encoding is the ONLY way search
+/// materialization walks back to the owning main-table row.
+pub(crate) fn encode_fts_rowid(kind: MemoryKind, main_rowid: i64) -> i64 {
+    main_rowid * FTS_KIND_SLOTS + kind.index()
+}
+
+/// Inverse of [`encode_fts_rowid`]; `None` when the rowid is not in the
+/// encoding's range (corrupt / foreign row).
+pub(crate) fn decode_fts_rowid(fts_rowid: i64) -> Option<(MemoryKind, i64)> {
+    if fts_rowid < FTS_KIND_SLOTS {
+        return None;
+    }
+    let kind = MemoryKind::from_index(fts_rowid % FTS_KIND_SLOTS)?;
+    Some((kind, fts_rowid / FTS_KIND_SLOTS))
+}
+
+/// (title, body, tags) projection of an episodic memory for the unified FTS
+/// table. `files_json`/`tags_json` are the stored JSON strings — brackets and
+/// commas are tokenizer separators, so the JSON form yields the same tokens
+/// as a plain join and lets the live path and the backfill share ONE formula
+/// per kind. Keep in sync with the macro invocation sites.
+pub(crate) fn unified_doc_episodic(
+    summary: &str,
+    content: &str,
+    files_json: &str,
+    tags_json: &str,
+) -> (String, String, String) {
+    (
+        MemoryRepository::preprocess_cjk(summary),
+        MemoryRepository::preprocess_cjk(&format!("{content}\n{files_json}")),
+        MemoryRepository::preprocess_cjk(tags_json),
+    )
+}
+
+/// (title, body, tags) projection of a decision memory; see
+/// [`unified_doc_episodic`].
+pub(crate) fn unified_doc_decision(
+    title: &str,
+    context: &str,
+    rationale: &str,
+    tradeoffs: &str,
+    tags_json: &str,
+) -> (String, String, String) {
+    (
+        MemoryRepository::preprocess_cjk(title),
+        MemoryRepository::preprocess_cjk(&format!("{context}\n{rationale}\n{tradeoffs}")),
+        MemoryRepository::preprocess_cjk(tags_json),
+    )
+}
+
+/// (title, body, tags) projection of a failure memory; see
+/// [`unified_doc_episodic`].
+pub(crate) fn unified_doc_failure(
+    incident: &str,
+    root_cause: &str,
+    fix: &str,
+    prevention: &str,
+    tags_json: &str,
+) -> (String, String, String) {
+    (
+        MemoryRepository::preprocess_cjk(incident),
+        MemoryRepository::preprocess_cjk(&format!("{root_cause}\n{fix}\n{prevention}")),
+        MemoryRepository::preprocess_cjk(tags_json),
+    )
+}
+
+/// (title, body, tags) projection of a procedural memory; see
+/// [`unified_doc_episodic`].
+pub(crate) fn unified_doc_procedural(
+    workflow_name: &str,
+    steps_json: &str,
+    tools_json: &str,
+    tags_json: &str,
+) -> (String, String, String) {
+    (
+        MemoryRepository::preprocess_cjk(workflow_name),
+        MemoryRepository::preprocess_cjk(&format!("{steps_json}\n{tools_json}")),
+        MemoryRepository::preprocess_cjk(tags_json),
+    )
+}
+
+/// SHA-256 hex of a memory's dedup text — the value stored in the main
+/// tables' `content_hash` column and enforced unique per project among ACTIVE
+/// rows (partial unique indexes `idx_<table>_content_hash`, migration v10).
+/// sha256 over the full text: the unique index treats hash equality as text
+/// equality, so a collision-prone short digest would reject legitimate writes.
+pub(crate) fn content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Whether this error is SQLite rejecting a row through a UNIQUE constraint.
+/// This is the enforcement mechanism of the content-hash dedup (v10): the
+/// INSERT/UPDATE statement itself is the guard, replacing the old two-step
+/// `find_exact_duplicate` → write that two racing callers could both pass.
+pub(crate) fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(ffi, _)
+            if ffi.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
+/// Rust-side dedup-text concatenation per kind — the SAME byte sequence the
+/// old SQL `dedup_text_expr` produced (`col || char(10) || col`; columns are
+/// NOT NULL so SQL-NULL propagation never applied). One formula now lives
+/// here, shared by the hash write path (`create_*_dedup`, updates), the
+/// consolidation scan, and the v10 backfill. Keep the column ORDER in
+/// lockstep with the table DDL and these builders.
+pub(crate) fn dedup_text_episodic(summary: &str, content: &str) -> String {
+    format!("{summary}\n{content}")
+}
+
+/// See [`dedup_text_episodic`].
+pub(crate) fn dedup_text_decision(
+    title: &str,
+    context: &str,
+    rationale: &str,
+    tradeoffs: &str,
+) -> String {
+    format!("{title}\n{context}\n{rationale}\n{tradeoffs}")
+}
+
+/// See [`dedup_text_episodic`].
+pub(crate) fn dedup_text_failure(
+    incident: &str,
+    root_cause: &str,
+    fix: &str,
+    prevention: &str,
+) -> String {
+    format!("{incident}\n{root_cause}\n{fix}\n{prevention}")
+}
+
+/// See [`dedup_text_episodic`]. `steps` is the STORED JSON string of the step
+/// list (exactly what the `steps` column holds — the SQL form concatenated
+/// the raw column, not a re-serialized array).
+pub(crate) fn dedup_text_procedural(workflow_name: &str, steps_json: &str) -> String {
+    format!("{workflow_name}\n{steps_json}")
+}
+
+/// Type-erased active memory for batch id materialization (vector-only
+/// hits, graph neighbors) — see
+/// [`MemoryRepository::get_active_any_batch`].
+pub enum ActiveMemory {
+    Episodic(EpisodicMemory),
+    Decision(DecisionMemory),
+    Failure(FailureMemory),
+    Procedural(ProceduralMemory),
+}
+
+/// One BM25 hit from the unified index: encoded rowid + raw score.
+struct UnifiedFtsHit {
+    rowid: i64,
+    /// Raw `bm25()` output (negative, more negative = better). Kept in
+    /// FTS5's own sign convention so `ScoredMemory` consumers see the same
+    /// scale the per-type tables used to produce.
+    raw: f64,
+}
+
+/// Typed result buckets of a unified search ([`MemoryRepository::search_unified`]).
+/// Order inside each bucket is BM25 rank order; `bm25_score` is the RAW
+/// unified score — comparable across buckets, which is the whole point of
+/// the unified table.
+#[derive(Default)]
+pub struct UnifiedHits {
+    pub episodic: Vec<ScoredMemory<EpisodicMemory>>,
+    pub decisions: Vec<ScoredMemory<DecisionMemory>>,
+    pub failures: Vec<ScoredMemory<FailureMemory>>,
+    pub procedures: Vec<ScoredMemory<ProceduralMemory>>,
+}
+
+/// Shared body of the typed materializers: fill `by_rowid` from chunked
+/// batch queries, then emit `ScoredMemory`s in rank order. Module-level
+/// macro_rules must textually precede their first use.
+macro_rules! materialize_body {
+    ($conn:expr, $group:expr, $project_id:expr, $kind:expr, $rid_idx:literal, $mapper:expr) => {{
+        let mut by_rowid: std::collections::HashMap<i64, _> = std::collections::HashMap::new();
+        let rowids: Vec<i64> = $group.iter().map(|(r, _)| *r).collect();
+        for chunk in rowids.chunks(500) {
+            let (sql, boxed) = Self::unified_materialize_sql($kind, chunk, $project_id);
+            let params_ref: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = $conn.prepare(&sql)?;
+            let mapper = $mapper;
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok((row.get::<_, i64>($rid_idx)?, mapper(row)?))
+            })?;
+            for r in rows {
+                let (rid, mem) = r?;
+                by_rowid.insert(rid, mem);
+            }
+        }
+        let mut out = Vec::new();
+        for (rid, raw) in $group {
+            if let Some(mem) = by_rowid.get(rid) {
+                out.push(ScoredMemory {
+                    memory: mem.clone(),
+                    bm25_score: *raw,
+                });
+            }
+        }
+        Ok(out)
+    }};
 }
 
 /// Repository for all memory CRUD operations with FTS5 dual-write.
@@ -266,28 +505,43 @@ impl MemoryRepository {
         row = row,
         link_ts = link_ts,
         fts_rowid = fts_rowid,
+        hash = hash,
 
         struct_type = EpisodicMemory,
         table = "episodic_memories",
-        fts_table = "episodic_memories_fts",
+
+        kind_variant = Episodic,
+        kind_index = 0,
+        kind_str = "episodic",
+        unified_hits_field = episodic,
 
         create_fn = create_episodic,
+        create_dedup_fn = create_episodic_dedup,
         get_fn = get_episodic,
+        get_active_fn = get_active_episodic,
         update_fn = update_episodic,
         delete_fn = delete_episodic,
         search_fn = search_episodic,
         list_active_fn = list_active_episodic,
 
         select_cols = "id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at",
-        search_cols = "m.id, m.project_id, m.session_id, m.summary, m.content, m.files_touched, m.related_commits, m.importance, m.tags, m.created_at, m.updated_at",
 
-        insert_sql = "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        insert_sql = "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, files_touched, related_commits, importance, tags, created_at, updated_at, content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
 
-        fts_insert_sql = "INSERT INTO episodic_memories_fts (summary, content, files_touched, tags, rowid) VALUES (?1,?2,?3,?4,?5)",
+        unified_doc = {
+            unified_doc_episodic(
+                &mem.summary,
+                &mem.content,
+                &serde_json::to_string(&mem.files_touched)?,
+                &serde_json::to_string(&mem.tags)?,
+            )
+        },
 
-        update_sql = "UPDATE episodic_memories SET session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10 WHERE id=?1 AND project_id=?2",
+        dedup_text = {
+            dedup_text_episodic(&mem.summary, &mem.content)
+        },
 
-        score_col_idx = 11,
+        update_sql = "UPDATE episodic_memories SET session_id=?3, summary=?4, content=?5, files_touched=?6, related_commits=?7, importance=?8, tags=?9, updated_at=?10, content_hash=CASE WHEN content_hash IS NULL THEN NULL ELSE ?11 END WHERE id=?1 AND project_id=?2 AND archived_at IS NULL",
 
         insert_params = {
             params![
@@ -298,16 +552,7 @@ impl MemoryRepository {
                 mem.importance,
                 serde_json::to_string(&mem.tags)?,
                 mem.created_at, mem.updated_at,
-            ]
-        },
-
-        fts_params = {
-            params![
-                Self::preprocess_cjk(&mem.summary),
-                Self::preprocess_cjk(&mem.content),
-                Self::fts_json(&mem.files_touched)?,
-                Self::fts_json(&mem.tags)?,
-                fts_rowid,
+                hash,
             ]
         },
 
@@ -320,6 +565,7 @@ impl MemoryRepository {
                 mem.importance,
                 serde_json::to_string(&mem.tags)?,
                 mem.updated_at,
+                hash,
             ]
         },
 
@@ -355,28 +601,44 @@ impl MemoryRepository {
         row = row,
         link_ts = link_ts,
         fts_rowid = fts_rowid,
+        hash = hash,
 
         struct_type = DecisionMemory,
         table = "decision_memories",
-        fts_table = "decision_memories_fts",
+
+        kind_variant = Decision,
+        kind_index = 1,
+        kind_str = "decision",
+        unified_hits_field = decisions,
 
         create_fn = create_decision,
+        create_dedup_fn = create_decision_dedup,
         get_fn = get_decision,
+        get_active_fn = get_active_decision,
         update_fn = update_decision,
         delete_fn = delete_decision,
         search_fn = search_decisions,
         list_active_fn = list_active_decision,
 
         select_cols = "id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at",
-        search_cols = "m.id, m.project_id, m.title, m.context, m.rationale, m.tradeoffs, m.related_files, m.tags, m.importance, m.superseded_by, m.created_at, m.updated_at",
 
-        insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        insert_sql = "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at, content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
 
-        fts_insert_sql = "INSERT INTO decision_memories_fts (title, context, rationale, tradeoffs, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6)",
+        unified_doc = {
+            unified_doc_decision(
+                &mem.title,
+                &mem.context,
+                &mem.rationale,
+                &mem.tradeoffs,
+                &serde_json::to_string(&mem.tags)?,
+            )
+        },
 
-        update_sql = "UPDATE decision_memories SET title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, importance=?9, updated_at=?10, superseded_by=?11 WHERE id=?1 AND project_id=?2",
+        dedup_text = {
+            dedup_text_decision(&mem.title, &mem.context, &mem.rationale, &mem.tradeoffs)
+        },
 
-        score_col_idx = 12,
+        update_sql = "UPDATE decision_memories SET title=?3, context=?4, rationale=?5, tradeoffs=?6, related_files=?7, tags=?8, importance=?9, updated_at=?10, superseded_by=?11, content_hash=CASE WHEN content_hash IS NULL THEN NULL ELSE ?12 END WHERE id=?1 AND project_id=?2 AND archived_at IS NULL",
 
         insert_params = {
             params![
@@ -387,17 +649,7 @@ impl MemoryRepository {
                 mem.importance,
                 mem.superseded_by,
                 mem.created_at, mem.updated_at,
-            ]
-        },
-
-        fts_params = {
-            params![
-                Self::preprocess_cjk(&mem.title),
-                Self::preprocess_cjk(&mem.context),
-                Self::preprocess_cjk(&mem.rationale),
-                Self::preprocess_cjk(&mem.tradeoffs),
-                Self::fts_json(&mem.tags)?,
-                fts_rowid,
+                hash,
             ]
         },
 
@@ -410,6 +662,7 @@ impl MemoryRepository {
                 mem.importance,
                 mem.updated_at,
                 mem.superseded_by,
+                hash,
             ]
         },
 
@@ -446,28 +699,44 @@ impl MemoryRepository {
         row = row,
         link_ts = link_ts,
         fts_rowid = fts_rowid,
+        hash = hash,
 
         struct_type = FailureMemory,
         table = "failure_memories",
-        fts_table = "failure_memories_fts",
+
+        kind_variant = Failure,
+        kind_index = 2,
+        kind_str = "failure",
+        unified_hits_field = failures,
 
         create_fn = create_failure,
+        create_dedup_fn = create_failure_dedup,
         get_fn = get_failure,
+        get_active_fn = get_active_failure,
         update_fn = update_failure,
         delete_fn = delete_failure,
         search_fn = search_failures,
         list_active_fn = list_active_failure,
 
         select_cols = "id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at",
-        search_cols = "m.id, m.project_id, m.incident, m.root_cause, m.fix, m.prevention, m.severity, m.tags, m.created_at, m.updated_at",
 
-        insert_sql = "INSERT INTO failure_memories (id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        insert_sql = "INSERT INTO failure_memories (id, project_id, incident, root_cause, fix, prevention, severity, tags, created_at, updated_at, content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
 
-        fts_insert_sql = "INSERT INTO failure_memories_fts (incident, root_cause, fix, prevention, tags, rowid) VALUES (?1,?2,?3,?4,?5,?6)",
+        unified_doc = {
+            unified_doc_failure(
+                &mem.incident,
+                &mem.root_cause,
+                &mem.fix,
+                &mem.prevention,
+                &serde_json::to_string(&mem.tags)?,
+            )
+        },
 
-        update_sql = "UPDATE failure_memories SET incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9 WHERE id=?1 AND project_id=?2",
+        dedup_text = {
+            dedup_text_failure(&mem.incident, &mem.root_cause, &mem.fix, &mem.prevention)
+        },
 
-        score_col_idx = 10,
+        update_sql = "UPDATE failure_memories SET incident=?3, root_cause=?4, fix=?5, prevention=?6, severity=?7, tags=?8, updated_at=?9, content_hash=CASE WHEN content_hash IS NULL THEN NULL ELSE ?10 END WHERE id=?1 AND project_id=?2 AND archived_at IS NULL",
 
         insert_params = {
             params![
@@ -476,17 +745,7 @@ impl MemoryRepository {
                 mem.severity,
                 serde_json::to_string(&mem.tags)?,
                 mem.created_at, mem.updated_at,
-            ]
-        },
-
-        fts_params = {
-            params![
-                Self::preprocess_cjk(&mem.incident),
-                Self::preprocess_cjk(&mem.root_cause),
-                Self::preprocess_cjk(&mem.fix),
-                Self::preprocess_cjk(&mem.prevention),
-                Self::fts_json(&mem.tags)?,
-                fts_rowid,
+                hash,
             ]
         },
 
@@ -497,6 +756,7 @@ impl MemoryRepository {
                 mem.severity,
                 serde_json::to_string(&mem.tags)?,
                 mem.updated_at,
+                hash,
             ]
         },
 
@@ -524,28 +784,46 @@ impl MemoryRepository {
         row = row,
         link_ts = link_ts,
         fts_rowid = fts_rowid,
+        hash = hash,
 
         struct_type = ProceduralMemory,
         table = "procedural_memories",
-        fts_table = "procedural_memories_fts",
+
+        kind_variant = Procedural,
+        kind_index = 3,
+        kind_str = "procedural",
+        unified_hits_field = procedures,
 
         create_fn = create_procedural,
+        create_dedup_fn = create_procedural_dedup,
         get_fn = get_procedural,
+        get_active_fn = get_active_procedural,
         update_fn = update_procedural,
         delete_fn = delete_procedural,
         search_fn = search_procedural,
         list_active_fn = list_active_procedural,
 
         select_cols = "id, project_id, workflow_name, steps, related_tools, tags, importance, created_at, updated_at",
-        search_cols = "m.id, m.project_id, m.workflow_name, m.steps, m.related_tools, m.tags, m.importance, m.created_at, m.updated_at",
 
-        insert_sql = "INSERT INTO procedural_memories (id, project_id, workflow_name, steps, related_tools, tags, importance, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        insert_sql = "INSERT INTO procedural_memories (id, project_id, workflow_name, steps, related_tools, tags, importance, created_at, updated_at, content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
 
-        fts_insert_sql = "INSERT INTO procedural_memories_fts (workflow_name, steps, related_tools, tags, rowid) VALUES (?1,?2,?3,?4,?5)",
+        unified_doc = {
+            unified_doc_procedural(
+                &mem.workflow_name,
+                &serde_json::to_string(&mem.steps)?,
+                &serde_json::to_string(&mem.related_tools)?,
+                &serde_json::to_string(&mem.tags)?,
+            )
+        },
 
-        update_sql = "UPDATE procedural_memories SET workflow_name=?3, steps=?4, related_tools=?5, tags=?6, importance=?7, updated_at=?8 WHERE id=?1 AND project_id=?2",
+        dedup_text = {
+            dedup_text_procedural(
+                &mem.workflow_name,
+                &serde_json::to_string(&mem.steps)?,
+            )
+        },
 
-        score_col_idx = 9,
+        update_sql = "UPDATE procedural_memories SET workflow_name=?3, steps=?4, related_tools=?5, tags=?6, importance=?7, updated_at=?8, content_hash=CASE WHEN content_hash IS NULL THEN NULL ELSE ?9 END WHERE id=?1 AND project_id=?2 AND archived_at IS NULL",
 
         insert_params = {
             params![
@@ -555,16 +833,7 @@ impl MemoryRepository {
                 serde_json::to_string(&mem.tags)?,
                 mem.importance,
                 mem.created_at, mem.updated_at,
-            ]
-        },
-
-        fts_params = {
-            params![
-                Self::preprocess_cjk(&mem.workflow_name),
-                Self::fts_json(&mem.steps)?,
-                Self::fts_json(&mem.related_tools)?,
-                Self::fts_json(&mem.tags)?,
-                fts_rowid,
+                hash,
             ]
         },
 
@@ -576,6 +845,7 @@ impl MemoryRepository {
                 serde_json::to_string(&mem.tags)?,
                 mem.importance,
                 mem.updated_at,
+                hash,
             ]
         },
 
@@ -603,30 +873,603 @@ impl MemoryRepository {
         },
     }
 
+    // ─── Unified FTS search ────────────────────────────────────────
+
+    /// Search every memory kind through the ONE unified FTS table.
+    ///
+    /// All filtering happens inside the MATCH expression — business terms
+    /// (phrase-quoted by `sanitize_fts_query`, wrapped in parens so the
+    /// appended filters cannot bind into an OR arm), plus optional
+    /// `project:"<sha256-hex>"` / `kind:"<kind>"` column filters with bm25
+    /// weight 0. The AND-form runs first; on an empty result the OR-form
+    /// runs — ONE fallback decision over the whole corpus (the per-type
+    /// tables re-decided per kind, so one kind could match under AND
+    /// semantics while another fell back to OR).
+    ///
+    /// Hits are decoded (`kind = rowid % 4`) and materialized per kind in
+    /// batches. The main-table query re-checks `archived_at IS NULL` and the
+    /// project id — the index should never contain archived rows (archive
+    /// deletes them) and the hex filter should never leak a row, but the
+    /// main tables remain the authority.
+    /// Materialize `(memory_type, id)` pairs in ONE batched query per kind:
+    /// `get_active_*` per id was a round-trip per candidate. Same guards as
+    /// those getters — `project_id = '*'` matches any project, archived rows
+    /// never materialize. Unknown types are dropped; input order is kept.
+    pub fn get_active_any_batch(
+        &self,
+        ids: &[(String, String)],
+        project_id: &str,
+    ) -> Result<Vec<ActiveMemory>> {
+        use std::collections::HashMap;
+        let mut by_kind: HashMap<MemoryKind, Vec<&str>> = HashMap::new();
+        for (memory_type, id) in ids {
+            if let Ok(kind) = MemoryKind::from_type_str(memory_type) {
+                by_kind.entry(kind).or_default().push(id);
+            }
+        }
+        let mut by_id: HashMap<(MemoryKind, String), ActiveMemory> = HashMap::new();
+        let conn = self.conn()?;
+        for (kind, kind_ids) in by_kind {
+            for chunk in kind_ids.chunks(500) {
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT {} FROM {} WHERE id IN ({placeholders}) \
+                     AND archived_at IS NULL AND (?{} = '*' OR project_id = ?{})",
+                    Self::unified_select_cols(kind),
+                    kind.table(),
+                    chunk.len() + 1,
+                    chunk.len() + 1
+                );
+                let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = chunk
+                    .iter()
+                    .map(|i| Box::new(i.to_string()) as Box<dyn rusqlite::ToSql>)
+                    .collect();
+                params_vec.push(Box::new(project_id.to_string()));
+                let params_ref: Vec<&dyn rusqlite::ToSql> =
+                    params_vec.iter().map(|b| b.as_ref()).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                match kind {
+                    MemoryKind::Episodic => {
+                        for m in stmt.query_map(params_ref.as_slice(), Self::map_episodic_row)? {
+                            let m = m?;
+                            by_id.insert((kind, m.id.clone()), ActiveMemory::Episodic(m));
+                        }
+                    }
+                    MemoryKind::Decision => {
+                        for m in stmt.query_map(params_ref.as_slice(), Self::map_decision_row)? {
+                            let m = m?;
+                            by_id.insert((kind, m.id.clone()), ActiveMemory::Decision(m));
+                        }
+                    }
+                    MemoryKind::Failure => {
+                        for m in stmt.query_map(params_ref.as_slice(), Self::map_failure_row)? {
+                            let m = m?;
+                            by_id.insert((kind, m.id.clone()), ActiveMemory::Failure(m));
+                        }
+                    }
+                    MemoryKind::Procedural => {
+                        for m in stmt.query_map(params_ref.as_slice(), Self::map_procedural_row)? {
+                            let m = m?;
+                            by_id.insert((kind, m.id.clone()), ActiveMemory::Procedural(m));
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (memory_type, id) in ids {
+            let key = MemoryKind::from_type_str(memory_type)
+                .ok()
+                .map(|k| (k, id.clone()));
+            if let Some((kind, id)) = key {
+                if let Some(m) = by_id.remove(&(kind, id)) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn search_unified(
+        &self,
+        query: &str,
+        project_id: &str,
+        kind_filter: Option<MemoryKind>,
+        limit: usize,
+    ) -> Result<UnifiedHits> {
+        if limit == 0 {
+            return Ok(UnifiedHits::default());
+        }
+        let and_query = Self::sanitize_fts_query(query, true);
+        let or_query = Self::sanitize_fts_query(query, false);
+        let project_hex = if project_id == "*" {
+            None
+        } else {
+            Some(Self::project_fts_hex(project_id))
+        };
+
+        // Business part in parens: `("a" OR "b") AND project:"…"` — without
+        // them the trailing filters would bind only into the last OR arm.
+        // A business query that sanitized to `""` (no content tokens) can
+        // match nothing, filters or not.
+        let compose = |business: &str| -> Option<String> {
+            if business == "\"\"" {
+                return None;
+            }
+            let mut m = format!("({business})");
+            if let Some(hex) = &project_hex {
+                m.push_str(&format!(" AND project:\"{hex}\""));
+            }
+            if let Some(kind) = kind_filter {
+                m.push_str(&format!(" AND kind:\"{}\"", kind.as_str()));
+            }
+            Some(m)
+        };
+
+        let fetch = |match_expr: &str| -> Result<Vec<UnifiedFtsHit>> {
+            let sql = format!(
+                "SELECT rowid, bm25(memories_fts, {UNIFIED_BM25_WEIGHTS}) as score \
+                 FROM memories_fts WHERE memories_fts MATCH ?1 \
+                 ORDER BY score LIMIT ?2"
+            );
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![match_expr, limit as i64], |r| {
+                Ok(UnifiedFtsHit {
+                    rowid: r.get(0)?,
+                    raw: r.get(1)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        };
+
+        let (and_expr, or_expr) = (compose(&and_query), compose(&or_query));
+        let mut hits = match &and_expr {
+            Some(expr) => fetch(expr)?,
+            None => Vec::new(),
+        };
+        // OR fallback: one decision for the whole corpus (see method doc).
+        if hits.is_empty() {
+            if let Some(expr) = or_expr {
+                if Some(&expr) != and_expr.as_ref() {
+                    hits = fetch(&expr)?;
+                }
+            }
+        }
+
+        // Decode → per-kind (main_rowid, raw) groups, preserving rank order.
+        let mut per_kind: [Vec<(i64, f64)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for hit in hits {
+            if let Some((kind, main_rowid)) = decode_fts_rowid(hit.rowid) {
+                per_kind[kind.index() as usize].push((main_rowid, hit.raw));
+            }
+        }
+
+        let conn = self.conn()?;
+        let mut out = UnifiedHits::default();
+        for (kind, group) in MemoryKind::all().into_iter().zip(per_kind) {
+            if group.is_empty() {
+                continue;
+            }
+            match kind {
+                MemoryKind::Episodic => {
+                    out.episodic = Self::materialize_episodic(&conn, &group, project_id)?;
+                }
+                MemoryKind::Decision => {
+                    out.decisions = Self::materialize_decisions(&conn, &group, project_id)?;
+                }
+                MemoryKind::Failure => {
+                    out.failures = Self::materialize_failures(&conn, &group, project_id)?;
+                }
+                MemoryKind::Procedural => {
+                    out.procedures = Self::materialize_procedures(&conn, &group, project_id)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// SQL + bound params for one batch-materialization chunk. `_rid` rides
+    /// as the LAST column so the map_*_row mappers keep reading columns 0..n.
+    fn unified_materialize_sql(
+        kind: MemoryKind,
+        rowids: &[i64],
+        project_id: &str,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let placeholders = rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT {}, rowid AS _rid FROM {} WHERE rowid IN ({placeholders}) \
+             AND archived_at IS NULL AND (?{} = '*' OR project_id = ?{})",
+            Self::unified_select_cols(kind),
+            kind.table(),
+            rowids.len() + 1,
+            rowids.len() + 1
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = rowids
+            .iter()
+            .map(|r| Box::new(*r) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params.push(Box::new(project_id.to_string()));
+        (sql, params)
+    }
+
+    fn materialize_episodic(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        group: &[(i64, f64)],
+        project_id: &str,
+    ) -> Result<Vec<ScoredMemory<EpisodicMemory>>> {
+        materialize_body!(
+            conn,
+            group,
+            project_id,
+            MemoryKind::Episodic,
+            11,
+            Self::map_episodic_row
+        )
+    }
+
+    fn materialize_decisions(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        group: &[(i64, f64)],
+        project_id: &str,
+    ) -> Result<Vec<ScoredMemory<DecisionMemory>>> {
+        materialize_body!(
+            conn,
+            group,
+            project_id,
+            MemoryKind::Decision,
+            12,
+            Self::map_decision_row
+        )
+    }
+
+    fn materialize_failures(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        group: &[(i64, f64)],
+        project_id: &str,
+    ) -> Result<Vec<ScoredMemory<FailureMemory>>> {
+        materialize_body!(
+            conn,
+            group,
+            project_id,
+            MemoryKind::Failure,
+            10,
+            Self::map_failure_row
+        )
+    }
+
+    fn materialize_procedures(
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        group: &[(i64, f64)],
+        project_id: &str,
+    ) -> Result<Vec<ScoredMemory<ProceduralMemory>>> {
+        materialize_body!(
+            conn,
+            group,
+            project_id,
+            MemoryKind::Procedural,
+            9,
+            Self::map_procedural_row
+        )
+    }
+
+    // ─── Lifecycle: archive / restore (soft delete) ────────────────
+
+    /// Column list for batch materialization per kind (order matches the
+    /// map_*_row mappers).
+    fn unified_select_cols(kind: MemoryKind) -> &'static str {
+        match kind {
+            MemoryKind::Episodic => {
+                "id, project_id, session_id, summary, content, files_touched, \
+                 related_commits, importance, tags, created_at, updated_at"
+            }
+            MemoryKind::Decision => {
+                "id, project_id, title, context, rationale, tradeoffs, \
+                 related_files, tags, importance, superseded_by, created_at, updated_at"
+            }
+            MemoryKind::Failure => {
+                "id, project_id, incident, root_cause, fix, prevention, \
+                 severity, tags, created_at, updated_at"
+            }
+            MemoryKind::Procedural => {
+                "id, project_id, workflow_name, steps, related_tools, tags, \
+                 importance, created_at, updated_at"
+            }
+        }
+    }
+
+    fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodicMemory> {
+        Ok(EpisodicMemory {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            session_id: row.get(2)?,
+            summary: row.get(3)?,
+            content: row.get(4)?,
+            files_touched: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+            related_commits: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+            importance: row.get(7)?,
+            tags: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    }
+
+    fn map_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionMemory> {
+        Ok(DecisionMemory {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            title: row.get(2)?,
+            context: row.get(3)?,
+            rationale: row.get(4)?,
+            tradeoffs: row.get(5)?,
+            related_files: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+            tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+            importance: row.get(8)?,
+            superseded_by: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+        })
+    }
+
+    fn map_failure_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FailureMemory> {
+        Ok(FailureMemory {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            incident: row.get(2)?,
+            root_cause: row.get(3)?,
+            fix: row.get(4)?,
+            prevention: row.get(5)?,
+            severity: row.get(6)?,
+            tags: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProceduralMemory> {
+        Ok(ProceduralMemory {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            workflow_name: row.get(2)?,
+            steps: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+            related_tools: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+            tags: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+            importance: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    }
+
     // ─── Lifecycle: archive / restore (soft delete) ────────────────
 
     /// Soft-delete (archive) a memory by id within a project.
     /// Returns true if a currently-active row was archived.
+    ///
+    /// The unified FTS row is deleted in the same transaction: the index
+    /// invariant is "one FTS row per ACTIVE main row" (archive must not
+    /// leave FTS rows behind — `fts_drift` and `rebuild_fts` both key on it,
+    /// and a stale row would resurface the memory in search until the next
+    /// rebuild).
     pub fn archive(&self, kind: MemoryKind, id: &str, project_id: &str, now: i64) -> Result<bool> {
         let sql = format!(
             "UPDATE {} SET archived_at = ?3 WHERE id = ?1 AND project_id = ?2 AND archived_at IS NULL",
             kind.table()
         );
-        let conn = self.conn()?;
-        let affected = conn.execute(&sql, params![id, project_id, now])?;
+        let mut conn = self.conn()?;
+        // Write tx takes the write lock up front (BEGIN IMMEDIATE): busy_timeout
+        // applies to contention instead of the deferred-upgrade SQLITE_BUSY path.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let affected = tx.execute(&sql, params![id, project_id, now])?;
+        if affected > 0 {
+            Self::delete_fts_row(&tx, kind, id, project_id)?;
+        }
+        tx.commit()?;
         Ok(affected > 0)
     }
 
     /// Un-archive a previously soft-deleted memory.
-    /// Returns true if a currently-archived row was restored.
+    /// Returns true if a currently-archived row was restored. The unified
+    /// FTS row is re-inserted in the same transaction (archive deleted it).
     pub fn restore(&self, kind: MemoryKind, id: &str, project_id: &str) -> Result<bool> {
         let sql = format!(
             "UPDATE {} SET archived_at = NULL WHERE id = ?1 AND project_id = ?2 AND archived_at IS NOT NULL",
             kind.table()
         );
-        let conn = self.conn()?;
-        let affected = conn.execute(&sql, params![id, project_id])?;
+        let mut conn = self.conn()?;
+        // Write tx takes the write lock up front (BEGIN IMMEDIATE): busy_timeout
+        // applies to contention instead of the deferred-upgrade SQLITE_BUSY path.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Restore-vs-dedup boundary (v10): if the restored row's content_hash
+        // equals the hash of an ACTIVE row, clearing `archived_at` trips the
+        // partial unique index. Restore WINS over dedup bookkeeping: THIS
+        // row's hash is set to NULL (NULL rows never participate in the index)
+        // and the restore proceeds — the memory comes back fully usable, only
+        // its future dedup tracking is waived. Logged for the audit trail.
+        let affected = match tx.execute(&sql, params![id, project_id]) {
+            Ok(n) => n,
+            Err(e) if is_unique_violation(&e) => {
+                // The failed statement rolled back only itself (ON CONFLICT
+                // ABORT); release this row's hash and retry in-transaction.
+                tracing::warn!(
+                    kind = kind.as_str(),
+                    id = %id,
+                    "restore: content_hash conflicts with an active duplicate; \
+                     releasing this row's hash (dedup tracking waived)"
+                );
+                tx.execute(
+                    &format!(
+                        "UPDATE {} SET content_hash = NULL WHERE id = ?1 AND project_id = ?2",
+                        kind.table()
+                    ),
+                    params![id, project_id],
+                )?;
+                tx.execute(&sql, params![id, project_id])?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if affected > 0 {
+            Self::reinsert_fts_row(&tx, kind, id, project_id)?;
+        }
+        tx.commit()?;
         Ok(affected > 0)
+    }
+
+    /// Delete the unified FTS row of a (kind, id) pair, resolving the main
+    /// rowid first. No-op when no main row exists. Runs inside the caller's
+    /// transaction.
+    fn delete_fts_row(
+        tx: &rusqlite::Transaction<'_>,
+        kind: MemoryKind,
+        id: &str,
+        project_id: &str,
+    ) -> Result<()> {
+        let rowid: Option<i64> = tx
+            .query_row(
+                &format!(
+                    "SELECT rowid FROM {} WHERE id = ?1 AND project_id = ?2",
+                    kind.table()
+                ),
+                params![id, project_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(rid) = rowid {
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid = ?1",
+                params![encode_fts_rowid(kind, rid)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Re-insert the unified FTS row for an existing (kind, id) pair by
+    /// reading the main row's FTS columns — the mirror of `delete_fts_row`.
+    /// Runs inside the caller's transaction; no-op when the main row is gone.
+    fn reinsert_fts_row(
+        tx: &rusqlite::Transaction<'_>,
+        kind: MemoryKind,
+        id: &str,
+        project_id: &str,
+    ) -> Result<()> {
+        let insert = |rid: i64, project: &str, doc: (String, String, String)| -> Result<()> {
+            tx.execute(
+                crate::storage::schema::UNIFIED_FTS_INSERT,
+                params![
+                    doc.0,
+                    doc.1,
+                    doc.2,
+                    Self::project_fts_hex(project),
+                    kind.as_str(),
+                    rid
+                ],
+            )?;
+            Ok(())
+        };
+        match kind {
+            MemoryKind::Episodic => {
+                let row = tx
+                    .query_row(
+                        "SELECT rowid, project_id, summary, content, files_touched, tags \
+                         FROM episodic_memories WHERE id = ?1 AND project_id = ?2",
+                        params![id, project_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                unified_doc_episodic(
+                                    &r.get::<_, String>(2)?,
+                                    &r.get::<_, String>(3)?,
+                                    &r.get::<_, String>(4)?,
+                                    &r.get::<_, String>(5)?,
+                                ),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((rid, project, doc)) = row {
+                    insert(encode_fts_rowid(kind, rid), &project, doc)?;
+                }
+            }
+            MemoryKind::Decision => {
+                let row = tx
+                    .query_row(
+                        "SELECT rowid, project_id, title, context, rationale, tradeoffs, tags \
+                         FROM decision_memories WHERE id = ?1 AND project_id = ?2",
+                        params![id, project_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                unified_doc_decision(
+                                    &r.get::<_, String>(2)?,
+                                    &r.get::<_, String>(3)?,
+                                    &r.get::<_, String>(4)?,
+                                    &r.get::<_, String>(5)?,
+                                    &r.get::<_, String>(6)?,
+                                ),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((rid, project, doc)) = row {
+                    insert(encode_fts_rowid(kind, rid), &project, doc)?;
+                }
+            }
+            MemoryKind::Failure => {
+                let row = tx
+                    .query_row(
+                        "SELECT rowid, project_id, incident, root_cause, fix, prevention, tags \
+                         FROM failure_memories WHERE id = ?1 AND project_id = ?2",
+                        params![id, project_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                unified_doc_failure(
+                                    &r.get::<_, String>(2)?,
+                                    &r.get::<_, String>(3)?,
+                                    &r.get::<_, String>(4)?,
+                                    &r.get::<_, String>(5)?,
+                                    &r.get::<_, String>(6)?,
+                                ),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((rid, project, doc)) = row {
+                    insert(encode_fts_rowid(kind, rid), &project, doc)?;
+                }
+            }
+            MemoryKind::Procedural => {
+                let row = tx
+                    .query_row(
+                        "SELECT rowid, project_id, workflow_name, steps, related_tools, tags \
+                         FROM procedural_memories WHERE id = ?1 AND project_id = ?2",
+                        params![id, project_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                unified_doc_procedural(
+                                    &r.get::<_, String>(2)?,
+                                    &r.get::<_, String>(3)?,
+                                    &r.get::<_, String>(4)?,
+                                    &r.get::<_, String>(5)?,
+                                ),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((rid, project, doc)) = row {
+                    insert(encode_fts_rowid(kind, rid), &project, doc)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Active memory ids matching the batch filters (read-only; used for dry-run).
@@ -679,7 +1522,8 @@ impl MemoryRepository {
     /// - `tags`: if non-empty, the memory must carry at least one of these tags.
     /// - `before`: if Some, only memories with `created_at < before`.
     ///
-    /// Returns the ids that were archived. All updates run in one transaction.
+    /// Returns the ids that were archived. All updates run in one transaction
+    /// (including the unified-FTS row deletions — same invariant as `archive`).
     pub fn archive_batch(
         &self,
         kind: MemoryKind,
@@ -689,14 +1533,19 @@ impl MemoryRepository {
         now: i64,
     ) -> Result<Vec<String>> {
         let matched = self.list_active_candidates(kind, project_id, tags, before)?;
-        let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let update_sql = format!(
-            "UPDATE {} SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
-            kind.table()
-        );
+        let mut conn = self.conn()?;
+        // Write tx takes the write lock up front (BEGIN IMMEDIATE): busy_timeout
+        // applies to contention instead of the deferred-upgrade SQLITE_BUSY path.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in &matched {
-            tx.execute(&update_sql, params![id, now])?;
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+                    kind.table()
+                ),
+                params![id, now],
+            )?;
+            Self::delete_fts_row(&tx, kind, id, project_id)?;
         }
         tx.commit()?;
         Ok(matched)
@@ -797,6 +1646,12 @@ impl MemoryRepository {
     /// One aggregate snapshot for `engram stats`: counts per kind/project,
     /// entity/graph totals, reflection proposal states.
     pub fn stats_snapshot(&self) -> Result<StatsSnapshot> {
+        // Values that borrow their own pooled connection are collected FIRST:
+        // computing them after `let conn` below held two connections at once,
+        // and ≥10 concurrent stats calls could exhaust the pool.
+        let schema_version = self.user_version()?;
+        let fts_tokenizer = self.meta_get("fts_tokenizer")?;
+        let orphan_entities = self.gc_orphan_entities(false)? as i64;
         let conn = self.conn()?;
         let mut memories = Vec::new();
         let mut total_active = 0i64;
@@ -835,7 +1690,6 @@ impl MemoryRepository {
 
         let entities_total: i64 =
             conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?;
-        let orphan_entities = self.gc_orphan_entities(false)? as i64;
         let (pending, confirmed, rejected): (i64, i64, i64) = conn.query_row(
             "SELECT \
                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0), \
@@ -847,8 +1701,8 @@ impl MemoryRepository {
         )?;
 
         Ok(StatsSnapshot {
-            schema_version: self.user_version()?,
-            fts_tokenizer: self.meta_get("fts_tokenizer")?,
+            schema_version,
+            fts_tokenizer,
             memories,
             total_active,
             projects,
@@ -867,8 +1721,13 @@ impl MemoryRepository {
     /// query_log row (within `window_seconds`) whose result set contains the
     /// id. Quoted-substring match against the JSON array is exact: memory ids
     /// are fixed-length UUIDs, so `"id"` cannot substring-match another id.
-    /// Also appends a row to the per-event `adoptions` log — query_log cannot
-    /// say WHICH memory was adopted, and `engram tune` needs exactly that.
+    ///
+    /// Deduplicated per memory within `window_seconds`: before the dedup, one
+    /// logical adoption ("search → read → mark useful") wrote TWO `adoptions`
+    /// rows (get_memory and mark_relevance each inserted one), and a client
+    /// loop calling get_memory could inflate `engram tune`'s adoption rate
+    /// above 1.0. Repeated signals inside the window are ignored. Both writes
+    /// run in one transaction so query_log and adoptions cannot disagree.
     pub fn record_adoption(
         &self,
         project_id: &str,
@@ -877,40 +1736,59 @@ impl MemoryRepository {
         now: i64,
         window_seconds: i64,
     ) -> Result<usize> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        // Write tx takes the write lock up front (BEGIN IMMEDIATE): busy_timeout
+        // applies to contention instead of the deferred-upgrade SQLITE_BUSY path.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let needle = format!("\"{memory_id}\"");
         let since = now.saturating_sub(window_seconds);
-        let updated = conn.execute(
-            "UPDATE query_log SET adopted = adopted + 1 \
-             WHERE id = ( \
-                 SELECT id FROM query_log \
-                  WHERE project_id = ?1 AND created_at >= ?2 \
-                    AND result_ids LIKE '%' || ?3 || '%' \
-                  ORDER BY created_at DESC LIMIT 1 \
-             )",
-            params![project_id, since, needle],
+        // Cooldown: an adoption row for this memory inside the window means
+        // the signal was already recorded — skip both writes.
+        let already: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM adoptions \
+             WHERE project_id = ?1 AND memory_id = ?2 AND created_at >= ?3)",
+            params![project_id, memory_id, since],
+            |row| row.get(0),
         )?;
-        conn.execute(
-            "INSERT INTO adoptions (project_id, memory_id, memory_type, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, memory_id, memory_type, now],
-        )?;
+        let mut updated = 0;
+        if !already {
+            updated = tx.execute(
+                "UPDATE query_log SET adopted = adopted + 1 \
+                 WHERE id = ( \
+                     SELECT id FROM query_log \
+                      WHERE project_id = ?1 AND created_at >= ?2 \
+                        AND result_ids LIKE '%' || ?3 || '%' \
+                      ORDER BY created_at DESC LIMIT 1 \
+                 )",
+                params![project_id, since, needle],
+            )?;
+            tx.execute(
+                "INSERT INTO adoptions (project_id, memory_id, memory_type, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![project_id, memory_id, memory_type, now],
+            )?;
+        }
+        tx.commit()?;
         Ok(updated)
     }
 
-    /// Adoption events per memory over a window, most-adopted first — the
-    /// per-memory signal `engram tune` learns from (query_log.adopted only
-    /// aggregates per query string).
-    pub fn adoption_counts(
+    /// Per-memory adoption evidence over a window, most evidence first: the
+    /// raw event count plus the number of DISTINCT UTC days the memory was
+    /// adopted on. `engram tune` rates adoption per calendar day (both sides
+    /// of the rate are deduplicated the same way), so one day with many
+    /// reads still counts as one adoption day. Grouped by memory_id only —
+    /// ids are UUIDs, unique across kinds.
+    pub fn adoption_day_counts(
         &self,
         project_id: &str,
         since: i64,
-    ) -> Result<Vec<(String, String, i64)>> {
+    ) -> Result<Vec<(String, i64, i64)>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT memory_id, memory_type, COUNT(*) AS cnt FROM adoptions \
+            "SELECT memory_id, COUNT(*) AS cnt, \
+                    COUNT(DISTINCT created_at / 86400) AS days FROM adoptions \
              WHERE project_id = ?1 AND created_at >= ?2 \
-             GROUP BY memory_id, memory_type \
+             GROUP BY memory_id \
              ORDER BY cnt DESC, memory_id",
         )?;
         let rows = stmt.query_map(params![project_id, since], |row| {
@@ -923,21 +1801,90 @@ impl MemoryRepository {
         Ok(out)
     }
 
-    /// Raw `result_ids` JSON arrays from query_log over a window — the
+    /// `(created_at, result_ids)` pairs from query_log over a window — the
     /// impression side of the tuning signal (how often each memory was
-    /// SERVED to the agent, regardless of whether it was read).
-    pub fn recent_result_ids(&self, project_id: &str, since: i64) -> Result<Vec<String>> {
+    /// SERVED to the agent, regardless of whether it was read). The
+    /// timestamp lets the caller bucket impressions per UTC calendar day,
+    /// mirroring the day-deduplicated adoption numerator.
+    pub fn recent_result_sets(&self, project_id: &str, since: i64) -> Result<Vec<(i64, String)>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT result_ids FROM query_log \
+            "SELECT created_at, result_ids FROM query_log \
              WHERE project_id = ?1 AND created_at >= ?2",
         )?;
-        let rows = stmt.query_map(params![project_id, since], |row| row.get(0))?;
+        let rows = stmt.query_map(params![project_id, since], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Record one explicit `mark_relevance` judgment ('useful'/'irrelevant').
+    /// Separate from `record_adoption` on purpose: a passive read is
+    /// behavioral evidence, this is a judgment — conflating the two made the
+    /// recommended search → get_memory → mark_relevance flow trip the
+    /// adoption cooldown, so explicit feedback never took effect.
+    pub fn record_feedback(
+        &self,
+        project_id: &str,
+        memory_id: &str,
+        memory_type: &str,
+        feedback: &str,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO memory_feedback \
+             (project_id, memory_id, memory_type, feedback, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, memory_id, memory_type, feedback, now],
+        )?;
+        Ok(())
+    }
+
+    /// Whether ANY explicit feedback for this memory was recorded within
+    /// `window_seconds` — deliberately direction-agnostic: 'useful' and
+    /// 'irrelevant' share one cooldown, so a client loop can neither pump
+    /// importance up nor grind it down.
+    pub fn has_recent_feedback(
+        &self,
+        project_id: &str,
+        memory_id: &str,
+        now: i64,
+        window_seconds: i64,
+    ) -> Result<bool> {
+        let conn = self.conn()?;
+        let since = now.saturating_sub(window_seconds);
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_feedback \
+             WHERE project_id = ?1 AND memory_id = ?2 AND created_at >= ?3)",
+            params![project_id, memory_id, since],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// Whether a 'useful' judgment exists for this memory since `since`. The
+    /// tuner's demote guard: an explicitly endorsed memory must not be
+    /// auto-demoted for being rarely read.
+    pub fn has_useful_feedback_since(
+        &self,
+        project_id: &str,
+        memory_id: &str,
+        since: i64,
+    ) -> Result<bool> {
+        let conn = self.conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_feedback \
+             WHERE project_id = ?1 AND memory_id = ?2 \
+               AND feedback = 'useful' AND created_at >= ?3)",
+            params![project_id, memory_id, since],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Group non-archived episodic memories by UTC day over a time window,
@@ -1057,40 +2004,16 @@ impl MemoryRepository {
         Ok(results)
     }
 
-    /// Write-time dedup guard: return the id of the ACTIVE memory of `kind`
-    /// in `project_id` whose dedup text (the same concatenation
-    /// consolidation hashes: `MemoryKind::dedup_text_expr`) is byte-identical
-    /// to `candidate_text`, or None. One indexed scan of the project's active
-    /// rows of that kind — creates are rare, this is not a hot path.
-    pub fn find_exact_duplicate(
-        &self,
-        kind: MemoryKind,
-        project_id: &str,
-        candidate_text: &str,
-    ) -> Result<Option<String>> {
-        let conn = self.conn()?;
-        let sql = format!(
-            "SELECT id FROM {} \
-             WHERE project_id = ?1 AND archived_at IS NULL AND {} = ?2 \
-             ORDER BY created_at ASC LIMIT 1",
-            kind.table(),
-            kind.dedup_text_expr()
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query_map(params![project_id, candidate_text], |row| {
-            row.get::<_, String>(0)
-        })?;
-        Ok(match rows.next() {
-            Some(r) => Some(r?),
-            None => None,
-        })
-    }
-
     /// Mark decision `old_id` as superseded by `new_id`: the old decision
     /// stays searchable as history but is flagged and downranked in retrieval.
     /// Fails loudly when the old id does not exist in this project. An already
     /// superseded decision is re-pointed at the newest one (chain flattening —
     /// "current" is always one hop from any replaced decision).
+    ///
+    /// Single targeted UPDATE (no full-row rewrite): the previous version did
+    /// get_decision → mutate → update_decision, which rebuilds the FTS row and
+    /// graph edges AND loses a concurrent update that landed in between.
+    /// `superseded_by` is not an FTS-indexed column, so no FTS rebuild needed.
     pub fn supersede_decision(
         &self,
         project_id: &str,
@@ -1098,15 +2021,149 @@ impl MemoryRepository {
         new_id: &str,
         now: i64,
     ) -> Result<()> {
-        let mut old = self.get_decision(old_id, project_id)?.with_context(|| {
-            format!("cannot supersede: no decision {old_id} in project {project_id}")
-        })?;
-        if old.superseded_by.is_some() {
-            tracing::info!("decision {old_id} was already superseded; re-pointing it to {new_id}");
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE decision_memories SET superseded_by = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND project_id = ?2",
+            params![old_id, project_id, new_id, now],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("cannot supersede: no decision {old_id} in project {project_id}");
         }
-        old.superseded_by = Some(new_id.to_string());
-        old.updated_at = now;
-        self.update_decision(&old)
+        Ok(())
+    }
+
+    /// Create a decision AND point its predecessor at it in ONE transaction.
+    ///
+    /// The two-step version (create, then supersede) was not atomic: a failed
+    /// supersede left the new decision committed but the chain broken, and a
+    /// client retry hit the write-dedup guard which returned early WITHOUT
+    /// ever performing the supersede. Here the old id is validated inside the
+    /// transaction before any write, and both writes commit or roll back
+    /// together. Mirrors the macro-generated create (insert + FTS dual-write +
+    /// entity link) — keep the two in sync.
+    ///
+    /// `dedup = true` (write_dedup config) writes the row's content_hash and
+    /// lets the partial unique index enforce dedup: on a collision the
+    /// existing ACTIVE decision's id is returned (`Ok(Some(id))`) and nothing
+    /// is written — the caller applies the missing supersede to that existing
+    /// row (retry-after-failure semantics) and answers "duplicate". With
+    /// `dedup = false` the row carries no hash and this always returns
+    /// `Ok(None)`.
+    pub fn create_decision_with_supersede(
+        &self,
+        mem: &DecisionMemory,
+        old_id: &str,
+        dedup: bool,
+    ) -> Result<Option<String>> {
+        let mem = mem.clone().sanitized();
+        let mut conn = self.conn()?;
+        // Write tx takes the write lock up front (BEGIN IMMEDIATE): busy_timeout
+        // applies to contention instead of the deferred-upgrade SQLITE_BUSY path.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if old_id == mem.id {
+            anyhow::bail!("cannot supersede: decision {old_id} cannot supersede itself");
+        }
+        let old_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM decision_memories WHERE id = ?1 AND project_id = ?2)",
+            params![old_id, mem.project_id],
+            |row| row.get(0),
+        )?;
+        if !old_exists {
+            anyhow::bail!(
+                "cannot supersede: no decision {old_id} in project {}",
+                mem.project_id
+            );
+        }
+        // content_hash: the dedup-enforcing write (see create_*_dedup) or NULL
+        // when write_dedup is off — NULL rows never participate in the index.
+        let hash = if dedup {
+            Some(content_hash(&dedup_text_decision(
+                &mem.title,
+                &mem.context,
+                &mem.rationale,
+                &mem.tradeoffs,
+            )))
+        } else {
+            None
+        };
+        let insert = tx.execute(
+            "INSERT INTO decision_memories (id, project_id, title, context, rationale, tradeoffs, related_files, tags, importance, superseded_by, created_at, updated_at, content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                mem.id, mem.project_id, mem.title,
+                mem.context, mem.rationale, mem.tradeoffs,
+                serde_json::to_string(&mem.related_files)?,
+                serde_json::to_string(&mem.tags)?,
+                mem.importance,
+                mem.superseded_by,
+                mem.created_at, mem.updated_at,
+                hash,
+            ],
+        );
+        if let Err(e) = insert {
+            if dedup && is_unique_violation(&e) {
+                // The index rejected OUR row: an ACTIVE decision already
+                // carries this content_hash. Return it for the duplicate
+                // response; the (empty) transaction is discarded on drop.
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM decision_memories \
+                         WHERE project_id = ?1 AND content_hash = ?2 AND archived_at IS NULL \
+                         LIMIT 1",
+                        params![&mem.project_id, &hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = existing {
+                    return Ok(Some(id));
+                }
+            }
+            return Err(e.into());
+        }
+        // Unified-FTS dual-write, identical to the macro-generated create.
+        let fts_rowid: i64 = encode_fts_rowid(MemoryKind::Decision, tx.last_insert_rowid());
+        let (u_title, u_body, u_tags) = unified_doc_decision(
+            &mem.title,
+            &mem.context,
+            &mem.rationale,
+            &mem.tradeoffs,
+            &serde_json::to_string(&mem.tags)?,
+        );
+        tx.execute(
+            crate::storage::schema::UNIFIED_FTS_INSERT,
+            params![
+                u_title,
+                u_body,
+                u_tags,
+                Self::project_fts_hex(&mem.project_id),
+                MemoryKind::Decision.as_str(),
+                fts_rowid,
+            ],
+        )?;
+        if !mem.related_files.is_empty() {
+            Self::ensure_linked_entities(
+                &tx,
+                &mem.project_id,
+                &mem.id,
+                "File",
+                &mem.related_files,
+                "References",
+                mem.created_at,
+            )?;
+        }
+        let affected = tx.execute(
+            "UPDATE decision_memories SET superseded_by = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND project_id = ?2",
+            params![old_id, mem.project_id, mem.id, mem.updated_at],
+        )?;
+        if affected == 0 {
+            // Impossible after the existence probe above unless the row was
+            // deleted mid-transaction; surface it rather than commit a broken
+            // chain.
+            anyhow::bail!("cannot supersede: decision {old_id} vanished mid-transaction");
+        }
+        tx.commit()?;
+        Ok(None)
     }
 
     /// List a project's procedural memories, highest importance first, then
@@ -1314,7 +2371,7 @@ impl MemoryRepository {
         project_id: &str,
         now: i64,
     ) -> Result<Option<String>> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         // Read the pending draft first (None if already resolved / wrong project).
         let draft = match Self::query_suggestion(
             &conn,
@@ -1332,7 +2389,9 @@ impl MemoryRepository {
         }
 
         let proc_id = format!("{}-proc", draft.id);
-        let tx = conn.unchecked_transaction()?;
+        // IMMEDIATE: the promote INSERT + status flip hold the write lock from
+        // the start (same discipline as the other write transactions).
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Idempotent promote: skip the INSERT if a crashed earlier attempt
         // already created the procedural memory.
@@ -1356,18 +2415,24 @@ impl MemoryRepository {
                     now,
                 ],
             )?;
-            // Mirror the standard create path's FTS dual-write: same
-            // preprocessing AND rowid alignment, so this hand-rolled path
+            // Mirror the standard create path's unified-FTS dual-write: same
+            // doc projection AND encoded rowid, so this hand-rolled path
             // stays consistent with the macro-generated one.
-            let fts_rowid: i64 = tx.last_insert_rowid();
+            let fts_rowid: i64 = encode_fts_rowid(MemoryKind::Procedural, tx.last_insert_rowid());
+            let (u_title, u_body, u_tags) = unified_doc_procedural(
+                &draft.suggested_workflow_name,
+                &serde_json::to_string(&draft.suggested_steps)?,
+                &serde_json::to_string(&Vec::<String>::new())?,
+                &serde_json::to_string(&draft.suggested_tags)?,
+            );
             tx.execute(
-                "INSERT INTO procedural_memories_fts (workflow_name, steps, related_tools, tags, rowid) \
-                 VALUES (?1,?2,?3,?4,?5)",
+                crate::storage::schema::UNIFIED_FTS_INSERT,
                 params![
-                    Self::preprocess_cjk(&draft.suggested_workflow_name),
-                    Self::fts_json(&draft.suggested_steps)?,
-                    Self::fts_json(&Vec::<String>::new())?,
-                    Self::fts_json(&draft.suggested_tags)?,
+                    u_title,
+                    u_body,
+                    u_tags,
+                    Self::project_fts_hex(&draft.project_id),
+                    MemoryKind::Procedural.as_str(),
                     fts_rowid,
                 ],
             )?;
@@ -1517,9 +2582,8 @@ impl MemoryRepository {
                 // `engram gc` is a separate CLI process sharing the DB with
                 // the live MCP server, and this closes a silent-data-loss
                 // race that does not need worker_threads > 1 to trigger.
-                let fts_table = kind_fts_table(kind);
-                let conn = self.conn()?;
-                let tx = conn.unchecked_transaction()?;
+                let mut conn = self.conn()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 for (id, project_id, fts_rowid) in &candidates {
                     let affected = tx.execute(
                         &format!(
@@ -1530,12 +2594,13 @@ impl MemoryRepository {
                         params![id, project_id],
                     )?;
                     if affected > 0 {
-                        // FTS rows are addressed by the main-table rowid —
-                        // matching the UNINDEXED memory_id column scanned the
-                        // whole FTS table for every GC'd row.
+                        // Unified-FTS row addressed by the encoded rowid.
+                        // Normally already gone (archive deleted it); kept
+                        // as a defensive purge for indexes from older
+                        // binaries or interrupted migrations.
                         tx.execute(
-                            &format!("DELETE FROM {} WHERE rowid = ?1", fts_table),
-                            params![fts_rowid],
+                            "DELETE FROM memories_fts WHERE rowid = ?1",
+                            params![encode_fts_rowid(kind, *fts_rowid)],
                         )?;
                         tx.execute(
                             "DELETE FROM graph_relations WHERE from_entity = ?1 OR to_entity = ?1",
@@ -1579,11 +2644,69 @@ impl MemoryRepository {
         })
     }
 
-    /// Memory ids that share a graph entity (file/tool) with any of the
-    /// `seed` memories — the relationship graph's contribution to retrieval.
-    /// Returns `(memory_type, id)` pairs, at most `limit`, excluding seeds.
-    /// Only ACTIVE memories are returned (each candidate is probed against
-    /// its main table with an archived_at IS NULL check).
+    /// Active episodic memories tagged `session-import` — the raw hook dumps
+    /// awaiting distillation (prompt `engram.distill`). Powers the session
+    /// brief's distillation hint and `engram maintain`'s aging report.
+    /// The LIKE match on the fixed tag inside the JSON array is exact enough
+    /// (the tag has no delimiters that could substring-match another tag).
+    pub fn count_session_imports(&self, project_id: &str) -> Result<i64> {
+        let conn = self.conn()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episodic_memories \
+             WHERE project_id = ?1 AND archived_at IS NULL \
+               AND tags LIKE '%\"session-import\"%'",
+            params![project_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Lifecycle for raw session imports: session-import memories whose
+    /// `updated_at` is older than `older_than_seconds` get their importance
+    /// lowered to `floor` (default path: 0.5 → 0.2) — raw prompt dumps age
+    /// out of prime ranking unless distilled into typed memories, which
+    /// become the durable knowledge. `apply=false` only reports candidates.
+    /// Returns `(id, current_importance)` pairs.
+    pub fn downgrade_stale_session_imports(
+        &self,
+        project_id: &str,
+        older_than_seconds: i64,
+        floor: f32,
+        apply: bool,
+        now: i64,
+    ) -> Result<Vec<(String, f32)>> {
+        let cutoff = now.checked_sub(older_than_seconds).unwrap_or(0);
+        let mut conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, importance FROM episodic_memories \
+             WHERE project_id = ?1 AND archived_at IS NULL \
+               AND tags LIKE '%\"session-import\"%' \
+               AND updated_at < ?2 AND importance > ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, cutoff, floor], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+        })?;
+        let mut candidates = Vec::new();
+        for r in rows {
+            candidates.push(r?);
+        }
+        drop(stmt);
+        if apply && !candidates.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (id, _) in &candidates {
+                tx.execute(
+                    "UPDATE episodic_memories SET importance = ?3, updated_at = ?4 \
+                     WHERE id = ?1 AND project_id = ?2",
+                    params![id, project_id, floor, now],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(candidates)
+    }
+
+    /// Most recent ACTIVE episodic memory for a (project, session) pair —
+    /// used by session-import to make repeated hook firings idempotent.
     pub fn find_episodic_by_session(
         &self,
         project_id: &str,
@@ -1617,14 +2740,8 @@ impl MemoryRepository {
         Ok(row)
     }
 
-    /// Physically delete File/Tool entities that no relation references
-    /// anymore. Memories' own entities (type `Memory`) and entities still
-    /// attached to any edge are preserved. Returns the number removed
-    /// (or that would be removed, when `apply=false`).
-    ///
-    /// Before this, deleted/archived memories left their File/Tool entities
-    /// and edges behind forever — the entity table grew unboundedly and
-    /// `related_files` results filled with orphan noise.
+    /// Truncate the WAL back into the main database file. Safe to run while
+    /// other connections are idle; a busy DB simply leaves the WAL in place.
     pub fn wal_checkpoint_truncate(&self) -> Result<()> {
         let conn = self.conn()?;
         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
@@ -1670,16 +2787,6 @@ pub(crate) fn is_cjk_character(ch: char) -> bool {
         | '\u{30A0}'..='\u{30FF}'   // Katakana
         | '\u{AC00}'..='\u{D7AF}'   // Hangul Syllables
     )
-}
-
-/// The FTS shadow table for a memory kind (enum-derived, never user input).
-fn kind_fts_table(kind: MemoryKind) -> &'static str {
-    match kind {
-        MemoryKind::Episodic => "episodic_memories_fts",
-        MemoryKind::Decision => "decision_memories_fts",
-        MemoryKind::Failure => "failure_memories_fts",
-        MemoryKind::Procedural => "procedural_memories_fts",
-    }
 }
 
 #[cfg(test)]
@@ -2616,9 +3723,9 @@ mod tests {
 
     #[test]
     fn fts_rowid_stays_aligned_with_main_table() {
-        // The FTS rowid must equal the main-table rowid: deletes/updates
-        // address FTS rows by rowid (O(log n)); a misaligned index would
-        // silently strand or destroy rows.
+        // The unified FTS rowid must decode back to the main-table row:
+        // deletes/updates address FTS rows by rowid (O(log n)); a misaligned
+        // encoding would silently strand or destroy rows.
         let repo = setup_repo();
         repo.create_episodic(&episodic_fixture("r1", "rowid alignment marker"))
             .unwrap();
@@ -2627,13 +3734,13 @@ mod tests {
             let (main_rowid, fts_rowid): (i64, i64) = conn
                 .query_row(
                     "SELECT m.rowid, f.rowid FROM episodic_memories m \
-                     JOIN episodic_memories_fts f ON f.rowid = m.rowid \
+                     JOIN memories_fts f ON f.rowid = m.rowid * 4 + 0 \
                      WHERE m.id = 'r1'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(main_rowid, fts_rowid);
+            assert_eq!(main_rowid * 4, fts_rowid);
         }
 
         // Update replaces the FTS row in place: still exactly one row,
@@ -2645,8 +3752,8 @@ mod tests {
             let conn = repo.connection().unwrap();
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM episodic_memories_fts f \
-                     JOIN episodic_memories m ON f.rowid = m.rowid WHERE m.id = 'r1'",
+                    "SELECT COUNT(*) FROM memories_fts f \
+                     JOIN episodic_memories m ON f.rowid = m.rowid * 4 + 0 WHERE m.id = 'r1'",
                     [],
                     |r| r.get(0),
                 )
@@ -2658,14 +3765,14 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // Delete removes the FTS row entirely (by rowid).
+        // Delete removes the FTS row entirely (by encoded rowid).
         repo.delete_episodic("r1", "p").unwrap();
         {
             let conn = repo.connection().unwrap();
             let leftover: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM episodic_memories_fts f \
-                     JOIN episodic_memories m ON f.rowid = m.rowid WHERE m.id = 'r1'",
+                    "SELECT COUNT(*) FROM memories_fts f \
+                     JOIN episodic_memories m ON f.rowid = m.rowid * 4 + 0 WHERE m.id = 'r1'",
                     [],
                     |r| r.get(0),
                 )
@@ -2689,7 +3796,8 @@ mod tests {
             // Install a genuine PRE-v2 shadow table (full-copy, memory_id
             // column, raw preprocessing) as an old binary would have left it.
             conn.execute_batch(
-                "DROP TABLE IF EXISTS episodic_memories_fts; \
+                "DROP TABLE IF EXISTS memories_fts; \
+                 DROP TABLE IF EXISTS episodic_memories_fts; \
                  CREATE VIRTUAL TABLE episodic_memories_fts USING fts5( \
                      memory_id UNINDEXED, summary, content, files_touched, tags, \
                      tokenize='porter unicode61');",
@@ -2702,27 +3810,131 @@ mod tests {
             )
             .unwrap();
         }
-        // Legacy query style (pre-boundary-split) can't match…
-        assert!(repo.search_episodic("rust", "p", 10).unwrap().is_empty());
+        // With the v1-era index installed the unified table does not exist
+        // yet — search cannot even run until the migration chain builds it.
+        assert!(
+            repo.search_episodic("rust", "p", 10).is_err(),
+            "unified FTS table must not exist before the chain reaches v9"
+        );
 
         repo.run_migrations().unwrap();
         assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        // …but after the v2 rebuild the latin term matches the mixed text.
+        // After the full chain (v2 preprocessing rebuilds + v9 unified
+        // conversion) the latin term matches the mixed-script text.
         assert!(
             !repo.search_episodic("rust", "p", 10).unwrap().is_empty(),
-            "v2 rebuild must apply boundary-aware preprocessing"
+            "migration chain must apply boundary-aware preprocessing"
         );
         let conn = repo.connection().unwrap();
         let aligned: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM episodic_memories m \
-                 JOIN episodic_memories_fts f ON f.rowid = m.rowid",
+                 JOIN memories_fts f ON f.rowid = m.rowid * 4 + 0",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(aligned, 1, "FTS rowid must equal main-table rowid");
+        assert_eq!(aligned, 1, "FTS rowid must decode to main-table rowid");
+        // The legacy per-type tables are gone.
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                 AND name IN ('episodic_memories_fts','decision_memories_fts',\
+                              'failure_memories_fts','procedural_memories_fts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "v9 must drop the per-type FTS tables");
     }
+
+    #[test]
+    fn archive_deletes_and_restore_reinserts_the_fts_row() {
+        // Unified-table invariant: one FTS row per ACTIVE main row. Archive
+        // removing the row (instead of relying on a search-time filter) is
+        // what keeps `fts_drift` meaningful and stale docs out of the index.
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("ar1", "archive fts marker"))
+            .unwrap();
+        assert_eq!(repo.fts_drift().unwrap(), 0);
+
+        repo.archive(MemoryKind::Episodic, "ar1", "p", 200).unwrap();
+        assert_eq!(
+            repo.fts_drift().unwrap(),
+            0,
+            "archived row must leave the index"
+        );
+        assert!(
+            repo.search_episodic("marker", "p", 10).unwrap().is_empty(),
+            "archived memory must not be searchable"
+        );
+
+        repo.restore(MemoryKind::Episodic, "ar1", "p").unwrap();
+        assert_eq!(
+            repo.fts_drift().unwrap(),
+            0,
+            "restored row must re-enter the index"
+        );
+        assert!(
+            !repo.search_episodic("marker", "p", 10).unwrap().is_empty(),
+            "restored memory must be searchable again"
+        );
+    }
+
+    #[test]
+    fn migrate_v9_converts_v8_db_to_unified_fts() {
+        // Simulate a v8 DB: main rows + per-type FTS tables, no unified table.
+        let repo = setup_repo();
+        repo.create_episodic(&episodic_fixture("v9e", "v9 conversion marker"))
+            .unwrap();
+        {
+            let conn = repo.connection().unwrap();
+            conn.execute_batch(
+                "DROP TABLE memories_fts; \
+                 CREATE VIRTUAL TABLE episodic_memories_fts USING fts5( \
+                     summary, content, files_touched, tags, \
+                     tokenize='porter unicode61', content='', contentless_delete=1); \
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+            // A stale legacy FTS row for an ARCHIVED memory — v9's backfill
+            // must not carry it into the unified index.
+            conn.execute_batch(
+                "INSERT INTO episodic_memories (id, project_id, session_id, summary, content, \
+                 files_touched, related_commits, importance, tags, created_at, updated_at, archived_at) \
+                 VALUES ('v9arch', 'p', 's', 'stale archived marker', 'x', '[]', '[]', 0.5, '[]', 1, 1, 5); \
+                 INSERT INTO episodic_memories_fts (summary, content, files_touched, tags, rowid) \
+                 VALUES ('stale archived marker', 'x', '[]', '[]', \
+                 (SELECT rowid FROM episodic_memories WHERE id = 'v9arch'));",
+            )
+            .unwrap();
+        }
+
+        repo.run_migrations().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(
+            !repo
+                .search_episodic("conversion", "p", 10)
+                .unwrap()
+                .is_empty(),
+            "v9 backfill must index active rows"
+        );
+        assert!(
+            repo.search_episodic("stale", "p", 10).unwrap().is_empty(),
+            "v9 backfill must skip archived rows even if the legacy index had them"
+        );
+        assert_eq!(repo.fts_drift().unwrap(), 0);
+        let conn = repo.connection().unwrap();
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'episodic_memories_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "v9 must drop the legacy FTS tables");
+    }
+
     #[test]
     fn sanitize_fts_query_escapes_reserved_words_and_operators() {
         // sanitize_fts_query wraps each whitespace-separated token in a
@@ -2746,11 +3958,9 @@ mod tests {
         );
 
         // Boolean operators inside the query are wrapped as literal phrases,
-        // NOT parsed as FTS5 AND/OR/NOT.
-        assert_eq!(
-            R::sanitize_fts_query("a AND b", false),
-            "\"a\" OR \"AND\" OR \"b\""
-        );
+        // NOT parsed as FTS5 AND/OR/NOT. ("a" is a stopword and dropped —
+        // stopwords never reach the MATCH expression.)
+        assert_eq!(R::sanitize_fts_query("a AND b", false), "\"AND\" OR \"b\"");
         assert_eq!(
             R::sanitize_fts_query("x OR y", false),
             "\"x\" OR \"OR\" OR \"y\""
@@ -3229,8 +4439,9 @@ mod tests {
         let conn = repo.connection().unwrap();
         let orphan: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM episodic_memories_fts f \
-                 WHERE NOT EXISTS (SELECT 1 FROM episodic_memories m WHERE m.rowid = f.rowid)",
+                "SELECT COUNT(*) FROM memories_fts f \
+                 WHERE NOT EXISTS (SELECT 1 FROM episodic_memories m \
+                                   WHERE f.rowid = m.rowid * 4 + 0)",
                 [],
                 |r| r.get(0),
             )
@@ -3248,30 +4459,36 @@ mod tests {
 
         {
             let conn = repo.connection().unwrap();
-            // Corrupt the index both ways: an orphan row (a rowid with no
-            // main-table row) + a missing row.
+            // Corrupt the index both ways: an orphan row (an encoded rowid
+            // with no main-table row) + a missing row.
             conn.execute(
-                "INSERT INTO episodic_memories_fts (summary, content, files_touched, tags, rowid)
-                 VALUES ('orphan', 'orphan', '[]', '[]', 99999)",
+                "INSERT INTO memories_fts (title, body, tags, project, kind, rowid)
+                 VALUES ('orphan', 'orphan', '[]', '00', 'episodic', 99999 * 4)",
                 [],
             )
             .unwrap();
             conn.execute(
-                "DELETE FROM episodic_memories_fts WHERE rowid = \
-                 (SELECT rowid FROM episodic_memories WHERE id = 'e2')",
+                "DELETE FROM memories_fts WHERE rowid = \
+                 (SELECT rowid * 4 + 0 FROM episodic_memories WHERE id = 'e2')",
                 [],
             )
             .unwrap();
         }
 
         let written = repo.rebuild_fts().unwrap();
-        assert_eq!(written, 2, "one FTS row per main-table row");
+        assert_eq!(written, 2, "one FTS row per active main-table row");
+        assert_eq!(
+            repo.fts_drift().unwrap(),
+            0,
+            "index must align after rebuild"
+        );
 
         let orphan: i64 = {
             let conn = repo.connection().unwrap();
             conn.query_row(
-                "SELECT COUNT(*) FROM episodic_memories_fts f \
-                 WHERE NOT EXISTS (SELECT 1 FROM episodic_memories m WHERE m.rowid = f.rowid)",
+                "SELECT COUNT(*) FROM memories_fts f \
+                 WHERE NOT EXISTS (SELECT 1 FROM episodic_memories m \
+                                   WHERE f.rowid = m.rowid * 4 + 0)",
                 [],
                 |r| r.get(0),
             )
@@ -3293,17 +4510,23 @@ mod tests {
         // preprocessing-aware query side.
         {
             let conn = repo.connection().unwrap();
+            let (rid, project): (i64, String) = conn
+                .query_row(
+                    "SELECT rowid, project_id FROM episodic_memories WHERE id = 'c1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let hex = MemoryRepository::project_fts_hex(&project);
             conn.execute(
-                "DELETE FROM episodic_memories_fts WHERE rowid = \
-                 (SELECT rowid FROM episodic_memories WHERE id = 'c1')",
-                [],
+                "DELETE FROM memories_fts WHERE rowid = ?1",
+                params![rid * 4],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO episodic_memories_fts (summary, content, files_touched, tags, rowid) \
-                 VALUES ('修复认证模块', '修复认证模块 body', '[]', '[]', \
-                 (SELECT rowid FROM episodic_memories WHERE id = 'c1'))",
-                [],
+                "INSERT INTO memories_fts (title, body, tags, project, kind, rowid) \
+                 VALUES ('修复认证模块', '修复认证模块 body', '[]', ?1, 'episodic', ?2)",
+                params![hex, rid * 4],
             )
             .unwrap();
         }
@@ -3364,6 +4587,312 @@ mod tests {
         let stats = repo.query_stats("p", 0, 10).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].query, "new");
+    }
+
+    // ─── content_hash dedup (v10) Tests ────────────────────────────
+
+    fn dedup_fixture(id: &str, summary: &str) -> EpisodicMemory {
+        EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: format!("{summary} body"),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    fn stored_hash(repo: &MemoryRepository, table: &str, id: &str) -> Option<String> {
+        repo.connection()
+            .unwrap()
+            .query_row(
+                &format!("SELECT content_hash FROM {table} WHERE id = ?1"),
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn dedup_create_returns_existing_id_and_writes_hash() {
+        let repo = setup_repo();
+        assert_eq!(
+            repo.create_episodic_dedup(&dedup_fixture("a1", "dup needle"))
+                .unwrap(),
+            None,
+            "first create wins"
+        );
+        let existing = repo
+            .create_episodic_dedup(&dedup_fixture("a2", "dup needle"))
+            .unwrap();
+        assert_eq!(
+            existing.as_deref(),
+            Some("a1"),
+            "collision returns the existing id"
+        );
+        // Nothing was written for the loser.
+        assert!(repo.get_episodic("a2", "p").unwrap().is_none());
+        // The winner is hash-tracked.
+        assert!(stored_hash(&repo, "episodic_memories", "a1").is_some());
+        // Search still finds exactly one row (FTS dual-write intact).
+        assert_eq!(repo.search_episodic("needle", "p", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plain_create_writes_null_hash_and_allows_duplicates() {
+        // write_dedup=false semantics: no hash → the partial unique index
+        // ignores the rows → duplicates are created freely.
+        let repo = setup_repo();
+        repo.create_episodic(&dedup_fixture("a1", "same text"))
+            .unwrap();
+        repo.create_episodic(&dedup_fixture("a2", "same text"))
+            .unwrap();
+        assert_eq!(repo.search_episodic("same", "p", 10).unwrap().len(), 2);
+        assert_eq!(stored_hash(&repo, "episodic_memories", "a1"), None);
+        assert_eq!(stored_hash(&repo, "episodic_memories", "a2"), None);
+    }
+
+    #[test]
+    fn dedup_create_is_project_scoped() {
+        let repo = setup_repo();
+        let mut a = dedup_fixture("a1", "cross project");
+        a.project_id = "p1".into();
+        let mut b = dedup_fixture("a2", "cross project");
+        b.project_id = "p2".into();
+        repo.create_episodic_dedup(&a).unwrap();
+        repo.create_episodic_dedup(&b).unwrap();
+        assert!(repo.get_episodic("a1", "p1").unwrap().is_some());
+        assert!(repo.get_episodic("a2", "p2").unwrap().is_some());
+    }
+
+    #[test]
+    fn dedup_create_procedural_hashes_stored_steps_json() {
+        let repo = setup_repo();
+        let mk = |id: &str| ProceduralMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            workflow_name: "release".into(),
+            steps: vec!["test".into(), "deploy".into()],
+            related_tools: vec![],
+            tags: vec![],
+            importance: 0.5,
+            created_at: 1,
+            updated_at: 1,
+        };
+        assert_eq!(repo.create_procedural_dedup(&mk("p1")).unwrap(), None);
+        assert_eq!(
+            repo.create_procedural_dedup(&mk("p2")).unwrap().as_deref(),
+            Some("p1"),
+            "identical name+steps is a duplicate"
+        );
+        assert!(stored_hash(&repo, "procedural_memories", "p1").is_some());
+    }
+
+    #[test]
+    fn dedup_create_races_have_a_single_winner() {
+        // The regression this whole mechanism fixes: N concurrent identical
+        // creates used to ALL pass the find_exact_duplicate check and all
+        // write. Now the unique index picks exactly one winner; the rest get
+        // the winner's id back as a duplicate.
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemoryRepository::new(&tmp.path().join("race.db")).unwrap());
+        repo.initialize_schema().unwrap();
+
+        let mut handles = vec![];
+        for i in 0..8 {
+            let repo = Arc::clone(&repo);
+            handles.push(std::thread::spawn(move || {
+                let mut m = dedup_fixture("loser", "race condition probe");
+                m.id = format!("racer-{i}");
+                m.created_at = 100 + i;
+                m.updated_at = m.created_at;
+                repo.create_episodic_dedup(&m).unwrap()
+            }));
+        }
+        let mut winners = 0;
+        let mut loser_ids = Vec::new();
+        for h in handles {
+            match h.join().unwrap() {
+                None => winners += 1,
+                Some(existing) => loser_ids.push(existing),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one create must win the race");
+        assert_eq!(loser_ids.len(), 7);
+        let winner = loser_ids[0].clone();
+        assert!(loser_ids.iter().all(|id| *id == winner));
+        // Exactly one row survived.
+        assert_eq!(
+            repo.search_episodic("condition probe", "p", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn restore_releases_conflicting_hash_and_still_restores() {
+        // Boundary (2a): restore must WIN over dedup bookkeeping. A is
+        // archived while holding a hash; B (same text) was created after —
+        // restoring A would collide with B, so A's hash is released (NULL)
+        // and the restore succeeds.
+        let repo = setup_repo();
+        repo.create_episodic_dedup(&dedup_fixture("a1", "restore clash"))
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "a1", "p", 200).unwrap();
+        // B can be created while A is archived (partial index = active rows only).
+        repo.create_episodic_dedup(&dedup_fixture("a2", "restore clash"))
+            .unwrap();
+
+        assert!(repo.restore(MemoryKind::Episodic, "a1", "p").unwrap());
+        // Both rows are active; A lost its hash, B kept its own hash.
+        assert!(repo.get_active_episodic("a1", "p").unwrap().is_some());
+        assert!(repo.get_active_episodic("a2", "p").unwrap().is_some());
+        assert_eq!(stored_hash(&repo, "episodic_memories", "a1"), None);
+        assert!(stored_hash(&repo, "episodic_memories", "a2").is_some());
+        // FTS row re-inserted for the restored memory.
+        assert_eq!(repo.search_episodic("clash", "p", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn restore_without_conflict_keeps_hash() {
+        let repo = setup_repo();
+        repo.create_episodic_dedup(&dedup_fixture("a1", "plain restore"))
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "a1", "p", 200).unwrap();
+        assert!(repo.restore(MemoryKind::Episodic, "a1", "p").unwrap());
+        assert!(stored_hash(&repo, "episodic_memories", "a1").is_some());
+    }
+
+    #[test]
+    fn update_collision_errors_naming_the_conflict() {
+        // Boundary (2b): updates are explicit edits — colliding with another
+        // tracked ACTIVE row must fail loudly naming it, never merge silently.
+        let repo = setup_repo();
+        repo.create_episodic_dedup(&dedup_fixture("a1", "original alpha"))
+            .unwrap();
+        repo.create_episodic_dedup(&dedup_fixture("a2", "target bravo"))
+            .unwrap();
+
+        let mut edited = dedup_fixture("a1", "target bravo");
+        edited.updated_at = 300;
+        let err = repo.update_episodic(&edited).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a2") && msg.contains("identical"),
+            "error must name the conflicting memory, got: {msg}"
+        );
+        // a1's text was NOT changed.
+        assert_eq!(
+            repo.get_episodic("a1", "p").unwrap().unwrap().summary,
+            "original alpha"
+        );
+    }
+
+    #[test]
+    fn update_refreshes_tracked_hash_but_preserves_null() {
+        // Tracked rows keep a fresh hash after edits; untracked (write_dedup
+        // off) rows never GAIN one — otherwise editing one of two legacy
+        // duplicates would arm a collision for the other's next update.
+        let repo = setup_repo();
+        repo.create_episodic(&dedup_fixture("u1", "untracked one"))
+            .unwrap();
+        repo.create_episodic(&dedup_fixture("u2", "untracked one"))
+            .unwrap();
+        let mut e1 = dedup_fixture("u1", "untracked one");
+        e1.updated_at = 300;
+        repo.update_episodic(&e1).unwrap();
+        assert_eq!(stored_hash(&repo, "episodic_memories", "u1"), None);
+
+        repo.create_episodic_dedup(&dedup_fixture("t1", "tracked one"))
+            .unwrap();
+        let mut e2 = dedup_fixture("t1", "tracked rewritten");
+        e2.updated_at = 300;
+        repo.update_episodic(&e2).unwrap();
+        assert_eq!(
+            stored_hash(&repo, "episodic_memories", "t1").as_deref(),
+            Some(
+                content_hash(&dedup_text_episodic(
+                    "tracked rewritten",
+                    "tracked rewritten body"
+                ))
+                .as_str()
+            ),
+        );
+    }
+
+    #[test]
+    fn update_archived_memory_is_rejected_with_actionable_error() {
+        // Tombstone semantics: a forgotten memory cannot be modified — the
+        // error must say so (not a bogus "no row").
+        let repo = setup_repo();
+        repo.create_episodic(&dedup_fixture("a1", "archived text"))
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "a1", "p", 200).unwrap();
+        let mut e = dedup_fixture("a1", "archived text");
+        e.updated_at = 300;
+        let err = repo.update_episodic(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("archived"),
+            "error must say the memory is archived, got: {err}"
+        );
+        // The row is untouched.
+        assert!(repo.get_episodic("a1", "p").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_archived_memory_returns_false_and_keeps_row() {
+        // Tombstone semantics: hard delete must not silently remove a
+        // forgotten memory (gc_archived is the only legitimate reaper).
+        let repo = setup_repo();
+        repo.create_episodic(&dedup_fixture("a1", "protected"))
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "a1", "p", 200).unwrap();
+        assert!(!repo.delete_episodic("a1", "p").unwrap());
+        assert!(repo.get_episodic("a1", "p").unwrap().is_some());
+        // Active rows delete as before.
+        repo.restore(MemoryKind::Episodic, "a1", "p").unwrap();
+        assert!(repo.delete_episodic("a1", "p").unwrap());
+    }
+
+    #[test]
+    fn migrate_v10_backfills_active_rows_and_skips_archived_and_duplicates() {
+        // Boundary (2c): the backfill hashes ACTIVE rows; archived rows stay
+        // NULL; pre-existing duplicates keep only the EARLIEST row tracked so
+        // creating the unique index cannot fail.
+        let repo = setup_repo();
+        repo.create_episodic(&dedup_fixture("m1", "backfill alpha"))
+            .unwrap();
+        repo.create_episodic(&dedup_fixture("m2", "backfill alpha"))
+            .unwrap(); // duplicate
+        repo.create_episodic(&dedup_fixture("m3", "backfill bravo"))
+            .unwrap();
+        repo.archive(MemoryKind::Episodic, "m3", "p", 500).unwrap();
+
+        // Rewind to v9 and let the chain re-run v10.
+        repo.set_user_version(9).unwrap();
+        repo.run_migrations().unwrap();
+        assert_eq!(repo.user_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        // Earliest active duplicate is tracked; the later one stays NULL.
+        assert!(stored_hash(&repo, "episodic_memories", "m1").is_some());
+        assert_eq!(stored_hash(&repo, "episodic_memories", "m2"), None);
+        // Archived row stays NULL.
+        assert_eq!(stored_hash(&repo, "episodic_memories", "m3"), None);
+
+        // The dedup index now enforces from the backfilled state.
+        assert_eq!(
+            repo.create_episodic_dedup(&dedup_fixture("m4", "backfill alpha"))
+                .unwrap()
+                .as_deref(),
+            Some("m1")
+        );
     }
 
     #[test]

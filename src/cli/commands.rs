@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::git_integration::GitIntegration;
 use crate::models::*;
 use crate::reflection::ReflectionEngine;
 use crate::storage::MemoryRepository;
@@ -61,11 +60,14 @@ fn require_str(args: &[String], name: &str) -> Result<String> {
     Ok(value)
 }
 
-/// Extract an optional string argument by name.
+/// Extract an optional string argument by name. A following flag is not a
+/// value: `--session --dry-run` yields None instead of swallowing
+/// "--dry-run" as the session id (the same guard `require_str` enforces with
+/// an error).
 fn optional_str(args: &[String], name: &str) -> Option<String> {
     let flag = format!("--{name}");
     let pos = args.iter().position(|a| a == &flag)?;
-    args.get(pos + 1).cloned()
+    args.get(pos + 1).filter(|v| !v.starts_with("--")).cloned()
 }
 
 /// Extract a numeric argument by name. Non-numeric, NaN, and infinite values
@@ -266,6 +268,39 @@ pub fn init_guide(args: &[String]) -> Result<()> {
 const HOOK_COMMAND_MARKER: &str = "engram hook";
 const BRIEF_COMMAND_MARKER: &str = "engram brief";
 
+/// Shell-quote a value embedded into a hook command string. project_id
+/// defaults to a directory basename, and directory names can contain spaces
+/// ("My Project" — which used to silently bind the wrong id: the hook got
+/// `--project My` and treated `Project` as a stray argument) or shell
+/// metacharacters (`;`, `$()`, backticks — previously executed verbatim by
+/// the hook's shell; cloning a maliciously-named directory was enough).
+/// Safe strings pass through unchanged; everything else is single-quoted.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The `engram hook` command line for a project (shell-quoting applied).
+fn hook_command(project_id: &str) -> String {
+    format!(
+        "{HOOK_COMMAND_MARKER} --project {}",
+        shell_quote(project_id)
+    )
+}
+
+/// The `engram brief` command line for a project (shell-quoting applied).
+fn brief_command(project_id: &str) -> String {
+    format!(
+        "{BRIEF_COMMAND_MARKER} --project {}",
+        shell_quote(project_id)
+    )
+}
+
 /// Whether a hook command string belongs to engram (either wiring).
 fn is_engram_command(cmd: &str) -> bool {
     cmd.contains(HOOK_COMMAND_MARKER) || cmd.contains(BRIEF_COMMAND_MARKER)
@@ -327,7 +362,7 @@ fn install_hooks_impl(
     install_hook_entry(
         settings_path,
         "SessionEnd",
-        &format!("{HOOK_COMMAND_MARKER} --project {project_id}"),
+        &hook_command(project_id),
         dry_run,
     )
 }
@@ -343,7 +378,7 @@ fn install_brief_hook_impl(
     install_hook_entry(
         settings_path,
         "SessionStart",
-        &format!("{BRIEF_COMMAND_MARKER} --project {project_id}"),
+        &brief_command(project_id),
         dry_run,
     )
 }
@@ -485,12 +520,12 @@ pub fn install_hooks(args: &[String]) -> Result<()> {
     print_json(&serde_json::json!({
         "settings": settings_path.to_string_lossy(),
         "status": status,
-        "command": format!("{HOOK_COMMAND_MARKER} --project {project_id}"),
+        "command": hook_command(&project_id),
         "event": "SessionEnd",
         "brief": if with_brief {
             serde_json::json!({
                 "status": brief_status,
-                "command": format!("{BRIEF_COMMAND_MARKER} --project {project_id}"),
+                "command": brief_command(&project_id),
                 "event": "SessionStart",
             })
         } else {
@@ -593,8 +628,10 @@ pub fn search(args: &[String]) -> Result<()> {
 
     // Best-effort retrieval feedback (mirrors MCP search_memory): log this
     // query + its hits so `engram queries` / MCP `query_stats` can surface
-    // hit-rate signal. A logging failure never breaks the command.
-    let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    // hit-rate signal. Graph-expansion neighbors are excluded — they never
+    // matched the query, and counting them as impressions poisoned
+    // `engram tune`. A logging failure never breaks the command.
+    let result_ids = crate::retrieval::bm25::BM25Retriever::impression_ids(&results);
     if let Err(e) = provider.record_query(&project_id, &query, &result_ids, memory_type.as_deref())
     {
         tracing::warn!("query log failed: {e}");
@@ -631,19 +668,22 @@ pub fn brief(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Write-time exact-dup guard shared by the CLI creates (mirrors the MCP
-/// create_* tools): returns the existing identical memory's id, if any.
-fn duplicate_guard(
-    repo: &MemoryRepository,
-    config: &Config,
-    kind: crate::storage::MemoryKind,
-    project_id: &str,
-    text: &str,
-) -> Result<Option<String>> {
-    if !config.retrieval.write_dedup {
-        return Ok(None);
-    }
-    repo.find_exact_duplicate(kind, project_id, text)
+/// The CLI create commands all share one shape: build the typed provider
+/// input from flags, run it through `DefaultMemoryProvider` — the SAME path
+/// the MCP tools use — and print the provider's JSON result. This keeps the
+/// two entry points from drifting (the CLI previously skipped importance
+/// validation AND semantic embedding, silently forking behavior).
+macro_rules! cli_create {
+    ($args:expr, $input_constructor:expr, $method:ident, $input_ty:ty) => {{
+        let input: $input_ty = $input_constructor;
+        let config = load_config()?;
+        let repo = open_repo(&config)?;
+        let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+        use crate::mcp::server::MemoryToolProvider as _;
+        let value = provider.$method(input)?;
+        print_json(&value);
+        Ok(())
+    }};
 }
 
 pub fn create_episodic(args: &[String]) -> Result<()> {
@@ -656,41 +696,21 @@ pub fn create_episodic(args: &[String]) -> Result<()> {
     let importance = optional_num(args, "importance").unwrap_or(0.5) as f32;
     let tags = repeated_args(args, "tag");
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    if let Some(existing) = duplicate_guard(
-        &repo,
-        &config,
-        crate::storage::MemoryKind::Episodic,
-        &project_id,
-        &format!("{summary}\n{content}"),
-    )? {
-        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
-        return Ok(());
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_ts();
-
-    let memory = EpisodicMemory {
-        id: id.clone(),
-        project_id,
-        session_id,
-        summary,
-        content,
-        files_touched: files,
-        related_commits: commits,
-        importance,
-        tags,
-        created_at: now,
-        updated_at: now,
-    };
-
-    repo.create_episodic(&memory)?;
-
-    print_json(&serde_json::json!({"id": id, "status": "created", "created_at": now}));
-    Ok(())
+    cli_create!(
+        args,
+        crate::mcp::server::CreateEpisodicInput {
+            project_id,
+            session_id,
+            summary,
+            content,
+            files_touched: files,
+            related_commits: commits,
+            importance,
+            tags,
+        },
+        create_episodic,
+        crate::mcp::server::CreateEpisodicInput
+    )
 }
 
 pub fn create_decision(args: &[String]) -> Result<()> {
@@ -702,62 +722,31 @@ pub fn create_decision(args: &[String]) -> Result<()> {
     let files = comma_list(args, "files");
     let tags = repeated_args(args, "tag");
     let supersedes = optional_str(args, "supersedes");
+    let importance = optional_num(args, "importance")
+        .map(|v| -> Result<f32> {
+            if !(0.0..=1.0).contains(&v) {
+                anyhow::bail!("importance must be between 0 and 1, got {v}");
+            }
+            Ok(v as f32)
+        })
+        .transpose()?;
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    if let Some(existing) = duplicate_guard(
-        &repo,
-        &config,
-        crate::storage::MemoryKind::Decision,
-        &project_id,
-        &format!("{title}\n{context}\n{rationale}\n{tradeoffs}"),
-    )? {
-        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
-        return Ok(());
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_ts();
-
-    let importance = {
-        let v = optional_num(args, "importance").unwrap_or(0.5);
-        if !(0.0..=1.0).contains(&v) {
-            anyhow::bail!("importance must be between 0 and 1, got {v}");
-        }
-        v as f32
-    };
-    let memory = DecisionMemory {
-        id: id.clone(),
-        project_id: project_id.clone(),
-        title,
-        context,
-        rationale,
-        tradeoffs,
-        related_files: files,
-        tags,
-        importance,
-        superseded_by: None,
-        created_at: now,
-        updated_at: now,
-    };
-
-    repo.create_decision(&memory)?;
-
-    // Supersede chain: point the replaced decision at this one.
-    let mut superseded = serde_json::Value::Null;
-    if let Some(old_id) = &supersedes {
-        repo.supersede_decision(&project_id, old_id, &id, now)?;
-        superseded = serde_json::json!(old_id);
-    }
-
-    print_json(&serde_json::json!({
-        "id": id,
-        "status": "created",
-        "superseded": superseded,
-        "created_at": now,
-    }));
-    Ok(())
+    cli_create!(
+        args,
+        crate::mcp::server::CreateDecisionInput {
+            project_id,
+            title,
+            context,
+            rationale,
+            tradeoffs,
+            related_files: files,
+            tags,
+            importance,
+            supersedes,
+        },
+        create_decision,
+        crate::mcp::server::CreateDecisionInput
+    )
 }
 
 pub fn create_failure(args: &[String]) -> Result<()> {
@@ -775,42 +764,20 @@ pub fn create_failure(args: &[String]) -> Result<()> {
     };
     let tags = repeated_args(args, "tag");
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    if let Some(existing) = duplicate_guard(
-        &repo,
-        &config,
-        crate::storage::MemoryKind::Failure,
-        &project_id,
-        &format!("{incident}\n{root_cause}\n{fix}\n{prevention}"),
-    )? {
-        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
-        return Ok(());
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_ts();
-
-    let memory = FailureMemory {
-        id: id.clone(),
-        project_id,
-        incident,
-        root_cause,
-        fix,
-        prevention,
-        severity,
-        tags,
-        created_at: now,
-        updated_at: now,
-    };
-
-    repo.create_failure(&memory)?;
-
-    print_json(
-        &serde_json::json!({"id": id, "status": "created", "severity": severity, "created_at": now}),
-    );
-    Ok(())
+    cli_create!(
+        args,
+        crate::mcp::server::CreateFailureInput {
+            project_id,
+            incident,
+            root_cause,
+            fix,
+            prevention,
+            severity,
+            tags,
+        },
+        create_failure,
+        crate::mcp::server::CreateFailureInput
+    )
 }
 
 pub fn create_procedural(args: &[String]) -> Result<()> {
@@ -820,94 +787,52 @@ pub fn create_procedural(args: &[String]) -> Result<()> {
     let steps: Vec<String> = steps_str.split(',').map(|s| s.trim().to_string()).collect();
     let tools = comma_list(args, "tools");
     let tags = repeated_args(args, "tag");
+    let importance = optional_num(args, "importance")
+        .map(|v| -> Result<f32> {
+            if !(0.0..=1.0).contains(&v) {
+                anyhow::bail!("importance must be between 0 and 1, got {v}");
+            }
+            Ok(v as f32)
+        })
+        .transpose()?;
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    // Steps are stored as their JSON array string — the guard must compare
-    // against the same serialization.
-    if let Some(existing) = duplicate_guard(
-        &repo,
-        &config,
-        crate::storage::MemoryKind::Procedural,
-        &project_id,
-        &format!("{workflow_name}\n{}", serde_json::to_string(&steps)?),
-    )? {
-        print_json(&serde_json::json!({"id": existing, "status": "duplicate"}));
-        return Ok(());
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_ts();
-
-    let importance = {
-        let v = optional_num(args, "importance").unwrap_or(0.5);
-        if !(0.0..=1.0).contains(&v) {
-            anyhow::bail!("importance must be between 0 and 1, got {v}");
-        }
-        v as f32
-    };
-    let memory = ProceduralMemory {
-        id: id.clone(),
-        project_id,
-        workflow_name,
-        steps,
-        related_tools: tools,
-        tags,
-        importance,
-        created_at: now,
-        updated_at: now,
-    };
-
-    repo.create_procedural(&memory)?;
-
-    print_json(&serde_json::json!({"id": id, "status": "created", "created_at": now}));
-    Ok(())
+    cli_create!(
+        args,
+        crate::mcp::server::CreateProceduralInput {
+            project_id,
+            workflow_name,
+            steps,
+            related_tools: tools,
+            tags,
+            importance,
+        },
+        create_procedural,
+        crate::mcp::server::CreateProceduralInput
+    )
 }
 
 pub fn ingest(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let repo_path = require_str(args, "repo")?;
     let count = (optional_num(args, "count").unwrap_or(20.0) as usize).clamp(1, 1000);
-    let session_id = optional_str(args, "session").unwrap_or_else(|| "auto-ingest".into());
+    let session_id = optional_str(args, "session");
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    let git = GitIntegration::new(Path::new(&repo_path))?;
-    let events = git.get_recent_commits(count)?;
-
-    // Dedup BEFORE generating (skip tree-diff work for known commits)…
-    let ingested_hashes = repo.get_ingested_commits(&project_id)?;
-    let fresh: Vec<crate::git_integration::CommitEvent> = events
-        .into_iter()
-        .filter(|e| !ingested_hashes.contains(&e.commit_hash))
-        .collect();
-    let skipped = count.saturating_sub(fresh.len());
-
-    // …then distill into one memory per (type, scope) milestone — same
-    // clustering the bootstrap collector uses, instead of one noisy memory
-    // per commit.
-    let memories = crate::git_integration::milestone_memories(&project_id, &session_id, &fresh);
-
-    let mut ingested = Vec::new();
-    for mem in &memories {
-        repo.create_episodic(mem)?;
-        ingested.push(serde_json::json!({
-            "id": mem.id,
-            "summary": mem.summary,
-            "commits": mem.related_commits.len(),
-            "files": mem.files_touched,
-        }));
-    }
-
-    print_json(&serde_json::json!({
-        "ingested": ingested.len(),
-        "total_commits_scanned": count,
-        "skipped_duplicates": skipped,
-        "memories": ingested,
-    }));
-    Ok(())
+    // Route through the provider (same path as the MCP tool): repo_path
+    // validation via path_guard, corrected scanned/skipped accounting, and
+    // — under the semantic feature — embeddings for the created memories.
+    // The previous CLI implementation talked to the repo directly and skipped
+    // all three.
+    cli_create!(
+        args,
+        crate::mcp::server::IngestCommitsInput {
+            project_id,
+            repo_path,
+            count,
+            session_id,
+        },
+        ingest_commits,
+        crate::mcp::server::IngestCommitsInput
+    )
 }
 
 pub fn collect(args: &[String]) -> Result<()> {
@@ -916,110 +841,83 @@ pub fn collect(args: &[String]) -> Result<()> {
     let dimensions = optional_str(args, "dimensions");
     let max_commits = (optional_num(args, "max-commits").unwrap_or(200.0) as usize).clamp(1, 1000);
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    // `collect` is a bootstrap entry point — ensure schema so it works on a
-    // fresh database without requiring a prior `engram init`.
-    repo.initialize_schema()?;
-
-    let dims = crate::collectors::Dimension::parse_list(dimensions.as_deref());
-    if dims.is_empty() {
-        anyhow::bail!("no valid dimensions parsed; valid: git, decisions, failures, workflow");
-    }
-
-    // Mirror the MCP tool: reuse commit-hash dedup so re-running collect stays idempotent.
-    let ingested = repo.get_ingested_commits(&project_id)?;
-    let opts = crate::collectors::CollectOptions {
-        max_commits,
-        ingested_commit_hashes: ingested,
-        ..Default::default()
-    };
-
-    let sources = crate::collectors::collect(&project_id, Path::new(&repo_path), &dims, &opts)?;
-    print_json(&serde_json::to_value(&sources)?);
-    Ok(())
+    // Same path as the MCP collect_sources tool (open_repo in the macro
+    // ensures schema, so the bootstrap entry point still works on a fresh
+    // database): commit-hash dedup for idempotent re-collection, path_guard
+    // + the configured allowed_roots allowlist, and one dimension-parse
+    // implementation. The previous CLI-local orchestration (~15 lines)
+    // duplicated all of it.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "repo_path": repo_path,
+            "dimensions": dimensions,
+            "max_commits": max_commits,
+        }))?,
+        collect_sources,
+        crate::mcp::server::CollectSourcesInput
+    )
 }
 
 pub fn recent_failures(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let service = optional_str(args, "service");
-    let limit = (optional_num(args, "limit").unwrap_or(5.0) as usize).clamp(1, 1000);
+    let limit = optional_num(args, "limit").map(|n| n as usize);
 
+    // Provider path (same renderer as the MCP recent_failures tool): the
+    // output now carries `prevention` and `tags` too — prevention is the
+    // core field of a failure record, and the old CLI-local renderer hid it.
     let config = load_config()?;
     let repo = open_repo(&config)?;
-
-    let query = service.as_deref().unwrap_or("");
-    let results = if query.is_empty() {
-        repo.list_recent_failures(&project_id, limit)?
-    } else {
-        repo.search_failures(query, &project_id, limit)?
-            .into_iter()
-            .map(|s| s.memory)
-            .collect()
-    };
-
-    let failures: Vec<serde_json::Value> = results
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "id": f.id,
-                "incident": f.incident,
-                "root_cause": f.root_cause,
-                "fix": f.fix,
-                "severity": f.severity,
-                "created_at": f.created_at,
-            })
-        })
-        .collect();
-
-    print_json(&serde_json::json!({"failures": failures, "total": failures.len()}));
+    let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+    use crate::mcp::server::MemoryToolProvider as _;
+    let mut value = provider.recent_failures(serde_json::from_value(serde_json::json!({
+        "project_id": project_id,
+        "service": service,
+        "limit": limit,
+    }))?)?;
+    // Keep the CLI's `total` field (a pure derivation of the result above).
+    if let Some(obj) = value.as_object_mut() {
+        let total = obj
+            .get("failures")
+            .and_then(|f| f.as_array())
+            .map_or(0, |a| a.len());
+        obj.insert("total".into(), serde_json::json!(total));
+    }
+    print_json(&value);
     Ok(())
 }
 
 pub fn decisions(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let topic = optional_str(args, "topic");
-    let limit = (optional_num(args, "limit").unwrap_or(5.0) as usize).clamp(1, 1000);
+    let limit = optional_num(args, "limit").map(|n| n as usize);
     // Current decisions by default — superseded (replaced) ones only with
     // --all, mirroring the MCP architectural_decisions tool.
     let include_superseded = args.iter().any(|a| a == "--all");
 
+    // Provider path (same renderer as the MCP architectural_decisions tool):
+    // the output now carries `related_files` and `tags` as well.
     let config = load_config()?;
     let repo = open_repo(&config)?;
-
-    let query = topic.as_deref().unwrap_or("");
-    let mut results = if query.is_empty() {
-        repo.list_recent_decisions(&project_id, limit * 2)?
-    } else {
-        repo.search_decisions(query, &project_id, limit * 2)?
-            .into_iter()
-            .map(|s| s.memory)
-            .collect()
-    };
-    if !include_superseded {
-        results.retain(|d| d.superseded_by.is_none());
+    let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+    use crate::mcp::server::MemoryToolProvider as _;
+    let mut value =
+        provider.architectural_decisions(serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "topic": topic,
+            "limit": limit,
+            "include_superseded": include_superseded,
+        }))?)?;
+    if let Some(obj) = value.as_object_mut() {
+        let total = obj
+            .get("decisions")
+            .and_then(|d| d.as_array())
+            .map_or(0, |a| a.len());
+        obj.insert("total".into(), serde_json::json!(total));
     }
-    results.truncate(limit);
-
-    let decisions: Vec<serde_json::Value> = results
-        .iter()
-        .map(|d| {
-            let mut item = serde_json::json!({
-                "id": d.id,
-                "title": d.title,
-                "context": d.context,
-                "rationale": d.rationale,
-                "tradeoffs": d.tradeoffs,
-                "created_at": d.created_at,
-            });
-            if let Some(sb) = &d.superseded_by {
-                item["superseded_by"] = serde_json::json!(sb);
-            }
-            item
-        })
-        .collect();
-
-    print_json(&serde_json::json!({"decisions": decisions, "total": decisions.len()}));
+    print_json(&value);
     Ok(())
 }
 
@@ -1031,22 +929,13 @@ pub fn timeline(args: &[String]) -> Result<()> {
     let repo = open_repo(&config)?;
 
     let since = now_ts() - days.saturating_mul(86400);
-    let conn = repo.connection()?;
-
-    let mut stmt = conn.prepare(
-        "SELECT date(created_at, 'unixepoch') as day, COUNT(*) as cnt
-         FROM episodic_memories
-         WHERE project_id = ?1 AND created_at >= ?2 AND archived_at IS NULL
-         GROUP BY day ORDER BY day DESC",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![project_id, since], |row| {
-        let day: String = row.get(0)?;
-        let count: i64 = row.get(1)?;
-        Ok(serde_json::json!({"date": day, "episodic_count": count}))
-    })?;
-
-    let events: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+    // Same repository accessor the MCP timeline tool uses — the old inline
+    // SQL here was a second implementation that could drift.
+    let events: Vec<serde_json::Value> = repo
+        .timeline(&project_id, since)?
+        .into_iter()
+        .map(|r| serde_json::json!({"date": r.day, "episodic_count": r.count}))
+        .collect();
 
     print_json(&serde_json::json!({"events": events}));
     Ok(())
@@ -1054,57 +943,72 @@ pub fn timeline(args: &[String]) -> Result<()> {
 
 /// `engram queries` — retrieval feedback: aggregate past search queries by
 /// frequency and average hit count. Surfaces which queries are common and
-/// which return few results.
+/// which return few results. Output is the MCP `query_stats` rendering
+/// (result_count_avg rounded to 2 decimals; days window clamped to 0..=3650
+/// — the CLI's old unclamped window could land in the future).
 pub fn queries(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let days = optional_num(args, "days").unwrap_or(7.0) as i64;
-    let limit = (optional_num(args, "limit").unwrap_or(10.0) as usize).clamp(1, 1000);
+    let limit = optional_num(args, "limit").map(|n| n as usize);
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    let since = now_ts() - days.saturating_mul(86400);
-    let stats = repo.query_stats(&project_id, since, limit)?;
-
-    print_json(&serde_json::json!({
-        "queries": serde_json::to_value(&stats)?
-    }));
-    Ok(())
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "days": days,
+            "limit": limit,
+        }))?,
+        query_stats,
+        crate::mcp::server::QueryStatsInput
+    )
 }
 
 pub fn forget(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = require_str(args, "type")?;
     let id = require_str(args, "id")?;
-    let kind = crate::storage::MemoryKind::from_type_str(&memory_type)?;
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let archived = repo.archive(kind, &id, &project_id, now_ts())?;
-    print_json(&serde_json::json!({"id": id, "archived": archived}));
-    Ok(())
+    // Provider path (same as forget_memory): batch-3 archived-tombstone
+    // semantics plus semantic vector-cache invalidation, which the old
+    // direct-repository call silently skipped. Input structs whose fields
+    // are private are built via their Deserialize impl — the same parse the
+    // MCP dispatch performs on tool arguments.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "id": id,
+        }))?,
+        forget_memory,
+        crate::mcp::server::ForgetMemoryInput
+    )
 }
 
 pub fn restore(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = require_str(args, "type")?;
     let id = require_str(args, "id")?;
-    let kind = crate::storage::MemoryKind::from_type_str(&memory_type)?;
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let restored = repo.restore(kind, &id, &project_id)?;
-    print_json(&serde_json::json!({"id": id, "restored": restored}));
-    Ok(())
+    // Provider path (same as restore_memory) — includes the semantic
+    // vector-cache invalidation the direct-repository call skipped.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "id": id,
+        }))?,
+        restore_memory,
+        crate::mcp::server::RestoreMemoryInput
+    )
 }
 
-pub fn update(args: &[String]) -> Result<()> {
-    let project_id = require_str(args, "project")?;
-    let memory_type = require_str(args, "type")?;
-    let id = require_str(args, "id")?;
-    let kind = crate::storage::MemoryKind::from_type_str(&memory_type)?;
-
-    // Build a patch object from generic --set key=value pairs.
+/// Parse the repeated `--set key=value` pairs of `engram update` into a
+/// patch object. Values are parsed as JSON when possible (numbers, bools,
+/// arrays) and fall back to plain strings — always-strings made
+/// `--set importance=0.9` fail type checking against the typed model.
+fn parse_set_pairs(args: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut patch = serde_json::Map::new();
     let mut i = 0;
     while i < args.len() {
@@ -1112,10 +1016,6 @@ pub fn update(args: &[String]) -> Result<()> {
             if let Some(kv) = args.get(i + 1) {
                 match kv.split_once('=') {
                     Some((k, v)) => {
-                        // Parse the value as JSON when possible (numbers, bools,
-                        // arrays); fall back to a plain string. Always-string
-                        // values made `--set importance=0.9` fail type
-                        // checking against the typed model.
                         let parsed = serde_json::from_str::<serde_json::Value>(v)
                             .unwrap_or_else(|_| serde_json::json!(v));
                         patch.insert(k.to_string(), parsed);
@@ -1130,47 +1030,44 @@ pub fn update(args: &[String]) -> Result<()> {
             i += 1;
         }
     }
+    Ok(patch)
+}
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let now = now_ts();
+pub fn update(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let memory_type = require_str(args, "type")?;
+    let id = require_str(args, "id")?;
+    let patch = parse_set_pairs(args)?;
 
-    macro_rules! guarded {
-        ($get:ident, $update:ident) => {{
-            let existing = repo
-                .$get(&id, &project_id)?
-                .ok_or_else(|| anyhow::anyhow!("memory not found in project {project_id}: {id}"))?;
-            let mut obj = match serde_json::to_value(&existing)? {
-                serde_json::Value::Object(m) => m,
-                _ => anyhow::bail!("memory did not serialize to object"),
-            };
-            for (k, v) in &patch {
-                if ["id", "project_id", "created_at", "memory_type"].contains(&k.as_str()) {
-                    continue;
-                }
-                if obj.contains_key(k) {
-                    obj.insert(k.clone(), v.clone());
-                } else {
-                    // A typo'd key used to vanish silently; say so.
-                    eprintln!(
-                        "warning: unknown field '{k}' ignored (no such field on this memory type)"
-                    );
-                }
+    // Provider path (same merge-patch as the MCP update_memory tool): the
+    // CLI's second inline merge-patch implementation is gone, and the
+    // command inherits batch-3 semantics — updating an archived memory
+    // fails with "restore it first", an edit whose new text collides with
+    // another active row's content hash fails naming the conflict, and
+    // (semantic builds) the updated text is re-embedded.
+    //
+    // The input's `patch` is serde-flattened: the --set pairs ride as plain
+    // keys next to the addressing triple. Protected keys are dropped here so
+    // the flag-derived addressing always wins (the old CLI skipped them in
+    // the merge for the same reason).
+    let mut input = serde_json::json!({
+        "project_id": project_id,
+        "memory_type": memory_type,
+        "id": id,
+    });
+    if let Some(obj) = input.as_object_mut() {
+        for (k, v) in patch {
+            if !matches!(k.as_str(), "project_id" | "memory_type" | "id") {
+                obj.insert(k, v);
             }
-            obj.insert("updated_at".into(), serde_json::json!(now));
-            let updated = serde_json::from_value(serde_json::Value::Object(obj))?;
-            repo.$update(&updated)?;
-        }};
+        }
     }
-    use crate::storage::MemoryKind::*;
-    match kind {
-        Episodic => guarded!(get_episodic, update_episodic),
-        Decision => guarded!(get_decision, update_decision),
-        Failure => guarded!(get_failure, update_failure),
-        Procedural => guarded!(get_procedural, update_procedural),
-    }
-    print_json(&serde_json::json!({"id": id, "status": "updated"}));
-    Ok(())
+    cli_create!(
+        args,
+        serde_json::from_value(input)?,
+        update_memory,
+        crate::mcp::server::UpdateMemoryInput
+    )
 }
 
 pub fn forget_batch(args: &[String]) -> Result<()> {
@@ -1180,47 +1077,40 @@ pub fn forget_batch(args: &[String]) -> Result<()> {
     let before = optional_num(args, "before").map(|n| n as i64);
     let apply = args.iter().any(|a| a == "--apply");
 
-    let kinds = match memory_type {
-        Some(s) => vec![crate::storage::MemoryKind::from_type_str(&s)?],
-        None => crate::storage::MemoryKind::all().to_vec(),
-    };
-
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let now = now_ts();
-    let mut matched = Vec::new();
-    for kind in kinds {
-        let ids = if apply {
-            repo.archive_batch(kind, &project_id, &tags, before, now)?
-        } else {
-            repo.list_active_candidates(kind, &project_id, &tags, before)?
-        };
-        for id in ids {
-            matched.push(serde_json::json!({"id": id, "memory_type": kind.as_str()}));
-        }
-    }
-    print_json(&serde_json::json!({"applied": apply, "matched": matched, "count": matched.len()}));
-    Ok(())
+    // Provider path (same as the MCP forget_batch tool): identical dry-run /
+    // apply accounting, plus the semantic vector-cache invalidation the
+    // direct-repository call skipped on --apply.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "tags": tags,
+            "before": before,
+            "apply": apply,
+        }))?,
+        forget_batch,
+        crate::mcp::server::ForgetBatchInput
+    )
 }
 
 pub fn list_archived(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = optional_str(args, "type");
-    let limit = (optional_num(args, "limit").unwrap_or(20.0) as usize).clamp(1, 1000);
-    let kinds = match memory_type {
-        Some(s) => vec![crate::storage::MemoryKind::from_type_str(&s)?],
-        None => crate::storage::MemoryKind::all().to_vec(),
-    };
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let mut archived = Vec::new();
-    for kind in kinds {
-        for row in repo.list_archived(kind, &project_id, limit)? {
-            archived.push(serde_json::to_value(&row)?);
-        }
-    }
-    print_json(&serde_json::json!({"archived": archived, "count": archived.len()}));
-    Ok(())
+    let limit = optional_num(args, "limit").map(|n| n as usize);
+
+    // Provider path (same as the MCP list_archived tool); the provider
+    // clamps the limit into 1..=1000 itself.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "limit": limit,
+        }))?,
+        list_archived,
+        crate::mcp::server::ListArchivedInput
+    )
 }
 
 /// `engram gc [--older-than <dur> | --all] [--apply] [--vacuum] [--no-checkpoint]`
@@ -1325,27 +1215,22 @@ pub fn consolidate(args: &[String]) -> Result<()> {
     let memory_type = optional_str(args, "type");
     let include_near_dup = args.iter().any(|a| a == "--near");
     let apply = args.iter().any(|a| a == "--apply");
-    let kinds = match memory_type {
-        Some(s) => vec![crate::storage::MemoryKind::from_type_str(&s)?],
-        None => crate::storage::MemoryKind::all().to_vec(),
-    };
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-    let engine = crate::consolidation::ConsolidationEngine::new();
-    let plans = engine.consolidate(
-        &repo,
-        &project_id,
-        &kinds,
-        include_near_dup,
-        crate::consolidation::engine::DEFAULT_JACCARD_THRESHOLD,
-        apply,
-        now_ts(),
-    )?;
-    let total_archived: usize = plans.iter().map(|p| p.archived).sum();
-    print_json(
-        &serde_json::json!({"applied": apply, "plans": plans, "total_archived": total_archived}),
-    );
-    Ok(())
+
+    // Provider path (same engine invocation as the MCP consolidate_memories
+    // tool, including the default Jaccard threshold and — on --apply with
+    // archives — the semantic vector-cache invalidation the direct call here
+    // used to skip).
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "include_near_dup": include_near_dup,
+            "apply": apply,
+        }))?,
+        consolidate_memories,
+        crate::mcp::server::ConsolidateInput
+    )
 }
 
 /// `engram reflect --project <id> [--min <n>] [--apply]` — scan a project's
@@ -1431,32 +1316,20 @@ pub fn get(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let memory_type = require_str(args, "type")?;
     let id = require_str(args, "id")?;
-    let kind = crate::storage::MemoryKind::from_type_str(&memory_type)?;
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    macro_rules! fetch {
-        ($get:ident) => {{
-            // project scoping is enforced in the SQL itself
-            let mem = repo
-                .$get(&id, &project_id)?
-                .ok_or_else(|| anyhow::anyhow!("memory not found in project {project_id}: {id}"))?;
-            serde_json::to_value(&mem)?
-        }};
-    }
-    use crate::storage::MemoryKind::*;
-    let memory = match kind {
-        Episodic => fetch!(get_episodic),
-        Decision => fetch!(get_decision),
-        Failure => fetch!(get_failure),
-        Procedural => fetch!(get_procedural),
-    };
-    print_json(&serde_json::json!({
-        "memory_type": kind.as_str(),
-        "memory": memory,
-    }));
-    Ok(())
+    // Provider path: identical output shape, and the read now records an
+    // adoption event like the MCP tool — CLI reads count toward query_stats
+    // adoption rates and `engram tune` (best-effort inside the provider).
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "memory_type": memory_type,
+            "id": id,
+        }))?,
+        get_memory,
+        crate::mcp::server::GetMemoryInput
+    )
 }
 /// `engram backup [--out <dir>] [--keep N]` — snapshot the database via the
 /// SQLite online-backup API (safe while the MCP server has the DB open).
@@ -1572,8 +1445,14 @@ pub fn import(args: &[String]) -> Result<()> {
     let mut created = 0usize;
     let mut skipped = 0usize;
 
+    // Embedding parity with the provider's create path: imported memories
+    // were invisible to semantic search until a manual `engram reindex`.
+    // No-op when the embedder is absent; compiled out without the feature.
+    #[cfg(feature = "semantic")]
+    let embedding = crate::mcp::embedding_service::EmbeddingService::new(&config);
+
     macro_rules! import_kind {
-        ($key:literal, $get:ident, $create:ident, $ty:ty) => {{
+        ($key:literal, $kind:literal, $get:ident, $create:ident, $ty:ty) => {{
             if let Some(items) = payload.get($key).and_then(|v| v.as_array()) {
                 for item in items {
                     let mem: $ty = serde_json::from_value(item.clone())
@@ -1581,6 +1460,14 @@ pub fn import(args: &[String]) -> Result<()> {
                     if repo.$get(&mem.id, &mem.project_id)?.is_some() {
                         skipped += 1;
                     } else {
+                        #[cfg(feature = "semantic")]
+                        embedding.index(
+                            &repo,
+                            $kind,
+                            &mem.id,
+                            &mem.project_id,
+                            &mem.embedding_text(),
+                        );
                         repo.$create(&mem)?;
                         created += 1;
                     }
@@ -1590,11 +1477,13 @@ pub fn import(args: &[String]) -> Result<()> {
     }
     import_kind!(
         "episodic",
+        "episodic",
         get_episodic,
         create_episodic,
         crate::models::EpisodicMemory
     );
     import_kind!(
+        "decision",
         "decision",
         get_decision,
         create_decision,
@@ -1602,11 +1491,13 @@ pub fn import(args: &[String]) -> Result<()> {
     );
     import_kind!(
         "failure",
+        "failure",
         get_failure,
         create_failure,
         crate::models::FailureMemory
     );
     import_kind!(
+        "procedural",
         "procedural",
         get_procedural,
         create_procedural,
@@ -1769,10 +1660,12 @@ fn report_summary(report: &crate::retrieval::eval::EvalReport) -> serde_json::Va
 
 /// `engram tune --project <id> [--days N] [--apply]` — close the adoption
 /// feedback loop automatically: memories that keep getting adopted move up in
-/// importance, memories that keep getting served and ignored move down.
+/// importance, memories that keep getting served and ignored move down
+/// (never memories with explicit 'useful' feedback in the window).
 /// Dry-run by default (prints the evidence-backed proposals); --apply writes
-/// bounded ±0.1 adjustments (severity for failures) via the same path
-/// `mark_relevance` uses.
+/// bounded ±0.1 adjustments via the same path `mark_relevance` uses. Failure
+/// memories are never auto-tuned — severity is an operational record — and
+/// are reported via `failures_skipped` for manual review.
 pub fn tune(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let days = (optional_num(args, "days").unwrap_or(30.0) as i64).clamp(1, 3650);
@@ -1795,6 +1688,16 @@ pub fn tune(args: &[String]) -> Result<()> {
         "applied_count": applied,
         "window_days": days,
         "window_queries": report.window_queries,
+        "failures_skipped": report.failures_skipped,
+        "failures_note": if report.failures_skipped > 0 {
+            format!(
+                "{} failure memories skipped: severity is an operational record of \
+                 incident impact, not auto-tuned — review them manually",
+                report.failures_skipped
+            )
+        } else {
+            String::new()
+        },
         "proposal_count": report.proposals.len(),
         "proposals": report.proposals,
         "hint": if !apply && !report.proposals.is_empty() {
@@ -1841,8 +1744,26 @@ pub fn maintain(args: &[String]) -> Result<()> {
         }
     }
 
-    // 2. FTS repair (idempotent — aligns the index with the main tables).
-    let fts_rows = repo.rebuild_fts()?;
+    // 2. FTS repair — gated by an actual drift check (main-table row count
+    // vs FTS row count per table). The old unconditional rebuild made even a
+    // dry-run maintain do a full delete+reinsert of every FTS table (a long
+    // write transaction on large stores) on every run.
+    let fts_drift = repo.fts_drift()?;
+    let fts_rows = if fts_drift == 0 {
+        // Aligned — verify the index is also internally consistent before
+        // skipping (a corrupt index needs the rebuild even at equal counts).
+        match repo.fts_integrity_check() {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::warn!("FTS integrity check failed ({e}); rebuilding");
+                repo.rebuild_fts()?
+            }
+        }
+    } else if apply {
+        repo.rebuild_fts()?
+    } else {
+        0 // dry-run: report the drift, write nothing
+    };
 
     // 3. query_log retention prune.
     let retention_secs = (config
@@ -1854,6 +1775,50 @@ pub fn maintain(args: &[String]) -> Result<()> {
     } else {
         0
     };
+
+    // 3b. Reflection pass (apply only): recurring-failure tags become pending
+    // preventive-rule proposals. Without this, `reflect` had no trigger —
+    // suggestion pools stayed empty unless someone remembered the command.
+    let mut reflected = 0usize;
+    let mut suggestions_created = 0usize;
+    if apply {
+        let engine = crate::reflection::ReflectionEngine::with_min_occurrences(
+            config.reflection.min_occurrences,
+        );
+        for p in &projects {
+            let plan = engine.reflect(&repo, p, true, now)?;
+            reflected += plan.suggestions.len();
+            suggestions_created += plan.created;
+        }
+    }
+
+    // 3c. Raw session-import aging: imports older than SESSION_IMPORT_STALE_DAYS
+    // that were never distilled lose ranking weight (distillation into typed
+    // memories — via the `engram.distill` prompt — is the promotion path).
+    const SESSION_IMPORT_STALE_DAYS: i64 = 90;
+    const SESSION_IMPORT_FLOOR: f32 = 0.2;
+    let mut aged_imports = 0usize;
+    if apply {
+        for p in &projects {
+            aged_imports += repo
+                .downgrade_stale_session_imports(
+                    p,
+                    SESSION_IMPORT_STALE_DAYS * 86_400,
+                    SESSION_IMPORT_FLOOR,
+                    true,
+                    now,
+                )?
+                .len();
+        }
+    }
+
+    // 3d. Distillation backlog: how many raw session-import memories await
+    // the `engram.distill` prompt — the maintain-side trigger for the loop
+    // session_brief surfaces on the read side.
+    let mut distill_backlog = 0i64;
+    for p in &projects {
+        distill_backlog += repo.count_session_imports(p)?;
+    }
 
     // 4. Staleness report (read-only).
     let stale = match &repo_path {
@@ -1892,7 +1857,25 @@ pub fn maintain(args: &[String]) -> Result<()> {
             "duplicates": dup_duplicates,
             "action": if apply { "archived (restore with `engram restore`)" } else { "dry-run — pass --apply to archive" },
         },
-        "fts_rebuilt_rows": fts_rows,
+        "fts": {
+            "drifted_rows": fts_drift,
+            "rebuilt_rows": fts_rows,
+            "note": if fts_drift == 0 { "index aligned; no rebuild needed" } else if apply { "rebuilt" } else { "dry-run: drift reported, nothing written" },
+        },
+        "reflection": {
+            "patterns_found": reflected,
+            "suggestions_created": suggestions_created,
+            "note": if apply { "run `engram suggestions` to review pending proposals" } else { "dry-run: reflection only runs with --apply" },
+        },
+        "session_import_aging": {
+            "downgraded": aged_imports,
+            "older_than_days": SESSION_IMPORT_STALE_DAYS,
+            "floor_importance": SESSION_IMPORT_FLOOR,
+        },
+        "distill_backlog": {
+            "raw_session_imports": distill_backlog,
+            "note": "refine them via the `engram.distill` MCP prompt (see session_brief)",
+        },
         "query_log_pruned": pruned,
         "stale": stale,
         "gc_preview": {
@@ -1986,18 +1969,21 @@ pub fn session_import(args: &[String]) -> Result<()> {
         optional_str(args, "session").unwrap_or_else(|| session_id_from_path(&transcript));
     let dry_run = args.iter().any(|a| a == "--dry-run");
 
-    let path = Path::new(&transcript);
     // Streaming bounded read: Claude Code transcripts can reach hundreds of
-    // MB; the distiller only needs prompts/edits/conclusions, so cap at 64MB.
-    let text = read_text_bounded(path, 64 * 1024 * 1024)
-        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    // MB; the distiller only needs prompts/edits/conclusions. 64MB total =
+    // 8MB head (session meta, early prompts) + tail-first remainder — the
+    // final conclusions and latest edits live at the END of a transcript,
+    // which a head-only cut dropped exactly when it mattered.
+    const TRANSCRIPT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+    const TRANSCRIPT_HEAD_BYTES: usize = 8 * 1024 * 1024;
+
+    let path = Path::new(&transcript);
+    let text = read_text_bounded(path, TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_HEAD_BYTES)
+        .map_err(|e| HookSkip::TranscriptUnreadable(format!("{}: {e}", path.display())))?;
     let digest = parse_transcript(&text);
 
     if digest.user_prompts.is_empty() && digest.files.is_empty() && digest.errors.is_empty() {
-        anyhow::bail!(
-            "transcript yielded no usable signal (no user prompts, no file edits); \
-             not writing an empty memory"
-        );
+        anyhow::bail!(HookSkip::NoSignal);
     }
 
     let now = now_ts();
@@ -2007,43 +1993,17 @@ pub fn session_import(args: &[String]) -> Result<()> {
         .map(|p| p.replace('\n', " "))
         .unwrap_or_else(|| format!("session {session_id}"));
     let summary: String = first_prompt.chars().take(160).collect();
-
-    let mut content = String::new();
-    content.push_str("User prompts:\n");
-    for p in digest.user_prompts.iter().take(10) {
-        let line: String = p.chars().take(400).collect();
-        content.push_str(&format!("- {line}\n"));
-    }
-    content.push_str("\nAssistant conclusions (latest last):\n");
-    for a in digest.assistant_texts.iter().rev().take(5).rev() {
-        let line: String = a.chars().take(600).collect();
-        content.push_str(&format!("- {line}\n"));
-    }
-    if !digest.files.is_empty() {
-        content.push_str(&format!("\nFiles touched ({}):\n", digest.files.len()));
-        content.push_str(
-            &digest
-                .files
-                .iter()
-                .take(50)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-    if !digest.errors.is_empty() {
-        content.push_str(&format!(
-            "\nErrors encountered ({} — failure-memory candidates):\n",
-            digest.errors.len()
-        ));
-        for e in digest.errors.iter().take(10) {
-            content.push_str(&format!("- {e}\n"));
-        }
-    }
-    let content: String = content.chars().take(4000).collect();
+    let content = session_import_content(&digest);
 
     let memory = EpisodicMemory {
-        id: uuid::Uuid::new_v4().to_string(),
+        // Deterministic id per (project, session): a Stop hook and a
+        // SessionEnd hook firing concurrently used to race find→create and
+        // write TWO memories for one session. With a deterministic id the
+        // primary key itself arbitrates — the loser's INSERT fails cleanly
+        // and falls back to the refresh path (see upsert_session_memory).
+        // The session lookup uses the session_id column, not this id, so
+        // hasher stability across compiler versions does not matter.
+        id: session_memory_id(&project_id, &session_id),
         project_id: project_id.clone(),
         session_id: session_id.clone(),
         summary,
@@ -2073,6 +2033,23 @@ pub fn session_import(args: &[String]) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo(&config)?;
     let action = upsert_session_memory(&repo, &memory, now)?;
+    // Embedding parity with the provider's create/update paths: hook-imported
+    // session memories used to be invisible to semantic search until a
+    // manual `engram reindex`. Direct EmbeddingService use (not a full
+    // provider) — a no-op without an embedder, compiled out entirely without
+    // the feature. Re-indexing the (possibly pre-existing) id keeps the
+    // vector fresh on the refresh path too.
+    #[cfg(feature = "semantic")]
+    {
+        let embedding = crate::mcp::embedding_service::EmbeddingService::new(&config);
+        embedding.index(
+            &repo,
+            "episodic",
+            &action.id,
+            &project_id,
+            &memory.embedding_text(),
+        );
+    }
     print_json(&serde_json::json!({
         "id": action.id,
         "status": action.status, // "created" | "updated"
@@ -2081,6 +2058,87 @@ pub fn session_import(args: &[String]) -> Result<()> {
         "created_at": now,
     }));
     Ok(())
+}
+
+/// Build the session-import episodic `content` from a transcript digest:
+/// bounded prompts, conclusions, files, and error candidates under fixed
+/// template headers. The headers come from the consolidation engine's
+/// session-import template constants — near-dup comparison EXCLUDES those
+/// scaffold words (two templated imports from different sessions must not
+/// look like duplicates on scaffold alone), and that exclusion only stays
+/// correct while this builder and the exclusion list share one source.
+fn session_import_content(digest: &SessionDigest) -> String {
+    use crate::consolidation::engine::{
+        SESSION_IMPORT_TPL_CONCLUSIONS, SESSION_IMPORT_TPL_ERRORS,
+        SESSION_IMPORT_TPL_FAILURE_CANDIDATES, SESSION_IMPORT_TPL_FILES,
+        SESSION_IMPORT_TPL_PROMPTS,
+    };
+    let mut content = String::new();
+    content.push_str(&format!("{SESSION_IMPORT_TPL_PROMPTS}:\n"));
+    for p in digest.user_prompts.iter().take(10) {
+        let line: String = p.chars().take(400).collect();
+        content.push_str(&format!("- {line}\n"));
+    }
+    content.push_str(&format!("\n{SESSION_IMPORT_TPL_CONCLUSIONS}:\n"));
+    for a in digest.assistant_texts.iter().rev().take(5).rev() {
+        let line: String = a.chars().take(600).collect();
+        content.push_str(&format!("- {line}\n"));
+    }
+    if !digest.files.is_empty() {
+        content.push_str(&format!(
+            "\n{} ({}):\n",
+            SESSION_IMPORT_TPL_FILES,
+            digest.files.len()
+        ));
+        content.push_str(
+            &digest
+                .files
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if !digest.errors.is_empty() {
+        content.push_str(&format!(
+            "\n{} ({} — {}):\n",
+            SESSION_IMPORT_TPL_ERRORS,
+            digest.errors.len(),
+            SESSION_IMPORT_TPL_FAILURE_CANDIDATES,
+        ));
+        for e in digest.errors.iter().take(10) {
+            content.push_str(&format!("- {e}\n"));
+        }
+    }
+    content.chars().take(4000).collect()
+}
+
+/// Normal, non-error hook outcomes: surfaced by `engram hook` as
+/// `status: "skipped"` (exit 0) instead of a failing exit that Claude Code
+/// would show the user on every idle Stop. TYPED — the previous
+/// string-matching on error messages silently changed hook behavior any time
+/// a message was reworded.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HookSkip {
+    #[error(
+        "transcript yielded no usable signal (no user prompts, no file edits); \
+             not writing an empty memory"
+    )]
+    NoSignal,
+    #[error("failed to read transcript {0}")]
+    TranscriptUnreadable(String),
+}
+
+/// Stable per-(project, session) memory id for session imports. See the
+/// comment at the construction site for why determinism matters.
+fn session_memory_id(project_id: &str, session_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    project_id.hash(&mut h);
+    '\n'.hash(&mut h);
+    session_id.hash(&mut h);
+    format!("sess-{:016x}", h.finish())
 }
 
 /// Idempotent session-import write: if an active episodic already exists for
@@ -2101,55 +2159,96 @@ fn upsert_session_memory(
     memory: &EpisodicMemory,
     now: i64,
 ) -> Result<SessionUpsert> {
-    if let Some(mut existing) =
-        repo.find_episodic_by_session(&memory.project_id, &memory.session_id)?
-    {
-        existing.summary = memory.summary.clone();
-        existing.content = memory.content.clone();
-        existing.files_touched = memory.files_touched.clone();
-        // Union tags: keep anything added after the first import (user
-        // curation), but don't re-add a marker tag the user removed.
-        let mut tags = existing.tags.clone();
-        for t in &memory.tags {
-            if !tags.contains(t) {
-                tags.push(t.clone());
-            }
-        }
-        existing.tags = tags;
-        existing.updated_at = now;
-        repo.update_episodic(&existing)?;
-        return Ok(SessionUpsert {
-            id: existing.id,
-            status: "updated",
-            files: existing.files_touched.len(),
-        });
+    if let Some(existing) = repo.find_episodic_by_session(&memory.project_id, &memory.session_id)? {
+        return refresh_session_memory(repo, existing, memory, now);
     }
-    let id = memory.id.clone();
-    let files = memory.files_touched.len();
-    repo.create_episodic(memory)?;
+    match repo.create_episodic(memory) {
+        Ok(()) => Ok(SessionUpsert {
+            id: memory.id.clone(),
+            status: "created",
+            files: memory.files_touched.len(),
+        }),
+        Err(e) if e.to_string().contains("UNIQUE constraint failed") => {
+            // Lost a create race with a concurrent hook on the same session
+            // (deterministic id collided on the primary key). The winner's
+            // row is now findable — refresh it instead of erroring out.
+            let existing = repo
+                .find_episodic_by_session(&memory.project_id, &memory.session_id)?
+                .ok_or(e)?;
+            refresh_session_memory(repo, existing, memory, now)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Refresh an existing session memory in place with the latest digest.
+fn refresh_session_memory(
+    repo: &crate::storage::MemoryRepository,
+    mut existing: EpisodicMemory,
+    memory: &EpisodicMemory,
+    now: i64,
+) -> Result<SessionUpsert> {
+    existing.summary = memory.summary.clone();
+    existing.content = memory.content.clone();
+    existing.files_touched = memory.files_touched.clone();
+    // Union tags: keep anything added after the first import (user
+    // curation), but don't re-add a marker tag the user removed.
+    let mut tags = existing.tags.clone();
+    for t in &memory.tags {
+        if !tags.contains(t) {
+            tags.push(t.clone());
+        }
+    }
+    existing.tags = tags;
+    existing.updated_at = now;
+    repo.update_episodic(&existing)?;
     Ok(SessionUpsert {
-        id,
-        status: "created",
-        files,
+        id: existing.id,
+        status: "updated",
+        files: existing.files_touched.len(),
     })
 }
 
-/// Read a text file up to `max_bytes` (lossy UTF-8), appending a truncation
-/// marker when cut. Streams — never slurps the whole file first.
-fn read_text_bounded(path: &Path, max_bytes: usize) -> Result<String> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::with_capacity(64 * 1024);
-    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > max_bytes;
-    if truncated {
-        bytes.truncate(max_bytes);
+/// Read a text file bounded by `max_bytes` total (lossy UTF-8), split as
+/// head + tail: the first `head_bytes`, and — only when the file exceeds the
+/// budget — the LAST `max_bytes - head_bytes` bytes, with a marker naming how
+/// much was skipped. Tail-priority is deliberate: session transcripts carry
+/// their meta at the top and their FINAL conclusions at the bottom, so a
+/// head-first cut threw away exactly the late signal the distiller wants.
+/// Streams — never slurps the whole file first. The tail may begin mid-line
+/// or mid-character (lossy decoding mends the latter); `parse_transcript`
+/// skips the one malformed line that can result.
+fn read_text_bounded(path: &Path, max_bytes: usize, head_bytes: usize) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len() as usize;
+    let head_bytes = head_bytes.min(max_bytes);
+
+    if file_len <= max_bytes {
+        // Whole file fits: one bounded streaming read.
+        let mut all = Vec::with_capacity(file_len.min(max_bytes) + 1);
+        (&file).take(max_bytes as u64 + 1).read_to_end(&mut all)?;
+        return Ok(String::from_utf8_lossy(&all).into_owned());
     }
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if truncated {
-        text.push_str("\n…[transcript truncated]");
-    }
-    Ok(text)
+
+    let mut head = Vec::with_capacity(head_bytes);
+    (&file).take(head_bytes as u64).read_to_end(&mut head)?;
+
+    let tail_budget = max_bytes - head_bytes;
+    let tail_start = file_len - tail_budget; // > head_bytes whenever file_len > max_bytes
+    let mut tail = Vec::with_capacity(tail_budget);
+    file.seek(SeekFrom::Start(tail_start as u64))?;
+    (&file).take(tail_budget as u64).read_to_end(&mut tail)?;
+
+    let skipped = file_len - head.len() - tail.len();
+    Ok(format!(
+        "{}\n…[{skipped} bytes skipped — transcript truncated, first {} and last {} \
+         bytes kept (latest conclusions preserved)]…\n{}",
+        String::from_utf8_lossy(&head),
+        head.len(),
+        tail.len(),
+        String::from_utf8_lossy(&tail),
+    ))
 }
 
 /// Best-effort text of a tool_result content block (string or array of text
@@ -2240,7 +2339,7 @@ pub fn hook(args: &[String]) -> Result<()> {
         "--project".into(),
         project_id.clone(),
         "--transcript".into(),
-        transcript,
+        transcript.clone(),
     ];
     if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
         import_args.push("--session".into());
@@ -2250,20 +2349,120 @@ pub fn hook(args: &[String]) -> Result<()> {
         import_args.push("--dry-run".into());
     }
 
-    // "No usable signal" is a normal empty session, not a failure — the hook
+    // Unchanged-transcript skip: `Stop` fires on EVERY agent turn, and the
+    // transcript is byte-identical between most turns — the old path re-read
+    // and re-parsed up to 64 MB each time. A (mtime, size) fingerprint makes
+    // the repeat work O(1); we still verify the session memory exists so a
+    // manually deleted memory is re-created from the unchanged transcript.
+    let unchanged = if dry_run {
+        false
+    } else {
+        match transcript_unchanged(&transcript, &project_id, &import_args) {
+            Ok(v) => v,
+            // The fingerprint check maps a missing transcript to the same
+            // typed skip session_import uses — handled once below.
+            Err(e) if e.downcast_ref::<HookSkip>().is_some() => {
+                print_json(&serde_json::json!({
+                    "status": "skipped",
+                    "reason": e.to_string(),
+                }));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    if unchanged {
+        print_json(&serde_json::json!({
+            "status": "skipped",
+            "reason": "transcript unchanged since last import",
+        }));
+        return Ok(());
+    }
+
+    // Normal empty-session outcomes are typed (HookSkip) so rewording a
+    // message can never silently flip a hook from skip to error — the hook
     // must not spam Claude Code with errors every idle Stop.
     if let Err(e) = session_import(&import_args) {
-        let msg = e.to_string();
-        if msg.contains("no usable signal") || msg.contains("failed to read transcript") {
+        if e.downcast_ref::<HookSkip>().is_some() {
             print_json(&serde_json::json!({
                 "status": "skipped",
-                "reason": msg,
+                "reason": e.to_string(),
             }));
             return Ok(());
         }
         return Err(e);
     }
     Ok(())
+}
+
+/// Whether the transcript's (mtime, size) fingerprint matches the last
+/// import AND the session memory still exists. State lives beside the
+/// database in `hook-state.json` (bounded to the newest 256 transcripts).
+fn transcript_unchanged(
+    transcript: &str,
+    project_id: &str,
+    import_args: &[String],
+) -> Result<bool> {
+    let md = std::fs::metadata(transcript)
+        .map_err(|e| HookSkip::TranscriptUnreadable(format!("{transcript}: {e}")))?;
+    let fingerprint = format!(
+        "{}:{}",
+        md.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        md.len()
+    );
+
+    let config = load_config()?;
+    let state_path = config
+        .storage
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("hook-state.json");
+    let mut state: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let unchanged = state.get(transcript).and_then(|v| v.as_str()) == Some(&fingerprint) && {
+        // Only skip when the memory actually exists — deleting the
+        // session memory must not be defeated by the fingerprint cache.
+        let repo = open_repo(&config)?;
+        let session_id: String = import_args
+            .iter()
+            .position(|a| a == "--session")
+            .and_then(|i| import_args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| session_id_from_path(transcript));
+        repo.find_episodic_by_session(project_id, &session_id)?
+            .is_some()
+    };
+
+    if !unchanged && !dry_run_import(import_args) {
+        // Record the fingerprint for next time (best-effort).
+        state.insert(transcript.to_string(), serde_json::json!(fingerprint));
+        while state.len() > 256 {
+            // Drop the oldest-inserted entries (serde_json maps preserve
+            // insertion order).
+            let first = state.iter().next().map(|(k, _)| k.clone());
+            match first {
+                Some(k) => {
+                    state.remove(&k);
+                }
+                None => break,
+            }
+        }
+        let _ = std::fs::write(&state_path, serde_json::to_string(&state)?);
+    }
+    Ok(unchanged)
+}
+
+fn dry_run_import(import_args: &[String]) -> bool {
+    import_args.iter().any(|a| a == "--dry-run")
 }
 
 /// What `parse_transcript` extracted from a session JSONL.
@@ -2880,6 +3079,124 @@ not json at all
         m3.session_id = "sess-2".into();
         let third = upsert_session_memory(&repo, &m3, 300).unwrap();
         assert_eq!(third.status, "created");
+    }
+
+    #[test]
+    fn optional_str_does_not_swallow_a_following_flag() {
+        // `--session --dry-run` must not bind "--dry-run" as the session id
+        // (same guard require_str enforces with an error).
+        let args = vec!["--session".to_string(), "--dry-run".to_string()];
+        assert_eq!(optional_str(&args, "session"), None);
+        let args = vec!["--session".to_string(), "s-1".to_string()];
+        assert_eq!(optional_str(&args, "session"), Some("s-1".to_string()));
+        assert_eq!(optional_str(&args, "missing"), None);
+    }
+
+    #[test]
+    fn parse_set_pairs_parses_json_values_with_string_fallback() {
+        let args: Vec<String> = [
+            "--set",
+            "importance=0.9",
+            "--set",
+            "summary=plain text",
+            "--set",
+            "tags=[\"a\",\"b\"]",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let patch = parse_set_pairs(&args).unwrap();
+        assert_eq!(patch.get("importance"), Some(&serde_json::json!(0.9)));
+        assert_eq!(patch.get("summary"), Some(&serde_json::json!("plain text")));
+        assert_eq!(patch.get("tags"), Some(&serde_json::json!(["a", "b"])));
+    }
+
+    #[test]
+    fn read_text_bounded_reads_small_files_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, "line1\nline2\n").unwrap();
+        let s = read_text_bounded(&path, 100, 10).unwrap();
+        assert_eq!(s, "line1\nline2\n"); // no truncation marker on small files
+    }
+
+    #[test]
+    fn read_text_bounded_keeps_head_and_tail_on_oversize() {
+        // 100-byte file, 30-byte budget, 10-byte head → head 10 + tail 20,
+        // 70 bytes skipped. The TAIL must survive: a session's final
+        // conclusions live at the end of the transcript.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let content = format!("{}{}{}", "H".repeat(10), "M".repeat(70), "T".repeat(20));
+        std::fs::write(&path, &content).unwrap();
+        let s = read_text_bounded(&path, 30, 10).unwrap();
+        assert!(s.contains(&"H".repeat(10)), "head kept: {s}");
+        assert!(s.contains(&"T".repeat(20)), "tail (latest lines) kept: {s}");
+        assert!(!s.contains('M'), "middle skipped: {s}");
+        assert!(s.contains("70 bytes skipped"), "marker names the gap: {s}");
+    }
+
+    #[test]
+    fn templated_session_imports_from_different_sessions_are_not_near_dups() {
+        // Regression (round-5 review): the content template's scaffold words
+        // are shared by EVERY session import. Two sessions differing by one
+        // real word scored raw Jaccard ≈ 0.90 — over the 0.85 near-dup
+        // threshold — so `consolidate --near` would archive one of them.
+        // The scaffold must be excluded so only session CONTENT is compared.
+        let mk = |prompt: &str| SessionDigest {
+            user_prompts: vec![prompt.into()],
+            files: vec!["a.rs".into()],
+            errors: vec!["boom".into()],
+            ..Default::default()
+        };
+        let content_a = session_import_content(&mk("revert"));
+        let content_b = session_import_content(&mk("retry"));
+
+        // Document the hazard first: the RAW (unfiltered) word sets clear the
+        // default threshold — exactly what the exclusion must defeat.
+        let raw_a: std::collections::HashSet<&str> = content_a.split_whitespace().collect();
+        let raw_b: std::collections::HashSet<&str> = content_b.split_whitespace().collect();
+        let raw_j = raw_a.intersection(&raw_b).count() as f64 / raw_a.union(&raw_b).count() as f64;
+        assert!(
+            raw_j >= crate::consolidation::engine::DEFAULT_JACCARD_THRESHOLD,
+            "test precondition: raw scaffold Jaccard {raw_j:.2} must clear the threshold"
+        );
+
+        let repo = crate::storage::MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk_mem = |summary: &str, content: &str, ts: i64| EpisodicMemory {
+            id: format!("m-{ts}"),
+            project_id: "p".into(),
+            session_id: format!("sess-{ts}"),
+            summary: summary.into(),
+            content: content.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec!["session-import".into()],
+            created_at: ts,
+            updated_at: ts,
+        };
+        repo.create_episodic(&mk_mem("revert", &content_a, 100))
+            .unwrap();
+        repo.create_episodic(&mk_mem("retry", &content_b, 200))
+            .unwrap();
+
+        let engine = crate::consolidation::ConsolidationEngine::new();
+        let plan = engine
+            .plan_for_kind(
+                &repo,
+                "p",
+                crate::storage::MemoryKind::Episodic,
+                true,
+                crate::consolidation::engine::DEFAULT_JACCARD_THRESHOLD,
+            )
+            .unwrap();
+        assert!(
+            plan.groups.is_empty(),
+            "two templated imports from different sessions must not be near-dups: {:?}",
+            plan.groups
+        );
     }
 
     #[test]

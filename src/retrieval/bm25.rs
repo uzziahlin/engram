@@ -1,12 +1,17 @@
 use crate::models::{DecisionMemory, EpisodicMemory, FailureMemory, ProceduralMemory};
 use crate::retrieval::planner::MemorySource;
-use crate::storage::{MemoryRepository, ScoredMemory};
+use crate::storage::{ActiveMemory, MemoryKind, MemoryRepository, ScoredMemory};
 use anyhow::Result;
+use std::collections::HashSet;
 
 /// A single search result with relevance score.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub id: String,
+    /// Owning project. Global search (`project_id = "*"`) mixes hits from
+    /// many projects; callers need the exact project for get_memory /
+    /// mark_relevance / forget_memory, which all require it.
+    pub project_id: String,
     pub memory_type: String,
     pub summary: String,
     pub relevance_score: f32,
@@ -24,6 +29,7 @@ pub struct SearchResult {
 /// Trait for extracting searchable fields from memory types.
 trait Searchable {
     fn search_id(&self) -> &str;
+    fn search_project_id(&self) -> &str;
     fn search_summary(&self) -> &str;
     fn search_created_at(&self) -> i64;
     fn search_importance(&self) -> f32;
@@ -34,6 +40,9 @@ trait Searchable {
 impl Searchable for EpisodicMemory {
     fn search_id(&self) -> &str {
         &self.id
+    }
+    fn search_project_id(&self) -> &str {
+        &self.project_id
     }
     fn search_summary(&self) -> &str {
         &self.summary
@@ -59,6 +68,9 @@ impl Searchable for EpisodicMemory {
 impl Searchable for DecisionMemory {
     fn search_id(&self) -> &str {
         &self.id
+    }
+    fn search_project_id(&self) -> &str {
+        &self.project_id
     }
     fn search_summary(&self) -> &str {
         &self.title
@@ -90,6 +102,9 @@ impl Searchable for FailureMemory {
     fn search_id(&self) -> &str {
         &self.id
     }
+    fn search_project_id(&self) -> &str {
+        &self.project_id
+    }
     fn search_summary(&self) -> &str {
         &self.incident
     }
@@ -116,6 +131,9 @@ impl Searchable for ProceduralMemory {
     fn search_id(&self) -> &str {
         &self.id
     }
+    fn search_project_id(&self) -> &str {
+        &self.project_id
+    }
     fn search_summary(&self) -> &str {
         &self.workflow_name
     }
@@ -137,10 +155,14 @@ impl Searchable for ProceduralMemory {
 }
 
 /// Type-erased search fields with the RAW bm25 score, before any
-/// normalization — the calibration pass needs the raw scale.
+/// normalization — the calibration pass needs the raw scale. `tokens` is the
+/// doc's searchable token set (same preprocessing as the FTS index), used by
+/// the query-term coverage signal.
 struct ScoredRaw {
     raw: f64,
+    tokens: HashSet<String>,
     id: String,
+    project_id: String,
     summary: String,
     importance: f32,
     created_at: i64,
@@ -148,19 +170,56 @@ struct ScoredRaw {
     detail: serde_json::Value,
 }
 
+/// Collect every string leaf of a JSON detail value into one text blob
+/// (values only, not keys) — the same text the FTS index covers.
+fn collect_text_leaves(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::String(s) => {
+            out.push(' ');
+            out.push_str(s);
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                collect_text_leaves(x, out);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for x in o.values() {
+                collect_text_leaves(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn doc_tokens(summary: &str, detail: &serde_json::Value) -> HashSet<String> {
+    let mut text = String::with_capacity(summary.len() + 128);
+    text.push_str(summary);
+    collect_text_leaves(detail, &mut text);
+    MemoryRepository::preprocess_cjk(&text)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 fn raw_group<T: Searchable>(scored: Vec<ScoredMemory<T>>) -> Vec<ScoredRaw> {
     scored
         .into_iter()
         .map(|s| {
             let m = s.memory;
+            let summary = m.search_summary().to_string();
+            let detail = m.search_detail();
+            let tokens = doc_tokens(&summary, &detail);
             ScoredRaw {
                 raw: (-s.bm25_score).max(0.0),
+                tokens,
                 id: m.search_id().to_string(),
-                summary: m.search_summary().to_string(),
+                project_id: m.search_project_id().to_string(),
+                summary,
                 importance: m.search_importance(),
                 created_at: m.search_created_at(),
                 tags: m.search_tags(),
-                detail: m.search_detail(),
+                detail,
             }
         })
         .collect()
@@ -180,53 +239,175 @@ impl BM25Retriever {
         Self
     }
 
-    /// Sigmoid normalization scaling factor.
-    /// Calibrated against the practical FTS5 bm25() range on memory-scale
-    /// corpora (strong matches ≈ -2..-6, weak ≈ -0.2..-1 after negation):
-    /// a scale of 2.0 maps strong matches to ≈0.63..0.95 and weak ones to
-    /// ≈0.1..0.4, so relevance keeps most of its dynamic range after the
-    /// 0.5 relevance weight. (The old 5.0 scale compressed everything into
-    /// 0.08..0.55, letting the static type prior outvote it.)
-    const SIGMOID_SCALE: f64 = 2.0;
-
-    /// Normalize FTS5 bm25() score to [0, 1].
-    /// bm25() returns negative values; more negative = better match.
-    /// We negate and apply sigmoid-like normalization.
-    fn normalize_bm25(score: f64) -> f32 {
-        let positive = (-score).max(0.0);
-        (1.0 - (-positive / Self::SIGMOID_SCALE).exp()) as f32
-    }
-
-    /// Convert scored memories of any type into SearchResults.
-    fn to_results<T: Searchable>(
-        scored_mems: Vec<ScoredMemory<T>>,
-        memory_type: &str,
-    ) -> Vec<SearchResult> {
-        scored_mems
-            .into_iter()
-            .map(|scored| SearchResult {
-                id: scored.memory.search_id().to_string(),
-                memory_type: memory_type.into(),
-                summary: scored.memory.search_summary().to_string(),
-                relevance_score: Self::normalize_bm25(scored.bm25_score),
-                importance: scored.memory.search_importance(),
-                created_at: scored.memory.search_created_at(),
-                tags: scored.memory.search_tags(),
-                detail: scored.memory.search_detail(),
+    /// Ids that count as search impressions for the feedback loop: every
+    /// result EXCEPT graph-expansion neighbors. Neighbors never matched the
+    /// query — counting them as impressions made `engram tune` systematically
+    /// demote them (served ≥5, adopted 0, by construction).
+    pub fn impression_ids(results: &[SearchResult]) -> Vec<String> {
+        results
+            .iter()
+            .filter(|r| {
+                !r.detail
+                    .get("graph_neighbor")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
             })
+            .map(|r| r.id.clone())
             .collect()
     }
 
-    /// Search a subset of memory types via FTS5 BM25, merging and sorting by
-    /// relevance. Used to route `search_memory` to only the types implied by
-    /// the classified intent. `search_all` is this with all four sources.
+    /// Floor of the query-term coverage factor. A doc matching none of the
+    /// query tokens exactly (only via porter-stemmed variants the Rust-side
+    /// comparison cannot see) keeps this share of its score instead of being
+    /// zeroed out.
+    const COVERAGE_FLOOR: f32 = 0.35;
+
+    /// Whether a query token is present in a doc's token set. Exact match
+    /// first; longer tokens also match on prefix overlap in either direction,
+    /// approximating FTS5's porter stemming ("crash" ~ "crashed"). Short
+    /// tokens (<4 chars) skip the prefix heuristic — "cat"/"catalog" style
+    /// false positives cost more than the stems they'd catch.
+    fn token_matches(q: &str, doc_tokens: &HashSet<String>) -> bool {
+        if doc_tokens.contains(q) {
+            return true;
+        }
+        if q.chars().count() < 4 {
+            return false;
+        }
+        doc_tokens
+            .iter()
+            .any(|d| d.starts_with(q) || (d.chars().count() >= 4 && q.starts_with(d.as_str())))
+    }
+
+    /// Fraction of the query's tokens the doc actually contains. Single-token
+    /// queries are always 1.0 (nothing to discriminate).
+    fn coverage(raw: &ScoredRaw, query_tokens: &[String]) -> f32 {
+        if query_tokens.len() <= 1 {
+            return 1.0;
+        }
+        let matched = query_tokens
+            .iter()
+            .filter(|q| Self::token_matches(q, &raw.tokens))
+            .count();
+        matched as f32 / query_tokens.len() as f32
+    }
+
+    /// Convert an [`ActiveMemory`] into a SearchResult with `relevance_score
+    /// = 0.0` — these are not BM25 hits; the reranker recomputes the final
+    /// score. Importance is normalized the same way as the BM25 path (via
+    /// `Searchable`).
+    fn active_to_result(m: ActiveMemory) -> SearchResult {
+        let generic = |memory_type: &str,
+                       id: &str,
+                       project_id: &str,
+                       summary: &str,
+                       importance: f32,
+                       created_at: i64,
+                       tags: Vec<String>,
+                       detail: serde_json::Value| SearchResult {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            memory_type: memory_type.into(),
+            summary: summary.to_string(),
+            relevance_score: 0.0,
+            importance,
+            created_at,
+            tags,
+            detail,
+        };
+        match m {
+            ActiveMemory::Episodic(m) => generic(
+                "episodic",
+                &m.id,
+                &m.project_id,
+                &m.summary,
+                m.importance.clamp(0.0, 1.0),
+                m.created_at,
+                m.tags.clone(),
+                serde_json::json!({
+                    "content": m.content,
+                    "files_touched": m.files_touched,
+                    "related_commits": m.related_commits,
+                }),
+            ),
+            ActiveMemory::Decision(m) => {
+                let mut detail = serde_json::json!({
+                    "context": m.context,
+                    "rationale": m.rationale,
+                    "tradeoffs": m.tradeoffs,
+                    "related_files": m.related_files,
+                });
+                if let Some(sb) = &m.superseded_by {
+                    detail["superseded_by"] = serde_json::json!(sb);
+                }
+                generic(
+                    "decision",
+                    &m.id,
+                    &m.project_id,
+                    &m.title,
+                    m.importance.clamp(0.0, 1.0),
+                    m.created_at,
+                    m.tags.clone(),
+                    detail,
+                )
+            }
+            ActiveMemory::Failure(m) => {
+                let severity = m.severity;
+                generic(
+                    "failure",
+                    &m.id,
+                    &m.project_id,
+                    &m.incident,
+                    (severity as f32 / 5.0).clamp(0.0, 1.0),
+                    m.created_at,
+                    m.tags.clone(),
+                    serde_json::json!({
+                        "root_cause": m.root_cause,
+                        "fix": m.fix,
+                        "prevention": m.prevention,
+                        "severity": severity,
+                    }),
+                )
+            }
+            ActiveMemory::Procedural(m) => generic(
+                "procedural",
+                &m.id,
+                &m.project_id,
+                &m.workflow_name,
+                m.importance.clamp(0.0, 1.0),
+                m.created_at,
+                m.tags.clone(),
+                serde_json::json!({
+                    "steps": m.steps,
+                    "related_tools": m.related_tools,
+                }),
+            ),
+        }
+    }
+
+    /// Search a subset of memory types through the ONE unified FTS table.
     ///
-    /// Cross-type calibration: the four FTS tables have independent corpora
-    /// and IDF scales, so raw bm25() scores are not comparable across types
-    /// (a weak failure-table match used to outrank a strong episodic match).
-    /// Each type's scores are rescaled to `raw / type_best * sigmoid(type_best)`
-    /// — the best match of a type keeps `sigmoid(best)` (absolute strength)
-    /// and weaker matches scale down linearly within their type.
+    /// The unified table makes raw bm25() scores comparable across kinds
+    /// (one IDF scale over the whole corpus) — the whole cross-type
+    /// calibration layer of the per-type-table era is gone.
+    ///
+    /// relevance is a per-query MONOTONE normalization of the raw score:
+    /// `raw / query_best`, where query_best is the highest raw score of THIS
+    /// query's result set (all-zero → all 0). Ordering by relevance is
+    /// therefore always identical to ordering by raw score, values are
+    /// bounded [0,1], and no fixed-scale constant (the old SIGMOID_SCALE was
+    /// tuned against a 22-row corpus and saturated as corpora grew) is
+    /// involved. Absolute scores are NOT comparable across queries — that is
+    /// inherent to bm25 (a rare-term query and a common-term query land on
+    /// different scales); ranking and within-result relative scores are what
+    /// downstream consumers (reranker, agent) actually use.
+    ///
+    /// Query-term coverage is kept: on OR-fallback (and any multi-token)
+    /// query, a doc's score scales with how many of the query's tokens it
+    /// actually contains — bm25 raw score is IDF-dominated, so a short doc
+    /// matching ONE rare token could outrank a doc matching all four query
+    /// tokens. AND-path docs match every token by construction, so their
+    /// factor is ~1.0 and ranking there is unchanged.
     pub fn search_by_types(
         repo: &MemoryRepository,
         query: &str,
@@ -234,42 +415,83 @@ impl BM25Retriever {
         sources: &[MemorySource],
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        // Gather raw-scored groups per type, calibrate within each type,
-        // then merge. See the method doc for the calibration rationale.
-        let mut groups: Vec<(Vec<ScoredRaw>, &str)> = Vec::new();
-        for src in sources {
-            match src {
-                MemorySource::Episodic => groups.push((
-                    raw_group(repo.search_episodic(query, project_id, limit)?),
-                    "episodic",
-                )),
-                MemorySource::Decision => groups.push((
-                    raw_group(repo.search_decisions(query, project_id, limit)?),
-                    "decision",
-                )),
-                MemorySource::Failure => groups.push((
-                    raw_group(repo.search_failures(query, project_id, limit)?),
-                    "failure",
-                )),
-                MemorySource::Procedural => groups.push((
-                    raw_group(repo.search_procedural(query, project_id, limit)?),
-                    "procedural",
-                )),
-            }
+        if sources.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let to_kind = |src: &MemorySource| match src {
+            MemorySource::Episodic => MemoryKind::Episodic,
+            MemorySource::Decision => MemoryKind::Decision,
+            MemorySource::Failure => MemoryKind::Failure,
+            MemorySource::Procedural => MemoryKind::Procedural,
+        };
+        // Kind routing: a single source filters inside the index
+        // (`kind:"…"` MATCH column); a strict subset of 2-3 sources cannot
+        // (the filter column takes one value), so it runs unfiltered and
+        // drops foreign kinds after decode, over-fetching ×4 to compensate.
+        let all = sources.len() == MemorySource::all().len();
+        let kind_filter = match sources {
+            [only] => Some(to_kind(only)),
+            _ => None,
+        };
+        let subset_postfilter = !all && kind_filter.is_none();
+
+        let hits = repo.search_unified(
+            query,
+            project_id,
+            kind_filter,
+            if subset_postfilter {
+                (limit * 4).min(400)
+            } else {
+                limit
+            },
+        )?;
+
+        let mut groups: Vec<(Vec<ScoredRaw>, MemoryKind)> = Vec::new();
+        if !hits.episodic.is_empty() {
+            groups.push((raw_group(hits.episodic), MemoryKind::Episodic));
+        }
+        if !hits.decisions.is_empty() {
+            groups.push((raw_group(hits.decisions), MemoryKind::Decision));
+        }
+        if !hits.failures.is_empty() {
+            groups.push((raw_group(hits.failures), MemoryKind::Failure));
+        }
+        if !hits.procedures.is_empty() {
+            groups.push((raw_group(hits.procedures), MemoryKind::Procedural));
+        }
+        if subset_postfilter {
+            let allowed: Vec<MemoryKind> = sources.iter().map(to_kind).collect();
+            groups.retain(|(_, kind)| allowed.contains(kind));
         }
 
+        // Stopwords drop out of the coverage denominator too (see
+        // is_stopword): content-word coverage is the signal.
+        let query_tokens: Vec<String> = MemoryRepository::preprocess_cjk(query)
+            .split_whitespace()
+            .filter(|t| !MemoryRepository::is_stopword(t))
+            .map(str::to_string)
+            .collect();
+
+        // Per-query monotone normalization (see method doc).
+        let query_best = groups
+            .iter()
+            .flat_map(|(raws, _)| raws.iter().map(|r| r.raw))
+            .fold(0.0f64, f64::max);
+
         let mut results = Vec::new();
-        for (raws, memory_type) in groups {
-            let type_best = raws.iter().map(|r| r.raw).fold(0.0f64, f64::max);
+        for (raws, kind) in groups {
             for raw in raws {
-                let relevance = if type_best > 0.0 {
-                    (raw.raw / type_best) as f32 * Self::normalize_bm25(type_best)
+                let relevance = if query_best > 0.0 {
+                    let normalized = (raw.raw / query_best) as f32;
+                    let cov = Self::coverage(&raw, &query_tokens);
+                    normalized * (Self::COVERAGE_FLOOR + (1.0 - Self::COVERAGE_FLOOR) * cov)
                 } else {
                     0.0
                 };
                 results.push(SearchResult {
                     id: raw.id,
-                    memory_type: memory_type.to_string(),
+                    project_id: raw.project_id,
+                    memory_type: kind.as_str().to_string(),
                     summary: raw.summary,
                     relevance_score: relevance,
                     importance: raw.importance,
@@ -302,7 +524,9 @@ impl BM25Retriever {
         Self::search_by_types(repo, query, project_id, MemorySource::all(), limit)
     }
 
-    /// Search a specific memory type.
+    /// Search a specific memory type. Delegates to [`Self::search_by_types`]
+    /// with a single source so filtered and unfiltered searches share ONE
+    /// query path.
     pub fn search_by_type(
         repo: &MemoryRepository,
         query: &str,
@@ -310,87 +534,38 @@ impl BM25Retriever {
         memory_type: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        match memory_type {
-            "episodic" => Ok(Self::to_results(
-                repo.search_episodic(query, project_id, limit)?,
-                "episodic",
-            )),
-            "decision" => Ok(Self::to_results(
-                repo.search_decisions(query, project_id, limit)?,
-                "decision",
-            )),
-            "failure" => Ok(Self::to_results(
-                repo.search_failures(query, project_id, limit)?,
-                "failure",
-            )),
-            "procedural" => Ok(Self::to_results(
-                repo.search_procedural(query, project_id, limit)?,
-                "procedural",
-            )),
-            // A typo'd type must fail loudly, not silently return "no
-            // memories" — the caller then knows to fix the filter.
-            other => anyhow::bail!(
-                "unknown memory_type {other:?}; valid: episodic, decision, failure, procedural"
-            ),
-        }
+        // A typo'd type must fail loudly, not silently return "no
+        // memories" — the caller then knows to fix the filter.
+        let source = MemorySource::from_type_str(memory_type)?;
+        Self::search_by_types(
+            repo,
+            query,
+            project_id,
+            std::slice::from_ref(&source),
+            limit,
+        )
     }
 
     /// Materialize `SearchResult`s for explicit `(memory_type, id)` pairs by
-    /// loading them from the repo. Used to bring vector-only hits into the
-    /// fused candidate set. `relevance_score` is 0.0 (these were not BM25 hits);
-    /// the reranker recomputes the final score. Importance is normalized the
-    /// same way as the BM25 path (via `Searchable`).
+    /// loading them from the repo — ONE batched query per kind (this used to
+    /// be one `get_active_*` round-trip per id). Used to bring vector-only
+    /// hits and graph neighbors into the fused candidate set.
+    /// `relevance_score` is 0.0 (these were not BM25 hits); the reranker
+    /// recomputes the final score.
+    ///
+    /// Uses wildcard-capable, archived-excluding getters: `project_id = '*'`
+    /// (global search) matches any project, and a forgotten memory can never
+    /// resurface through a stale embedding or graph edge.
     pub fn fetch_by_ids(
         repo: &MemoryRepository,
         ids: &[(String, String)],
         project_id: &str,
     ) -> Result<Vec<SearchResult>> {
-        let mut out = Vec::new();
-        for (memory_type, id) in ids {
-            let mut sr = match memory_type.as_str() {
-                "episodic" => repo.get_episodic(id, project_id)?.map(|m| {
-                    Self::to_results(
-                        vec![ScoredMemory {
-                            memory: m,
-                            bm25_score: 0.0,
-                        }],
-                        "episodic",
-                    )
-                }),
-                "decision" => repo.get_decision(id, project_id)?.map(|m| {
-                    Self::to_results(
-                        vec![ScoredMemory {
-                            memory: m,
-                            bm25_score: 0.0,
-                        }],
-                        "decision",
-                    )
-                }),
-                "failure" => repo.get_failure(id, project_id)?.map(|m| {
-                    Self::to_results(
-                        vec![ScoredMemory {
-                            memory: m,
-                            bm25_score: 0.0,
-                        }],
-                        "failure",
-                    )
-                }),
-                "procedural" => repo.get_procedural(id, project_id)?.map(|m| {
-                    Self::to_results(
-                        vec![ScoredMemory {
-                            memory: m,
-                            bm25_score: 0.0,
-                        }],
-                        "procedural",
-                    )
-                }),
-                _ => None,
-            };
-            if let Some(v) = sr.as_mut() {
-                out.append(v);
-            }
-        }
-        Ok(out)
+        Ok(repo
+            .get_active_any_batch(ids, project_id)?
+            .into_iter()
+            .map(Self::active_to_result)
+            .collect())
     }
 }
 
@@ -398,7 +573,6 @@ impl BM25Retriever {
 mod tests {
     use super::*;
     use crate::models::{DecisionMemory, EpisodicMemory, FailureMemory, ProceduralMemory};
-    use crate::storage::ScoredMemory;
 
     fn episodic(importance: f32) -> EpisodicMemory {
         EpisodicMemory {
@@ -462,48 +636,22 @@ mod tests {
     #[test]
     fn importance_maps_per_type() {
         // episodic: passthrough
-        let r = BM25Retriever::to_results(
-            vec![ScoredMemory {
-                memory: episodic(0.8),
-                bm25_score: -1.0,
-            }],
-            "episodic",
+        let r = BM25Retriever::active_to_result(ActiveMemory::Episodic(episodic(0.8)));
+        assert!((r.importance - 0.8).abs() < 1e-6);
+        assert_eq!(
+            r.relevance_score, 0.0,
+            "materialized ids carry no BM25 score"
         );
-        assert!((r[0].importance - 0.8).abs() < 1e-6);
         // failure: severity / 5
-        let r = BM25Retriever::to_results(
-            vec![ScoredMemory {
-                memory: failure(5),
-                bm25_score: -1.0,
-            }],
-            "failure",
-        );
-        assert!((r[0].importance - 1.0).abs() < 1e-6);
-        let r = BM25Retriever::to_results(
-            vec![ScoredMemory {
-                memory: failure(1),
-                bm25_score: -1.0,
-            }],
-            "failure",
-        );
-        assert!((r[0].importance - 0.2).abs() < 1e-6);
+        let r = BM25Retriever::active_to_result(ActiveMemory::Failure(failure(5)));
+        assert!((r.importance - 1.0).abs() < 1e-6);
+        let r = BM25Retriever::active_to_result(ActiveMemory::Failure(failure(1)));
+        assert!((r.importance - 0.2).abs() < 1e-6);
         // decision / procedural: neutral 0.5
-        let r = BM25Retriever::to_results(
-            vec![ScoredMemory {
-                memory: decision(),
-                bm25_score: -1.0,
-            }],
-            "decision",
-        );
-        assert!((r[0].importance - 0.5).abs() < 1e-6);
-        let r = BM25Retriever::to_results(
-            vec![ScoredMemory {
-                memory: procedural(),
-                bm25_score: -1.0,
-            }],
-            "procedural",
-        );
-        assert!((r[0].importance - 0.5).abs() < 1e-6);
+        let r = BM25Retriever::active_to_result(ActiveMemory::Decision(decision()));
+        assert!((r.importance - 0.5).abs() < 1e-6);
+        let r = BM25Retriever::active_to_result(ActiveMemory::Procedural(procedural()));
+        assert!((r.importance - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -628,5 +776,133 @@ mod tests {
         repo.create_episodic(&mem).unwrap();
         let results = repo.search_episodic("认证", "p", 10).unwrap();
         assert!(!results.is_empty(), "CJK search should find the memory");
+    }
+
+    #[test]
+    fn coverage_demotes_rare_single_term_hit() {
+        // The known OR-fallback weakness: a short doc containing ONE rare
+        // query token (high IDF → high raw bm25) must not outrank a doc that
+        // contains ALL the query tokens.
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |id: &str, summary: &str, content: &str| EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            content: content.into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        // "xylophone" is absent everywhere else → very rare token.
+        repo.create_episodic(&mk("rare", "xylophone", "unrelated filler text"))
+            .unwrap();
+        repo.create_episodic(&mk(
+            "full",
+            "crash report analysis",
+            "crash analysis with stack trace",
+        ))
+        .unwrap();
+        let r = BM25Retriever::search_all(&repo, "crash analysis xylophone", "p", 10).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r[0].id,
+            "full",
+            "doc matching 2/3 query terms must outrank the single-rare-term doc (got {:?})",
+            r.iter()
+                .map(|x| (x.id.clone(), x.relevance_score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fetch_by_ids_supports_wildcard_and_excludes_archived() {
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mem = EpisodicMemory {
+            id: "wx1".into(),
+            project_id: "other-project".into(),
+            session_id: "s".into(),
+            summary: "global knowledge".into(),
+            content: "c".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mem).unwrap();
+        // Wildcard: a cross-project id materializes under '*'.
+        let r = BM25Retriever::fetch_by_ids(
+            &repo,
+            &[(("episodic".to_string()), "wx1".to_string())],
+            "*",
+        )
+        .unwrap();
+        assert_eq!(
+            r.len(),
+            1,
+            "wildcard project must materialize cross-project ids"
+        );
+        assert_eq!(r[0].id, "wx1");
+        // Strict project still returns nothing for another project's id.
+        let r = BM25Retriever::fetch_by_ids(
+            &repo,
+            &[("episodic".to_string(), "wx1".to_string())],
+            "mine",
+        )
+        .unwrap();
+        assert!(r.is_empty());
+        // Archived rows never materialize (stale embeddings/graph edges).
+        repo.archive(
+            crate::storage::repository::MemoryKind::Episodic,
+            "wx1",
+            "other-project",
+            99,
+        )
+        .unwrap();
+        let r =
+            BM25Retriever::fetch_by_ids(&repo, &[("episodic".to_string(), "wx1".to_string())], "*")
+                .unwrap();
+        assert!(r.is_empty(), "archived memory must not resurface");
+    }
+
+    #[test]
+    fn search_by_type_shares_calibration_with_search_all() {
+        // Same doc, same query: the score must not depend on whether a
+        // memory_type filter was present (the old separate normalization
+        // gave filtered searches a different scale).
+        let repo = MemoryRepository::new_in_memory().unwrap();
+        repo.initialize_schema().unwrap();
+        let mk = |id: &str| EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: "alpha beta gamma".into(),
+            content: "alpha beta gamma".into(),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+        repo.create_episodic(&mk("e1")).unwrap();
+        let filtered =
+            BM25Retriever::search_by_type(&repo, "alpha beta", "p", "episodic", 10).unwrap();
+        let all = BM25Retriever::search_all(&repo, "alpha beta", "p", 10).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(all.len(), 1);
+        assert!(
+            (filtered[0].relevance_score - all[0].relevance_score).abs() < 1e-6,
+            "filtered {} vs unfiltered {}",
+            filtered[0].relevance_score,
+            all[0].relevance_score
+        );
     }
 }

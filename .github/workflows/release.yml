@@ -30,6 +30,8 @@ jobs:
         with:
           key: release-test
       - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo fmt --check
 
   build:
     needs: test
@@ -52,6 +54,12 @@ jobs:
             archive: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # install.sh accepts aarch64 Linux (ARM servers, Raspberry Pi, Asahi)
+          # — this target must actually be built or those installs 404.
+          # Native arm runner, no cross toolchain needed.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc

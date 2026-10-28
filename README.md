@@ -338,21 +338,26 @@ memory_budget_percent = 15               # % of context for memories
 [mcp]
 worker_threads = 1                       # Concurrent request handlers (default 1 = FIFO sequential; raise only if your client pipelines independent requests)
 
+[reflection]
+agent_confirm = true                    # false → the MCP confirm_suggestion tool refuses; suggestions are
+                                         # confirmed only by a human via `engram confirm-suggestion`
+
 [security]                              # Guards for agent-supplied repo_path (prompt-injection defense)
 allowed_roots = []                      # Non-empty: ingest/collect only accept paths under these roots
                                          # (home dir and / are always rejected)
 
 [http]                                  # Optional MCP Streamable-HTTP transport (stdio stays the default)
-enabled = false                         # true → serve POST /mcp (Bearer-token gated)
+enabled = false                         # true → serve POST /mcp (Bearer-token gated, constant-time compare)
 bind = "127.0.0.1:8742"
 auth_token = ""                         # REQUIRED when enabled — startup refuses an empty token
+                                         # initialize returns an mcp-session-id header; later requests
+                                         # must carry it (unknown → 404); DELETE /mcp ends the session
 
 [semantic]                               # Semantic search — only active in builds compiled with --features semantic
 enabled = false                          # Turn on embedding-based retrieval
 model_id = "sentence-transformers/all-MiniLM-L6-v2"   # fetched once into ~/.engram/models on first run
 # model_path = "/path/to/model-dir"      # Air-gapped override: dir with config.json/tokenizer.json/model.safetensors
-rrf_k = 60                               # Reciprocal Rank Fusion constant (fuses BM25 + vector ranks)
-top_k = 50                               # Vector candidates fused with BM25
+top_k = 50                               # Vector candidates fused with BM25 (max-injection)
 ```
 
 Data is stored in `~/.engram/memory.db` by default.
@@ -392,7 +397,8 @@ Data is stored in `~/.engram/memory.db` by default.
 - **CJK-aware search** — Chinese/Japanese/Korean queries get character-level segmentation (spaces inserted between CJK runes), and FTS5 reserved words in a query are escaped so terms like `UNIQUE` or `AND` match as text rather than column filters. The intent classifier recognizes Chinese keywords too (e.g. 调试/修复, 架构/决策).
 - **Ranking signals** — `search_memory` reranks BM25 results with weights normalized to sum 1: relevance (the normalized BM25 — or fused semantic — score) dominates; recency (exponential half-life decay against the real clock), per-record `importance`, and a narrow memory-type prior only break ties. Classified intents raise *relevance* (the query matched that domain), never the static priors. The relationship graph contributes second-tier candidates: memories sharing a file/tool entity with the top hits are appended at low rank, marked `graph_neighbor: true`. Decisions replaced via a `supersedes` chain are score-halved and flagged `superseded: true` — history stays reachable but never outranks its replacement.
 - **Connection pool + concurrency** — the repository uses an r2d2 pool over WAL-mode SQLite (multi-reader, single-writer via `busy_timeout`); concurrent reads no longer serialize. MCP request handling dispatches to a bounded worker pool (`[mcp] worker_threads`, default 1 = FIFO sequential — safe for stdio clients that pipeline dependent requests; raise only for independent workloads).
-- **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2), and vector top-K is fused with BM25 via Reciprocal Rank Fusion. Vectors are stored as BLOBs in SQLite and scored by brute-force cosine over the active set (no separate vector index), so semantic search suits thousands — not millions — of memories per project. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
+- **Semantic search (optional)** — build with `--features semantic` to add local embedding retrieval via [candle](https://github.com/huggingface/candle) (pure Rust, no native runtime). Query and memories are embedded with a BERT model (default all-MiniLM-L6-v2); a candidate's relevance becomes its two-arm reciprocal-rank fusion score — `1/(60+bm25_rank) + 1/(60+cosine_rank)`, each arm contributing only when the candidate ranked in it, normalized to [0,1] with a 0.5 ceiling for single-signal candidates. (The earlier `max(normalized BM25, cosine)` blend was retired: embedding cosine has a heavy noise floor — MiniLM scores unrelated pairs 0.25-0.45, right where weak-but-real BM25 matches land — so the max let noise override lexical evidence; ranks cannot override each other's scale.) Vectors are stored as BLOBs in SQLite and scored by brute-force cosine over the active set (no separate vector index), so semantic search suits thousands — not millions — of memories per project. The model is fetched once into `~/.engram/models/` (or supply `[semantic] model_path` for air-gapped use); inference is fully offline thereafter. **Off by default** — the standard build pulls in none of it and stays self-contained. Archived memories are excluded automatically; changing `model_id` makes existing vectors inert until memories are re-indexed.
+- **Evaluating semantic quality manually** — the real-model path cannot run in CI (the first `--features semantic` run downloads ~90 MB of model weights), so verify retrieval quality by hand when it matters: 1) build with `--features semantic` and set `[semantic] enabled = true`; 2) `engram reindex --project myproj` to embed all active memories; 3) run a handful of **paraphrase** queries (same intent, different wording than the stored text) through `search_memory` twice — once with `[semantic] enabled = true`, once `false` — and check the intended memory ranks top-3 in both runs. Paraphrases are the queries semantic search exists for; verbatim keyword queries should not regress. If semantic results are uniformly poor after a `model_id` change, re-run `reindex` (old vectors are inert under a new model).
 
 ---
 

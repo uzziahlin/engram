@@ -523,8 +523,9 @@ impl DefaultMemoryProvider {
         }
 
         // Semantic fusion: when an embedder is present, blend vector top-K with
-        // the BM25 candidates via RRF via the embedding service. Vector-only
-        // hits are materialized so they can surface even when BM25 missed them.
+        // the BM25 candidates (two-arm RRF — see EmbeddingService::fuse).
+        // Vector-only hits are materialized so they can surface even when BM25
+        // missed them.
         #[cfg(feature = "semantic")]
         {
             if self.embedding.is_active() {
@@ -534,7 +535,6 @@ impl DefaultMemoryProvider {
                     project_id,
                     results,
                     self.config.semantic.top_k,
-                    self.config.semantic.rrf_k,
                     memory_type,
                     tags,
                     before,
@@ -546,12 +546,12 @@ impl DefaultMemoryProvider {
         let half_life_seconds = (self.config.retrieval.recency_half_life_days as f32) * 86400.0;
         self.reranker
             .rerank(&mut results, &plan, now_ts, half_life_seconds);
-        results.truncate(limit);
 
         // Supersede chain: a replaced decision stays searchable as history,
         // but must not outrank the decision that replaced it — halve its
-        // score, flag it, and re-sort (the halving happens after the
-        // reranker's ordering pass, so the order must be re-derived).
+        // score, flag it, and re-sort. This runs BEFORE the truncate so a
+        // superseded decision cannot occupy a slot it is about to be demoted
+        // out of (it previously displaced a valid result and only then sank).
         let mut supersede_adjusted = false;
         for r in results.iter_mut().filter(|r| r.memory_type == "decision") {
             let superseded = r
@@ -577,26 +577,52 @@ impl DefaultMemoryProvider {
 
         // Graph-based second tier: memories that share an entity (file/tool)
         // with the top hits are contextually related even when their text
-        // didn't match the query. Capped at 2 and appended below the reranked
-        // order, so this can only ADD context, never displace a match.
+        // didn't match the query. Appended below the reranked order, so this
+        // can only ADD context, never displace a match. If neighbors exist,
+        // the lowest-ranked true hits yield their slots so the response still
+        // respects `limit` (previously limit+2 came back); with no neighbors
+        // the full limit of true hits is kept. At least one true hit always
+        // survives — a lone query match is never displaced by a graph
+        // neighbor. Neighbors respect the caller's explicit filters
+        // (memory_type/tags/before) with the same semantics as the vector
+        // path — a typed or time-bounded search must not leak foreign
+        // neighbors through the graph.
+        results.truncate(limit);
         if self.config.retrieval.graph_expansion && !results.is_empty() {
             const GRAPH_NEIGHBOR_CAP: usize = 2;
             let seeds: Vec<String> = results.iter().take(3).map(|r| r.id.clone()).collect();
             let existing: std::collections::HashSet<&str> =
                 results.iter().map(|r| r.id.as_str()).collect();
-            let neighbors = repo.neighbor_memories(project_id, &seeds, GRAPH_NEIGHBOR_CAP)?;
-            let fresh: Vec<(String, String)> = neighbors
+            let neighbors_raw = repo.neighbor_memories(project_id, &seeds, GRAPH_NEIGHBOR_CAP)?;
+            let fresh: Vec<(String, String)> = neighbors_raw
                 .into_iter()
                 .filter(|(_, id)| !existing.contains(id.as_str()))
                 .collect();
+            let mut neighbors: Vec<_> = Vec::new();
             for mut sr in BM25Retriever::fetch_by_ids(repo, &fresh, project_id)? {
+                // Explicit filters apply to graph neighbors too, mirroring
+                // the vector path in EmbeddingService::fuse: memory_type must
+                // match, tags must intersect, created_at must precede
+                // `before`.
+                let type_ok = memory_type.is_none_or(|mt| sr.memory_type == mt);
+                let tags_ok = tags.is_empty() || sr.tags.iter().any(|t| tags.contains(t));
+                let before_ok = before.is_none_or(|b| sr.created_at < b);
+                if !(type_ok && tags_ok && before_ok) {
+                    continue;
+                }
                 // Fixed low relevance: these are "related by graph", not
                 // text matches — they must rank below every true hit.
                 sr.relevance_score = 0.30;
                 if let Some(obj) = sr.detail.as_object_mut() {
                     obj.insert("graph_neighbor".to_string(), serde_json::Value::Bool(true));
                 }
-                results.push(sr);
+                neighbors.push(sr);
+            }
+            // At most limit-1 neighbors: keep room for one true hit.
+            neighbors.truncate(limit.saturating_sub(1).min(GRAPH_NEIGHBOR_CAP));
+            if !neighbors.is_empty() {
+                results.truncate(limit - neighbors.len());
+                results.extend(neighbors);
             }
         }
         Ok(results)
@@ -645,6 +671,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             .map(|r| {
                 let mut item = serde_json::json!({
                     "id": r.id,
+                    // Global search (`project_id = "*"`) mixes projects; the
+                    // exact owner must travel with the hit so agents can call
+                    // get_memory / mark_relevance / forget_memory on it.
+                    "project_id": r.project_id,
                     "memory_type": r.memory_type,
                     "summary": r.summary,
                     "tags": r.tags,
@@ -675,6 +705,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             if let Some(obj) = result_items[idx].as_object_mut() {
                 let keep = [
                     "id",
+                    "project_id",
                     "memory_type",
                     "summary",
                     "relevance_score",
@@ -691,9 +722,12 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         }
 
         // Best-effort retrieval feedback: log this query + its hits so
-        // `query_stats` / `engram queries` can surface hit-rate signal. A
-        // logging failure must never break search.
-        let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+        // `query_stats` / `engram queries` can surface hit-rate signal, and
+        // `engram tune` learns from impressions/adoptions. Graph neighbors
+        // are excluded — they never matched the query, so counting them as
+        // impressions poisoned the tuning signal. A logging failure must
+        // never break search.
+        let result_ids = BM25Retriever::impression_ids(&results);
         if let Err(e) = self.repo.record_query(
             &input.project_id,
             &input.query,
@@ -758,22 +792,46 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         // Resolve the file's graph neighborhood directly from the indexed
         // graph_relations table — no full-project graph load into memory.
         let (entity_id, edges) = repo.related_files_for(&input.file, &input.project_id)?;
-        let relations: Vec<_> = edges
-            .iter()
-            .map(|e| {
+        let found = entity_id.is_some();
+
+        // The primary payload: ACTIVE memories touching this file, each with
+        // its memory_type and label so agents can act on them (the old output
+        // listed neighbor entity names — for memories that is a bare UUID,
+        // unusable without a type for get_memory).
+        let memories: Vec<serde_json::Value> = repo
+            .related_memories_for_file(&input.file, &input.project_id, 20)?
+            .into_iter()
+            .map(|m| {
                 serde_json::json!({
-                    "to": e.other_name,
-                    "type": e.relation_type,
+                    "memory_type": m.memory_type,
+                    "id": m.id,
+                    "summary": m.label,
+                    "relation": m.relation,
                 })
             })
             .collect();
+
+        // Non-memory neighbors (other files/tools in the graph), kept for
+        // completeness.
+        let related_entities: Vec<_> = edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.other_name,
+                    "relation": e.relation_type,
+                    "direction": e.direction,
+                })
+            })
+            .collect();
+
         Ok(serde_json::json!({
-            "entities": [{
-                "id": entity_id.unwrap_or_default(),
-                "type": "File",
-                "name": input.file,
-                "relations": relations,
-            }]
+            "file": input.file,
+            "found": found,
+            "memories": memories,
+            "related_entities": related_entities,
+            "detail": if found { serde_json::Value::Null } else {
+                serde_json::json!("no File entity for this name in the project — no memory has touched it (or the file is new)")
+            },
         }))
     }
 
@@ -864,6 +922,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let failures = repo.list_recent_failures(&input.project_id, 5)?;
         let procedures = repo.list_top_procedural(&input.project_id, 5)?;
         let pending = repo.list_pending_suggestions(&input.project_id)?;
+        // Raw session imports awaiting distillation — surfacing the count
+        // here is the distill loop's trigger: the agent sees the backlog in
+        // every session brief and can fetch the `engram.distill` prompt.
+        let raw_session_imports = repo.count_session_imports(&input.project_id)?;
 
         // Optional focused context: run the query through the same pipeline
         // search_memory uses (intent → BM25 → rerank), capped at 3 hits.
@@ -882,6 +944,12 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             "=== Engram Session Brief: {} ===",
             input.project_id
         ));
+        if raw_session_imports > 0 {
+            lines.push(format!(
+                "-- {raw_session_imports} raw session-import memories awaiting distillation \
+                 (fetch prompt engram.distill to refine them into typed memories) --"
+            ));
+        }
         if !decisions.is_empty() {
             lines.push("-- Decisions (constraints to respect) --".into());
             for d in &decisions {
@@ -915,14 +983,22 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         }
         if !pending.is_empty() {
             lines.push(format!(
-                "-- Pending reflection suggestions ({}) awaiting confirmation --",
+                "-- Pending reflection suggestions ({}) --",
                 pending.len()
             ));
             for s in &pending {
-                lines.push(format!(
-                    "[suggestion x{}] {} — confirm or reject via list_suggestions",
-                    s.occurrence_count, s.suggested_workflow_name
-                ));
+                if self.config.reflection.agent_confirm {
+                    lines.push(format!(
+                        "[suggestion x{}] {} — confirm or reject via list_suggestions",
+                        s.occurrence_count, s.suggested_workflow_name
+                    ));
+                } else {
+                    lines.push(format!(
+                        "[suggestion x{}] {} — awaiting human confirmation \
+                         (engram confirm-suggestion / reject-suggestion)",
+                        s.occurrence_count, s.suggested_workflow_name
+                    ));
+                }
             }
         }
         if let Some(hits) = &focused {
@@ -1012,6 +1088,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             "failures": failures_out,
             "procedures": procedures_out,
             "pending_suggestions": suggestions_out,
+            "raw_session_imports": raw_session_imports,
             "focused": focused_out,
             "generated_at": now,
         }))
@@ -1074,20 +1151,6 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             );
         }
         let repo = self.lock_repo();
-        // Write-time exact-dup guard: an identical active memory is returned,
-        // not re-created (agents retry writes; near-dups stay consolidate's job).
-        if self.config.retrieval.write_dedup {
-            let text = format!("{}\n{}", input.summary, input.content);
-            if let Some(existing) =
-                repo.find_exact_duplicate(MemoryKind::Episodic, &input.project_id, &text)?
-            {
-                return Ok(serde_json::json!({
-                    "id": existing,
-                    "status": "duplicate",
-                    "detail": "identical active memory already exists; nothing written",
-                }));
-            }
-        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -1105,7 +1168,27 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             updated_at: now,
         };
 
-        repo.create_episodic(&memory)?;
+        // Write-time exact-dup guard: with write_dedup on, the row's
+        // content_hash is written and the partial unique index enforces dedup
+        // ATOMICALLY inside the INSERT — the old two-step
+        // find_exact_duplicate → create raced (both callers passed the check
+        // and double-wrote). On collision the existing ACTIVE row's id comes
+        // back and is answered as "duplicate", not an error (agents retry
+        // writes; near-dups stay consolidate's job). With write_dedup off the
+        // row carries no hash and duplicates are created freely.
+        let duplicate = if self.config.retrieval.write_dedup {
+            repo.create_episodic_dedup(&memory)?
+        } else {
+            repo.create_episodic(&memory)?;
+            None
+        };
+        if let Some(existing) = duplicate {
+            return Ok(serde_json::json!({
+                "id": existing,
+                "status": "duplicate",
+                "detail": "identical active memory already exists; nothing written",
+            }));
+        }
         #[cfg(feature = "semantic")]
         self.embedding.index(
             repo,
@@ -1124,24 +1207,23 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn create_decision(&self, input: CreateDecisionInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        // Write-time exact-dup guard (see create_episodic).
-        if self.config.retrieval.write_dedup {
-            let text = format!(
-                "{}\n{}\n{}\n{}",
-                input.title, input.context, input.rationale, input.tradeoffs
-            );
-            if let Some(existing) =
-                repo.find_exact_duplicate(MemoryKind::Decision, &input.project_id, &text)?
-            {
-                return Ok(serde_json::json!({
-                    "id": existing,
-                    "status": "duplicate",
-                    "detail": "identical active decision already exists; nothing written \
-                               (pass `supersedes` when intentionally replacing a decision)",
-                }));
+        let now = chrono::Utc::now().timestamp();
+
+        // Fail fast BEFORE any write: a bad `supersedes` id must not leave a
+        // committed decision behind with the chain broken (the old two-step
+        // path could do exactly that, and the retry then hit the dedup guard
+        // which returned early without ever performing the supersede).
+        if let Some(old_id) = &input.supersedes {
+            if repo.get_decision(old_id, &input.project_id)?.is_none() {
+                anyhow::bail!(
+                    "cannot supersede: no decision {old_id} in project {}",
+                    input.project_id
+                );
             }
         }
-        let now = chrono::Utc::now().timestamp();
+
+        // Write-time exact-dup guard (see create_episodic): the partial
+        // unique index on content_hash enforces dedup inside the INSERT.
         let id = uuid::Uuid::new_v4().to_string();
 
         let memory = DecisionMemory {
@@ -1159,7 +1241,50 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             updated_at: now,
         };
 
-        repo.create_decision(&memory)?;
+        // Create + supersede in ONE transaction (validated above); without
+        // the supersede there is nothing to couple and the plain create runs.
+        // The dedup flag rides along so the collision (an identical ACTIVE
+        // decision already exists) surfaces as the existing row's id instead
+        // of a double write.
+        let duplicate = match &input.supersedes {
+            Some(old_id) => repo.create_decision_with_supersede(
+                &memory,
+                old_id,
+                self.config.retrieval.write_dedup,
+            )?,
+            None => {
+                if self.config.retrieval.write_dedup {
+                    repo.create_decision_dedup(&memory)?
+                } else {
+                    repo.create_decision(&memory)?;
+                    None
+                }
+            }
+        };
+        if let Some(existing) = duplicate {
+            // Retry of a supersede that failed around an earlier create: the
+            // decision exists but the chain may be missing — apply the
+            // supersede to the EXISTING record instead of silently returning
+            // "duplicate" with the chain still broken.
+            let mut supersede_applied = serde_json::Value::Null;
+            if let Some(old_id) = &input.supersedes {
+                supersede_applied = serde_json::json!(old_id);
+                if let Err(e) = repo.supersede_decision(&input.project_id, old_id, &existing, now) {
+                    // Race (old deleted between the pre-check and here):
+                    // report, don't fail — the memory itself is intact.
+                    supersede_applied = serde_json::json!({
+                        "error": e.to_string(),
+                    });
+                }
+            }
+            return Ok(serde_json::json!({
+                "id": existing,
+                "status": "duplicate",
+                "superseded": supersede_applied,
+                "detail": "identical active decision already exists; nothing written \
+                           (pass `supersedes` when intentionally replacing a decision)",
+            }));
+        }
         #[cfg(feature = "semantic")]
         self.embedding.index(
             repo,
@@ -1169,16 +1294,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             &memory.embedding_text(),
         );
 
-        // Supersede chain: point the replaced decision at this one (the old
-        // record stays searchable as history, flagged + downranked).
         let superseded = match &input.supersedes {
-            Some(old_id) => {
-                repo.supersede_decision(&input.project_id, old_id, &id, now)?;
-                serde_json::json!(old_id)
-            }
+            Some(old_id) => serde_json::json!(old_id),
             None => serde_json::Value::Null,
         };
-
         Ok(serde_json::json!({
             "id": id,
             "status": "created",
@@ -1192,22 +1311,6 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             anyhow::bail!("severity must be between 1 and 5, got {}", input.severity);
         }
         let repo = self.lock_repo();
-        // Write-time exact-dup guard (see create_episodic).
-        if self.config.retrieval.write_dedup {
-            let text = format!(
-                "{}\n{}\n{}\n{}",
-                input.incident, input.root_cause, input.fix, input.prevention
-            );
-            if let Some(existing) =
-                repo.find_exact_duplicate(MemoryKind::Failure, &input.project_id, &text)?
-            {
-                return Ok(serde_json::json!({
-                    "id": existing,
-                    "status": "duplicate",
-                    "detail": "identical active failure already exists; nothing written",
-                }));
-            }
-        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -1224,7 +1327,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             updated_at: now,
         };
 
-        repo.create_failure(&memory)?;
+        // Write-time exact-dup guard (see create_episodic).
+        let duplicate = if self.config.retrieval.write_dedup {
+            repo.create_failure_dedup(&memory)?
+        } else {
+            repo.create_failure(&memory)?;
+            None
+        };
+        if let Some(existing) = duplicate {
+            return Ok(serde_json::json!({
+                "id": existing,
+                "status": "duplicate",
+                "detail": "identical active failure already exists; nothing written",
+            }));
+        }
         #[cfg(feature = "semantic")]
         self.embedding.index(
             repo,
@@ -1244,24 +1360,6 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
     fn create_procedural(&self, input: CreateProceduralInput) -> Result<serde_json::Value> {
         let repo = self.lock_repo();
-        // Write-time exact-dup guard (see create_episodic). The steps column
-        // stores the JSON array string, so the candidate text must match it.
-        if self.config.retrieval.write_dedup {
-            let text = format!(
-                "{}\n{}",
-                input.workflow_name,
-                serde_json::to_string(&input.steps)?
-            );
-            if let Some(existing) =
-                repo.find_exact_duplicate(MemoryKind::Procedural, &input.project_id, &text)?
-            {
-                return Ok(serde_json::json!({
-                    "id": existing,
-                    "status": "duplicate",
-                    "detail": "identical active procedure already exists; nothing written",
-                }));
-            }
-        }
         let now = chrono::Utc::now().timestamp();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -1277,7 +1375,21 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             updated_at: now,
         };
 
-        repo.create_procedural(&memory)?;
+        // Write-time exact-dup guard (see create_episodic). The steps column
+        // stores the JSON array string, so the hashed dedup text matches it.
+        let duplicate = if self.config.retrieval.write_dedup {
+            repo.create_procedural_dedup(&memory)?
+        } else {
+            repo.create_procedural(&memory)?;
+            None
+        };
+        if let Some(existing) = duplicate {
+            return Ok(serde_json::json!({
+                "id": existing,
+                "status": "duplicate",
+                "detail": "identical active procedure already exists; nothing written",
+            }));
+        }
         #[cfg(feature = "semantic")]
         self.embedding.index(
             repo,
@@ -1325,6 +1437,17 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn confirm_suggestion(&self, input: SuggestionIdInput) -> Result<serde_json::Value> {
+        // Optional human gate: `reflection.agent_confirm = false` reserves
+        // confirmation for the CLI, making the documented "awaiting human
+        // confirmation" model enforceable instead of aspirational.
+        if !self.config.reflection.agent_confirm {
+            anyhow::bail!(
+                "confirm_suggestion is disabled by config \
+                 ([reflection] agent_confirm = false): suggestions are confirmed \
+                 by a human via `engram confirm-suggestion {}`",
+                input.id
+            );
+        }
         let repo = self.lock_repo();
         match repo.confirm_suggestion(
             &input.id,
@@ -1370,6 +1493,10 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let session_id = input.session_id.unwrap_or_else(|| "auto-ingest".into());
 
         let events = git.get_recent_commits(count)?;
+        // Count against what was actually available: a shallow repo with 5
+        // commits and count=20 has 0 duplicates, not 15 (the old `count -
+        // fresh` arithmetic reported missing history as "skipped").
+        let scanned = events.len();
         let repo = self.lock_repo();
 
         // Dedup BEFORE generating: the old path built a full memory (with
@@ -1379,7 +1506,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             .into_iter()
             .filter(|e| !ingested_hashes.contains(&e.commit_hash))
             .collect();
-        let skipped = count.saturating_sub(fresh.len());
+        let skipped = scanned.saturating_sub(fresh.len());
 
         // One memory per (type, scope) milestone instead of one per commit —
         // the distillation git_collector's bootstrap path always intended.
@@ -1389,6 +1516,17 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let mut ingested = Vec::new();
         for mem in &memories {
             repo.create_episodic(mem)?;
+            // Embedding parity with the manual create path — without this,
+            // git-ingested memories were invisible to semantic search until a
+            // manual `engram reindex`.
+            #[cfg(feature = "semantic")]
+            self.embedding.index(
+                repo,
+                "episodic",
+                &mem.id,
+                &mem.project_id,
+                &mem.embedding_text(),
+            );
             ingested.push(serde_json::json!({
                 "id": mem.id,
                 "summary": mem.summary,
@@ -1399,7 +1537,7 @@ impl MemoryToolProvider for DefaultMemoryProvider {
 
         Ok(serde_json::json!({
             "ingested": ingested.len(),
-            "total_commits_scanned": count,
+            "total_commits_scanned": scanned,
             "skipped_duplicates": skipped,
             "memories": ingested,
         }))
@@ -1476,6 +1614,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
 
+        // A patch with no fields is a caller bug — most often a strict MCP
+        // client stripping keys the inputSchema did not declare (the old
+        // schema declared only the three fixed params). That used to land
+        // here as a silent "updated" that changed nothing but updated_at:
+        // the agent read the memory back unchanged, retried with more
+        // parameters, and looped. Fail loudly with guidance instead.
+        if input.patch.is_empty() {
+            anyhow::bail!(
+                "empty patch: no fields to update. Pass the fields to change \
+                 alongside project_id/memory_type/id — see this tool's schema \
+                 for the fields each memory_type accepts"
+            );
+        }
+
         macro_rules! guarded_update {
             ($get:ident, $update:ident) => {{
                 // project scoping is enforced in the SQL itself
@@ -1486,17 +1638,50 @@ impl MemoryToolProvider for DefaultMemoryProvider {
                         input.id
                     )
                 })?;
-                let updated = merge_patch(&existing, &input.patch, now)?;
+                let existing_value = serde_json::to_value(&existing)?;
+                let (applied, ignored) =
+                    partition_patch(&input.memory_type, &existing_value, &input.patch)?;
+                if applied.is_empty() {
+                    // Two distinct caller mistakes, two distinct messages so
+                    // the retry can be a fix instead of another loop: only
+                    // protected keys vs fields of a different memory_type.
+                    if input
+                        .patch
+                        .keys()
+                        .all(|k| PROTECTED_PATCH_KEYS.contains(&k.as_str()))
+                    {
+                        let keys: Vec<&str> = input.patch.keys().map(String::as_str).collect();
+                        anyhow::bail!(
+                            "no fields to update: patch contained only protected keys \
+                             ({keys:?}) — those are never changed; pass the fields to \
+                             change instead"
+                        );
+                    }
+                    let wrong: Vec<&str> = input
+                        .patch
+                        .keys()
+                        .filter(|k| !PROTECTED_PATCH_KEYS.contains(&k.as_str()))
+                        .map(String::as_str)
+                        .collect();
+                    anyhow::bail!(
+                        "no fields to update: {wrong:?} do not apply to memory_type '{}'; \
+                         applicable fields: {}",
+                        input.memory_type,
+                        applicable_field_list(&existing_value)
+                    );
+                }
+                let updated = merge_patch(&existing, &applied, now)?;
                 repo.$update(&updated)?;
+                (applied, ignored)
             }};
         }
 
-        match kind {
+        let (applied, ignored) = match kind {
             MemoryKind::Episodic => guarded_update!(get_episodic, update_episodic),
             MemoryKind::Decision => guarded_update!(get_decision, update_decision),
             MemoryKind::Failure => guarded_update!(get_failure, update_failure),
             MemoryKind::Procedural => guarded_update!(get_procedural, update_procedural),
-        }
+        };
 
         // Semantic freshness: re-embed the updated text so vector search
         // matches what the memory now says. The create path embeds; without
@@ -1526,11 +1711,23 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             }
         }
 
-        Ok(serde_json::json!({
+        // Echo what actually changed: `applied` maps each written field to
+        // its new value (no follow-up get_memory needed to verify), and
+        // `ignored` explains every key that was not applied. Omitted when
+        // empty to keep the common all-valid case terse.
+        let mut response = serde_json::json!({
             "id": input.id,
             "status": "updated",
+            "applied": serde_json::Value::Object(applied),
             "updated_at": now,
-        }))
+        });
+        if !ignored.is_empty() {
+            response
+                .as_object_mut()
+                .expect("response is an object")
+                .insert("ignored".into(), serde_json::Value::Object(ignored));
+        }
+        Ok(response)
     }
 
     fn mark_relevance(&self, input: MarkRelevanceInput) -> Result<serde_json::Value> {
@@ -1542,6 +1739,26 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         };
         let repo = self.lock_repo();
         let now = chrono::Utc::now().timestamp();
+
+        // Feedback cooldown (24h, one judgment per memory per day). Keyed on
+        // the memory_feedback table, NOT adoptions: get_memory writes an
+        // adoption row, and keying the cooldown there meant the recommended
+        // search → get_memory → mark_relevance flow ALWAYS hit cooldown —
+        // importance never moved. Direction-agnostic: the symmetric window
+        // keeps a client loop from swinging importance to the bounds
+        // (10 × useful = +1.0) or grinding it to the floor with 'irrelevant'.
+        const FEEDBACK_WINDOW_SECS: i64 = 24 * 3600;
+        let cooled =
+            repo.has_recent_feedback(&input.project_id, &input.id, now, FEEDBACK_WINDOW_SECS)?;
+        if cooled {
+            return Ok(serde_json::json!({
+                "id": input.id,
+                "feedback": input.feedback,
+                "status": "cooldown",
+                "detail": "feedback already recorded for this memory in the last 24h; \
+                           importance unchanged",
+            }));
+        }
 
         macro_rules! adjust_importance {
             ($get:ident, $update:ident) => {{
@@ -1586,7 +1803,20 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             MemoryKind::Procedural => adjust_importance!(get_procedural, update_procedural),
         };
 
-        // Explicit "useful" is also an adoption event for retrieval feedback.
+        // The judgment itself: drives the cooldown above (both directions)
+        // and the tuner's demote guard (has_useful_feedback_since).
+        repo.record_feedback(
+            &input.project_id,
+            &input.id,
+            kind.as_str(),
+            &input.feedback,
+            now,
+        )?;
+
+        // Explicit "useful" is also an adoption event for retrieval feedback
+        // — a stronger signal than a passive read. Dedup stays inside
+        // record_adoption. "irrelevant" is a ranking judgment, not evidence
+        // about adoption: it writes no adoption row.
         if step > 0.0 {
             let _ =
                 repo.record_adoption(&input.project_id, &input.id, kind.as_str(), now, 24 * 3600);
@@ -1669,9 +1899,72 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 }
 
+/// Keys update_memory never writes, whether or not a patch carries them:
+/// identity (id/project_id), routing (memory_type), and bookkeeping
+/// (created_at/updated_at — updated_at is always stamped server-side, so a
+/// patch value for it never took effect; it is reported instead of being
+/// silently overwritten).
+const PROTECTED_PATCH_KEYS: [&str; 5] = [
+    "id",
+    "project_id",
+    "created_at",
+    "memory_type",
+    "updated_at",
+];
+
+/// Split a caller's patch against one memory's serialized field set: keys the
+/// model actually carries (minus protected keys) go into `applied`; every
+/// other key lands in `ignored` with a human-readable reason. Derived from
+/// the row itself, so a new model field is patchable the moment it exists —
+/// the schema anti-drift test keeps tools/list honest about it.
+fn partition_patch(
+    memory_type: &str,
+    existing: &serde_json::Value,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
+    let empty = serde_json::Map::new();
+    let model = existing.as_object().unwrap_or(&empty);
+    let mut applied = serde_json::Map::new();
+    let mut ignored = serde_json::Map::new();
+    for (k, v) in patch {
+        if PROTECTED_PATCH_KEYS.contains(&k.as_str()) {
+            ignored.insert(
+                k.clone(),
+                serde_json::json!("protected field, never changed"),
+            );
+        } else if model.contains_key(k) {
+            applied.insert(k.clone(), v.clone());
+        } else {
+            ignored.insert(
+                k.clone(),
+                serde_json::json!(format!("not a field of memory_type '{memory_type}'")),
+            );
+        }
+    }
+    Ok((applied, ignored))
+}
+
+/// Comma-joined, sorted list of the fields a patch may set on one memory
+/// (serialized keys minus protected ones) — used in the "no applicable
+/// fields" error so the message tracks the model instead of drifting.
+fn applicable_field_list(existing: &serde_json::Value) -> String {
+    let mut fields: Vec<&str> = existing
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    fields.retain(|k| !PROTECTED_PATCH_KEYS.contains(k));
+    fields.sort_unstable();
+    fields.join(", ")
+}
+
 /// Merge a patch object into an existing memory: overwrite only keys that already
-/// exist on the model (ignores unknown keys), never touch id/project_id/created_at,
-/// and stamp updated_at. Returns the rebuilt typed value.
+/// exist on the model (ignores unknown keys), never touch the protected keys,
+/// and stamp updated_at. Returns the rebuilt typed value. `update_memory`
+/// pre-filters its patch through `partition_patch`, so the protections here
+/// are defense in depth.
 fn merge_patch<T>(
     existing: &T,
     patch: &serde_json::Map<String, serde_json::Value>,
@@ -1684,9 +1977,8 @@ where
         serde_json::Value::Object(m) => m,
         _ => anyhow::bail!("memory did not serialize to an object"),
     };
-    const PROTECTED: [&str; 4] = ["id", "project_id", "created_at", "memory_type"];
     for (k, v) in patch {
-        if PROTECTED.contains(&k.as_str()) {
+        if PROTECTED_PATCH_KEYS.contains(&k.as_str()) {
             continue;
         }
         if obj.contains_key(k) {
@@ -1855,12 +2147,12 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "related_files".into(),
-                description: "Find entities related to a specific file via the relationship graph".into(),
+                description: "Find memories that touch a specific file (via the relationship graph). Each result carries memory_type, id, and a summary — usable directly with get_memory. Run before modifying a file to surface prior work, decisions, and failures involving it.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
-                        "file": { "type": "string", "description": "File name to find relations for" },
+                        "file": { "type": "string", "description": "File name/path to find related memories for" },
                     },
                     "required": ["project_id", "file"],
                 }),
@@ -1884,7 +2176,7 @@ impl McpServer {
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
-                        "service": { "type": "string", "description": "Filter by service name" },
+                        "service": { "type": "string", "description": "Optional full-text filter matched against failure text (incident, root_cause, fix, prevention) — NOT a structured 'service' field" },
                         "limit": { "type": "integer", "description": "Max results", "default": 10 },
                     },
                     "required": ["project_id"],
@@ -1995,6 +2287,7 @@ impl McpServer {
                         "steps": { "type": "array", "items": { "type": "string" }, "description": "Step-by-step instructions" },
                         "related_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools used in this workflow" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorization" },
+                        "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Ranking signal (default 0.5; core conventions ≥0.7)" },
                     },
                     "required": ["project_id", "workflow_name", "steps"],
                 }),
@@ -2055,21 +2348,43 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "update_memory".into(),
-                description: "Patch fields of an existing memory (correction). Provide memory_type, id, and any fields to change.".into(),
+                description: "Patch fields of an existing memory (correction). Pass ONLY the fields to change (plus project_id/memory_type/id) — omitted fields keep their current value. Fields that do not apply to the target memory_type are ignored and reported in the response's `ignored` map with a reason; `applied` echoes every field that was actually written, so no follow-up get_memory is needed to verify. id/project_id/created_at/updated_at are server-managed and never changed. An empty patch — or one whose keys are all protected or belong to another memory_type — is an error, never a silent success. Patchable fields by type — episodic: session_id, summary, content, files_touched, related_commits; decision: title, context, rationale, tradeoffs, related_files, superseded_by; failure: incident, root_cause, fix, prevention, severity; procedural: workflow_name, steps, related_tools; importance (0-1) applies to episodic/decision/procedural (failure has no importance — severity is its ranking signal); tags applies to all types.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
+                    "description": "Only the fields to change need to be passed. Fields that do not apply to the target memory_type are ignored and reported in the response's `ignored` map; unknown keys are rejected by this schema.",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"] },
                         "id": { "type": "string", "description": "Memory id to update" },
+                        "session_id": { "type": "string", "description": "episodic only" },
+                        "summary": { "type": "string", "description": "episodic only" },
+                        "content": { "type": "string", "description": "episodic only" },
+                        "files_touched": { "type": "array", "items": { "type": "string" }, "description": "episodic only" },
+                        "related_commits": { "type": "array", "items": { "type": "string" }, "description": "episodic only" },
+                        "title": { "type": "string", "description": "decision only" },
+                        "context": { "type": "string", "description": "decision only" },
+                        "rationale": { "type": "string", "description": "decision only" },
+                        "tradeoffs": { "type": "string", "description": "decision only" },
+                        "related_files": { "type": "array", "items": { "type": "string" }, "description": "decision only" },
+                        "superseded_by": { "type": ["string", "null"], "description": "decision only — id of the decision that replaced this one; normally set via create_decision's `supersedes`, patch only to repair a broken chain" },
+                        "incident": { "type": "string", "description": "failure only" },
+                        "root_cause": { "type": "string", "description": "failure only" },
+                        "fix": { "type": "string", "description": "failure only" },
+                        "prevention": { "type": "string", "description": "failure only" },
+                        "severity": { "type": "integer", "minimum": 1, "maximum": 5, "description": "failure only" },
+                        "workflow_name": { "type": "string", "description": "procedural only" },
+                        "steps": { "type": "array", "items": { "type": "string" }, "description": "procedural only" },
+                        "related_tools": { "type": "array", "items": { "type": "string" }, "description": "procedural only" },
+                        "importance": { "type": "number", "minimum": 0, "maximum": 1, "description": "episodic/decision/procedural only — failure has no importance (severity is its ranking signal)" },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "all types" },
                     },
                     "required": ["project_id", "memory_type", "id"],
-                    "additionalProperties": true,
+                    "additionalProperties": false,
                 }),
             },
             ToolDefinition {
                 name: "mark_relevance".into(),
-                description: "Give feedback on a search result: 'useful' raises its ranking importance (+0.1, also counted as adopted), 'irrelevant' lowers it (-0.1). Call this after reading a result that helped (or didn't) — it tunes future rankings.".into(),
+                description: "Give feedback on a search result: 'useful' raises its ranking importance (+0.1, also counted as adopted), 'irrelevant' lowers it (-0.1). The normal flow IS search → get_memory → mark_relevance — reading a result does NOT cool down feedback. One feedback per memory per 24h (either direction): a repeat inside the window returns status \"cooldown\" and changes nothing. Call this after reading a result that helped (or didn't) — it tunes future rankings.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2182,21 +2497,39 @@ impl McpServer {
 
     fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         match request.method.as_str() {
-            "initialize" => JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id: request.id,
-                result: Some(serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {}, "prompts": {} },
-                    "serverInfo": {
-                        "name": "engram",
-                        // Keep in lockstep with Cargo.toml — a stale hardcoded
-                        // version here made clients see 0.1.0 in 0.2.0 builds.
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                })),
-                error: None,
-            },
+            "initialize" => {
+                // Protocol version negotiation (MCP spec): echo the client's
+                // requested version when we support it; otherwise reply with
+                // our latest supported version. The old unconditional
+                // hardcoded reply never honored the client's request.
+                let requested = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05"];
+                let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+                    requested.to_string()
+                } else {
+                    SUPPORTED_PROTOCOL_VERSIONS[0].to_string()
+                };
+                JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id,
+                    result: Some(serde_json::json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": { "tools": {}, "prompts": {} },
+                        "serverInfo": {
+                            "name": "engram",
+                            // Keep in lockstep with Cargo.toml — a stale hardcoded
+                            // version here made clients see 0.1.0 in 0.2.0 builds.
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                    })),
+                    error: None,
+                }
+            }
             // MCP liveness probe: clients may ping to check connection health;
             // answering with an empty result is required by the spec.
             "ping" => JsonRpcResponse {

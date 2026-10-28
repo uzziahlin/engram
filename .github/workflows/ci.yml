@@ -72,6 +72,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Keep in lockstep with release.yml + install.sh's target map — an
+          # installable-but-never-built target 404s for users.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-13
