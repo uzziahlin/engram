@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-02
+
+Iteration rounds 4+5 (two deep reviews): the feedback loop's causal chain
+repaired, retrieval moved onto a single unified FTS index, concurrency
+contracts pushed down from the transports into the data layer, the
+`update_memory` tool contract fixed, the eval harness scaled up, and the CLI
+converged onto the same provider path as MCP.
+
 ### Fixed - CLI/MCP behavior unification (batch 5)
 Round-5 review: 13 CLI commands still bypassed `DefaultMemoryProvider` and
 talked to the repository directly — six of them with real behavior forks
