@@ -18,7 +18,7 @@ Commands:\n\
   collect           Collect bootstrap evidence from a project\n\
   recent-failures   List recent failures\n\
   decisions         List architectural decisions\n\
-  timeline          Show project timeline\n\
+  timeline          Show per-day memory counts by type (--type, --until)\n\
   queries           Show popular search queries (retrieval feedback)\n\
   brief             Assemble a session-start brief (decisions, failures, procedures)\n\
   eval              Score retrieval quality on a golden corpus (in-memory; MRR/NDCG)\n\
@@ -30,7 +30,8 @@ Commands:\n\
   list-archived     List archived memories\n\
   gc                Garbage-collect archived memories + reclaim WAL space (dry-run; --apply)\n\
   consolidate       Find/merge duplicate memories (--near, --apply)\n\
-  maintain          One-shot health pass (dedup, FTS repair, prune, gaps)\n\
+  maintain          One-shot health pass (dedup, FTS repair, prune, gaps)
+  distill-backlog   List raw session-import memories awaiting distillation (oldest first)\n\
   stats             Store observability: counts, feedback, adoption rates\n\
   backup            Hot-backup the database (safe while the server runs)\n\
   export            Export memories as JSON (idempotent by id)\n\
@@ -41,10 +42,10 @@ Commands:\n\
   reject-suggestion Discard a pending proposal without creating a procedural memory\n\
   reindex           Backfill embeddings for existing memories (semantic build)\n\
   init              Initialize database\n\
-  session-import    Distill a session transcript (Claude Code or Codex JSONL) into a memory\n\
+  session-import    Distill a session transcript (Claude Code, Codex, or Gemini CLI JSONL) into a memory\n\
   hook              Agent hook entry point (reads hook JSON on stdin; auto session-import)\n\
-  install-hooks     Wire `engram hook` into Claude Code settings (SessionEnd; merge + backup + idempotent)\n\
-  uninstall-hooks   Remove engram hook entries from Claude Code settings\n\
+  install-hooks     Wire `engram hook` into Claude Code/Gemini CLI settings (SessionEnd; merge + backup + idempotent)\n\
+  uninstall-hooks   Remove engram hook entries from Claude Code/Gemini CLI settings\n\
   init-guide        Generate ENGRAM.md agent guide; optionally @import into CLAUDE.md\n\
 \n\
 Run 'engram' with no arguments to start the MCP server (stdio).";
@@ -94,6 +95,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "reject-suggestion" => commands::reject_suggestion(cmd_args),
         "reindex" => commands::reindex(cmd_args),
         "maintain" => commands::maintain(cmd_args),
+        "distill-backlog" => commands::distill_backlog(cmd_args),
         "stats" => commands::stats(cmd_args),
         "backup" => commands::backup(cmd_args),
         "export" => commands::export(cmd_args),
@@ -163,5 +165,10 @@ mod tests {
         ] {
             assert!(USAGE.contains(c), "USAGE missing {c}");
         }
+    }
+
+    #[test]
+    fn usage_lists_distill_backlog() {
+        assert!(USAGE.contains("distill-backlog"));
     }
 }

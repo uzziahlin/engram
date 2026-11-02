@@ -103,6 +103,13 @@ pub struct TimelineInput {
     project_id: String,
     #[serde(default = "default_days")]
     days: i64,
+    /// Optional filter: count only this memory type. The other per-type
+    /// counts stay 0 so the response shape never changes with filtering.
+    #[serde(default)]
+    memory_type: Option<String>,
+    /// Optional window end as an absolute unix timestamp (exclusive).
+    #[serde(default)]
+    until: Option<i64>,
 }
 
 fn default_days() -> i64 {
@@ -351,6 +358,16 @@ pub struct ConsolidateInput {
     pub apply: bool,
 }
 
+/// distill_backlog tool input — the distill loop's material list: raw
+/// session-import memories awaiting distillation, oldest first.
+#[derive(Debug, Deserialize)]
+pub struct DistillBacklogInput {
+    pub project_id: String,
+    /// None → 10; clamped into 1..=50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// MCP Tool definition.
 #[derive(Debug, Serialize)]
 pub struct ToolDefinition {
@@ -378,6 +395,7 @@ pub trait MemoryToolProvider: Send + Sync {
         &self,
         input: ArchitecturalDecisionsInput,
     ) -> Result<serde_json::Value>;
+    fn distill_backlog(&self, input: DistillBacklogInput) -> Result<serde_json::Value>;
 
     // Write tools
     fn create_episodic(&self, input: CreateEpisodicInput) -> Result<serde_json::Value>;
@@ -836,19 +854,44 @@ impl MemoryToolProvider for DefaultMemoryProvider {
     }
 
     fn timeline(&self, input: TimelineInput) -> Result<serde_json::Value> {
+        // Same validation convention as resolve_kinds: a bad memory_type is a
+        // clear error, not a silently empty timeline.
+        let kind = match &input.memory_type {
+            Some(s) => Some(MemoryKind::from_type_str(s)?),
+            None => None,
+        };
         let repo = self.lock_repo();
         let since = chrono::Utc::now().timestamp() - clamp_days(input.days).saturating_mul(86400);
-        let rows = repo.timeline(&input.project_id, since)?;
+        let rows = repo.timeline(&input.project_id, since, input.until, kind)?;
         let events: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    "date": r.day,
-                    "episodic_count": r.count,
+                    "day": r.day,
+                    "counts": {
+                        "episodic": r.episodic,
+                        "decision": r.decision,
+                        "failure": r.failure,
+                        "procedural": r.procedural,
+                        "total": r.episodic + r.decision + r.failure + r.procedural,
+                    },
                 })
             })
             .collect();
-        Ok(serde_json::json!({ "events": events }))
+        // Echo the window actually used (days is clamped 0..=3650); the
+        // optional filters appear only when the caller supplied them.
+        let mut out = serde_json::json!({
+            "project_id": input.project_id,
+            "days": clamp_days(input.days),
+            "events": events,
+        });
+        if let Some(mt) = &input.memory_type {
+            out["memory_type"] = serde_json::json!(mt);
+        }
+        if let Some(until) = input.until {
+            out["until"] = serde_json::json!(until);
+        }
+        Ok(out)
     }
 
     fn query_stats(&self, input: QueryStatsInput) -> Result<serde_json::Value> {
@@ -925,7 +968,11 @@ impl MemoryToolProvider for DefaultMemoryProvider {
         // Raw session imports awaiting distillation — surfacing the count
         // here is the distill loop's trigger: the agent sees the backlog in
         // every session brief and can fetch the `engram.distill` prompt.
-        let raw_session_imports = repo.count_session_imports(&input.project_id)?;
+        // Distilled typed memories (source tag kept, `distilled` added) no
+        // longer count; the oldest raw import's age hints at how overdue
+        // the loop is.
+        let (raw_session_imports, oldest_raw_import) =
+            repo.count_session_imports(&input.project_id)?;
 
         // Optional focused context: run the query through the same pipeline
         // search_memory uses (intent → BM25 → rerank), capped at 3 hits.
@@ -945,9 +992,12 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             input.project_id
         ));
         if raw_session_imports > 0 {
+            let oldest = oldest_raw_import
+                .map(|ts| format!("oldest {} days ago; ", (now - ts).max(0) / 86_400))
+                .unwrap_or_default();
             lines.push(format!(
                 "-- {raw_session_imports} raw session-import memories awaiting distillation \
-                 (fetch prompt engram.distill to refine them into typed memories) --"
+                 ({oldest}fetch prompt engram.distill to refine them into typed memories) --"
             ));
         }
         if !decisions.is_empty() {
@@ -1092,6 +1142,43 @@ impl MemoryToolProvider for DefaultMemoryProvider {
             "focused": focused_out,
             "generated_at": now,
         }))
+    }
+
+    fn distill_backlog(&self, input: DistillBacklogInput) -> Result<serde_json::Value> {
+        use crate::consolidation::engine::{SESSION_IMPORT_TPL_ERRORS, SESSION_IMPORT_TPL_FILES};
+
+        let repo = self.lock_repo();
+        // Backlog pages are read top-down by the distill agent — a bound an
+        // order of magnitude below search_memory's keeps the response small.
+        let limit = input.limit.unwrap_or(10).clamp(1, 50);
+        let now = chrono::Utc::now().timestamp();
+        let (items, total) = repo.list_distill_backlog(&input.project_id, limit)?;
+        let items: Vec<_> = items
+            .iter()
+            .map(|m| {
+                // Signal overview parsed from the session-import template
+                // headers (built by `cli::commands::session_import_content`
+                // from THESE constants). A section that is absent (nothing of
+                // that kind was recorded) parses to null, not 0.
+                let error_count = parse_session_import_count(&m.content, SESSION_IMPORT_TPL_ERRORS);
+                let file_count = parse_session_import_count(&m.content, SESSION_IMPORT_TPL_FILES);
+                let age_days = (now - m.created_at).max(0) / 86_400;
+                // The content starts with template scaffold on its own lines;
+                // flatten whitespace so the preview is one readable line.
+                let flat: String = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                serde_json::json!({
+                    "id": m.id,
+                    "memory_type": "episodic",
+                    "summary": m.summary,
+                    "created_at": m.created_at,
+                    "age_days": age_days,
+                    "error_count": error_count,
+                    "file_count": file_count,
+                    "preview": first_sentence(&flat),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "total": total, "items": items }))
     }
 
     fn architectural_decisions(
@@ -2003,6 +2090,25 @@ fn first_sentence(text: &str) -> String {
     format!("{}…", &t[..cut])
 }
 
+/// Parse the section count out of a session-import content template header.
+/// The builder writes `Files touched (N):` and `Errors encountered (N —
+/// failure-memory candidates):` (see `cli::commands::session_import_content`,
+/// which stitches from the same `consolidation::engine` constants this is
+/// called with) — the digits right after the opening paren are the count.
+/// `None` = section absent (nothing of that kind was recorded) or malformed.
+fn parse_session_import_count(content: &str, header: &str) -> Option<i64> {
+    let rest = content.split_once(header)?.1.trim_start();
+    let after_paren = rest.strip_prefix('(')?;
+    let digits: String = after_paren
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Resolve an optional memory_type into the kinds to operate on.
 fn resolve_kinds(memory_type: &Option<String>) -> Result<Vec<MemoryKind>> {
     match memory_type {
@@ -2065,11 +2171,12 @@ impl McpServer {
                 search_memory, SearchMemoryInput, {"results": [], "total": 0};
                 get_memory, GetMemoryInput, {"memory": null};
                 related_files, RelatedFilesInput, {"entities": []};
-                timeline, TimelineInput, {"events": []};
+                timeline, TimelineInput, {"project_id": "", "days": 7, "events": []};
                 recent_failures, RecentFailuresInput, {"failures": []};
                 query_stats, QueryStatsInput, {"queries": []};
                 session_brief, SessionBriefInput, {"brief": "", "decisions": [], "failures": [], "procedures": [], "pending_suggestions": []};
                 architectural_decisions, ArchitecturalDecisionsInput, {"decisions": []};
+                distill_backlog, DistillBacklogInput, {"total": 0, "items": []};
                 create_episodic, CreateEpisodicInput, {"id": "", "status": "noop"};
                 create_decision, CreateDecisionInput, {"id": "", "status": "noop"};
                 create_failure, CreateFailureInput, {"id": "", "status": "noop"};
@@ -2159,14 +2266,17 @@ impl McpServer {
             },
             ToolDefinition {
                 name: "timeline".into(),
-                description: "Get a timeline of memory events for the past N days".into(),
+                description: "Get a timeline of memory activity for a project: per-UTC-day counts across all four memory types (episodic, decision, failure, procedural) over the past N days. Archived memories are excluded. Optional memory_type counts a single type (the other per-type counts stay 0); optional until bounds the window's end with an absolute unix timestamp.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string", "description": "Project identifier (required)" },
                         "days": { "type": "integer", "description": "Number of days to look back", "default": 7 },
+                        "memory_type": { "type": "string", "enum": ["episodic", "decision", "failure", "procedural"], "description": "Only count this memory type; the other per-type counts stay 0" },
+                        "until": { "type": "integer", "description": "Window end as an absolute unix timestamp (exclusive); omitted means now" },
                     },
                     "required": ["project_id"],
+                    "additionalProperties": false,
                 }),
             },
             ToolDefinition {
@@ -2219,6 +2329,19 @@ impl McpServer {
                         "include_superseded": { "type": "boolean", "description": "Also include decisions replaced by a newer one (default false)", "default": false },
                     },
                     "required": ["project_id"],
+                }),
+            },
+            ToolDefinition {
+                name: "distill_backlog".into(),
+                description: "List the raw session-import memories awaiting distillation, ordered oldest first with a per-item signal overview (age, error/file counts, content preview). This is the material-picking entry point of the engram.distill prompt: take items from the top (longest rotting), get_memory each for the full transcript dump, distill into typed memories, then forget the raw ones. Distilled memories (tagged 'distilled') never appear here — the total reaching 0 means the loop is closed.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "description": "Project identifier (required)" },
+                        "limit": { "type": "integer", "description": "Max entries returned (default 10, clamped 1..=50)" },
+                    },
+                    "required": ["project_id"],
+                    "additionalProperties": false,
                 }),
             },
             // ─── Write Tools ─────────────────────────────────────────
@@ -2718,6 +2841,14 @@ impl McpServer {
                         self.provider,
                         architectural_decisions
                     ),
+                    "distill_backlog" => {
+                        dispatch_tool!(
+                            arguments,
+                            DistillBacklogInput,
+                            self.provider,
+                            distill_backlog
+                        )
+                    }
                     "create_episodic" => dispatch_tool!(
                         arguments,
                         CreateEpisodicInput,

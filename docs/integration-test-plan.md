@@ -184,7 +184,7 @@
 ### 3.3 timeline
 - **用例 A - 当日时间线**:
   - 输入: `days=1`
-  - 预期: `events` 数组非空, 包含当日日期和 `episodic_count >= 1`
+  - 预期: `events` 数组非空, 包含当日日期和 `counts.episodic >= 1`
 
 - **用例 B - 7 天时间线**:
   - 输入: `days=7`（默认值）

@@ -16,7 +16,7 @@
 #   INSTALL_DIR  install location for the binary   (default ~/.engram/bin)
 #   DATA_DIR     engram database / state directory  (default ~/.engram)
 #   CLIENTS      MCP clients to configure: "auto" or a space-separated subset of
-#                {claude cursor windsurf codex}     (default auto)
+#                {claude cursor windsurf codex gemini} (default auto)
 #   PURGE        with `uninstall`, set to 1 to also remove DATA_DIR
 #   TARGET_DIR   cargo output dir (default: auto-detected via `cargo metadata`)
 

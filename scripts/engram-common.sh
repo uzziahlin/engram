@@ -163,13 +163,18 @@ _configure_claude() {
 _cursor_cfg()   { echo "$HOME/.cursor/mcp.json"; }
 _windsurf_cfg() { echo "$HOME/.codeium/windsurf/mcp_config.json"; }
 _codex_cfg()    { echo "$HOME/.codex/mcp.json"; }
+_gemini_cfg()   { echo "$HOME/.gemini/settings.json"; }
 
 # --- configure MCP clients ---
 # ENGRAM_CLIENTS controls scope (default "auto"):
-#   auto                       -> Claude Code always; cursor/windsurf/codex only
-#                                 when their config dir exists (install.sh behavior)
+#   auto                       -> Claude Code always; cursor/windsurf/codex/gemini
+#                                 only when their config dir exists (install.sh behavior)
 #   space-separated token list -> configure exactly those, unconditionally
-#                                 (known tokens: claude cursor windsurf codex)
+#                                 (known tokens: claude cursor windsurf codex gemini)
+# Gemini CLI keeps its MCP registrations in ~/.gemini/settings.json under the
+# same `mcpServers` key as Claude; that file also carries hooks/theme/auth
+# from other tools, so the merge (never overwrite) behavior of write_mcp_json
+# is what makes it safe.
 configure_clients() {
   info "Configuring MCP clients (idempotent)..."
   clients="${ENGRAM_CLIENTS:-auto}"
@@ -178,6 +183,7 @@ configure_clients() {
     [ -d "$HOME/.cursor" ]  && write_mcp_json "$(_cursor_cfg)"
     [ -d "$HOME/.codeium" ] && write_mcp_json "$(_windsurf_cfg)"
     [ -d "$HOME/.codex" ]   && write_mcp_json "$(_codex_cfg)"
+    [ -d "$HOME/.gemini" ]  && write_mcp_json "$(_gemini_cfg)"
   else
     for c in $clients; do
       case "$c" in
@@ -185,7 +191,8 @@ configure_clients() {
         cursor)   write_mcp_json "$(_cursor_cfg)" ;;
         windsurf) write_mcp_json "$(_windsurf_cfg)" ;;
         codex)    write_mcp_json "$(_codex_cfg)" ;;
-        *)        warn "Unknown client '$c' (known: claude cursor windsurf codex)" ;;
+        gemini)   write_mcp_json "$(_gemini_cfg)" ;;
+        *)        warn "Unknown client '$c' (known: claude cursor windsurf codex gemini)" ;;
       esac
     done
   fi
@@ -205,4 +212,5 @@ unconfigure_clients() {
   remove_mcp_json "$(_cursor_cfg)"
   remove_mcp_json "$(_windsurf_cfg)"
   remove_mcp_json "$(_codex_cfg)"
+  remove_mcp_json "$(_gemini_cfg)"
 }

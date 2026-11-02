@@ -306,6 +306,53 @@ fn is_engram_command(cmd: &str) -> bool {
     cmd.contains(HOOK_COMMAND_MARKER) || cmd.contains(BRIEF_COMMAND_MARKER)
 }
 
+/// Which agent CLI's settings file hooks are wired into. Gemini CLI's native
+/// hooks use the same `{hooks: {"<Event>": [{hooks: [{type: "command",
+/// command}]}]}}` shape as Claude Code and feed `engram hook` an equivalent
+/// stdin payload (`session_id`/`transcript_path`/`cwd`), so only the target
+/// path differs — `~/.gemini/settings.json` (project-level:
+/// `<dir>/.gemini/settings.json`) instead of `.claude/settings.json`. Note
+/// Gemini keeps ALL its config in that one file (theme, auth, mcpServers,
+/// hooks from other tools), so the merge-and-preserve behavior is not
+/// optional there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookClient {
+    Claude,
+    Gemini,
+}
+
+impl HookClient {
+    /// Parse the `--client` flag. Absent flag → Claude (zero breakage for
+    /// existing invocations); a present-but-valueless or unknown value is a
+    /// hard error, mirroring the `require_str` guards.
+    fn from_args(args: &[String]) -> Result<Self> {
+        let Some(pos) = args.iter().position(|a| a == "--client") else {
+            return Ok(Self::Claude);
+        };
+        let value = args
+            .get(pos + 1)
+            .cloned()
+            .context("--client requires a value (claude|gemini)")?;
+        if value.starts_with("--") {
+            anyhow::bail!("--client requires a value, but got flag '{value}'");
+        }
+        match value.as_str() {
+            "claude" => Ok(Self::Claude),
+            "gemini" => Ok(Self::Gemini),
+            other => anyhow::bail!("unknown --client '{other}' (expected claude or gemini)"),
+        }
+    }
+
+    /// The settings file under a base directory: `--global` passes the home
+    /// directory, project-level passes the project directory.
+    fn settings_path(&self, base: &Path) -> PathBuf {
+        match self {
+            Self::Claude => base.join(".claude").join("settings.json"),
+            Self::Gemini => base.join(".gemini").join("settings.json"),
+        }
+    }
+}
+
 /// Install one hook entry (command string) under `event` in a Claude Code
 /// settings file, preserving other entries. Returns "installed", "already",
 /// or "dry-run". Idempotent per event: a second engram command under the
@@ -498,15 +545,18 @@ fn backup_then_write(settings_path: &Path, settings: &serde_json::Value) -> Resu
     Ok(())
 }
 
-/// `engram install-hooks [--global] [--dir <path>] [--project <id>] [--brief]
-/// [--dry-run]` — SessionEnd memory capture; `--brief` additionally wires
-/// SessionStart to `engram brief` (context injection at session start).
+/// `engram install-hooks [--client claude|gemini] [--global] [--dir <path>]
+/// [--project <id>] [--brief] [--dry-run]` — SessionEnd memory capture;
+/// `--brief` additionally wires SessionStart to `engram brief` (context
+/// injection at session start). `--client gemini` targets the Gemini CLI's
+/// `settings.json` (same hook entry shape, same `engram hook` payload).
 pub fn install_hooks(args: &[String]) -> Result<()> {
     let global = args.iter().any(|a| a == "--global");
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let with_brief = args.iter().any(|a| a == "--brief");
+    let client = HookClient::from_args(args)?;
 
-    let (settings_path, project_id) = hooks_target(args, global)?;
+    let (settings_path, project_id) = hooks_target(args, global, client)?;
     let status = install_hooks_impl(&settings_path, &project_id, dry_run)?;
     let brief_status = if with_brief {
         Some(install_brief_hook_impl(
@@ -518,6 +568,7 @@ pub fn install_hooks(args: &[String]) -> Result<()> {
         None
     };
     print_json(&serde_json::json!({
+        "client": client_name(client),
         "settings": settings_path.to_string_lossy(),
         "status": status,
         "command": hook_command(&project_id),
@@ -535,20 +586,32 @@ pub fn install_hooks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `engram uninstall-hooks [--global] [--dir <path>]`
+/// `engram uninstall-hooks [--client claude|gemini] [--global] [--dir <path>]`
 pub fn uninstall_hooks(args: &[String]) -> Result<()> {
     let global = args.iter().any(|a| a == "--global");
-    let (settings_path, _project_id) = hooks_target(args, global)?;
+    let client = HookClient::from_args(args)?;
+    let (settings_path, _project_id) = hooks_target(args, global, client)?;
     let removed = uninstall_hooks_impl(&settings_path)?;
     print_json(&serde_json::json!({
+        "client": client_name(client),
         "settings": settings_path.to_string_lossy(),
         "removed": removed,
     }));
     Ok(())
 }
 
-/// Resolve the settings file path (and the project id for install).
-fn hooks_target(args: &[String], global: bool) -> Result<(PathBuf, String)> {
+/// The client's name as it appears in command output.
+fn client_name(client: HookClient) -> &'static str {
+    match client {
+        HookClient::Claude => "claude",
+        HookClient::Gemini => "gemini",
+    }
+}
+
+/// Resolve the settings file path (and the project id for install) for the
+/// given client: `--global` → the home-level settings, otherwise
+/// `<dir>/.<client>/settings.json`.
+fn hooks_target(args: &[String], global: bool, client: HookClient) -> Result<(PathBuf, String)> {
     let project_id = match optional_str(args, "project") {
         Some(p) => p,
         None => {
@@ -565,15 +628,13 @@ fn hooks_target(args: &[String], global: bool) -> Result<(PathBuf, String)> {
         }
     };
     let settings_path = if global {
-        dirs::home_dir()
-            .context("could not determine home directory for --global")?
-            .join(".claude")
-            .join("settings.json")
+        let home = dirs::home_dir().context("could not determine home directory for --global")?;
+        client.settings_path(&home)
     } else {
         let dir = optional_str(args, "dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        dir.join(".claude").join("settings.json")
+        client.settings_path(&dir)
     };
     Ok((settings_path, project_id))
 }
@@ -921,24 +982,46 @@ pub fn decisions(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `engram distill-backlog`: the same prioritized worklist the MCP
+/// `distill_backlog` tool serves — raw session-import memories awaiting the
+/// `engram.distill` prompt, oldest first, with age/error/file signal per item.
+pub fn distill_backlog(args: &[String]) -> Result<()> {
+    let project_id = require_str(args, "project")?;
+    let limit = optional_num(args, "limit").map(|n| n as usize);
+
+    // Provider path (same renderer as the MCP distill_backlog tool).
+    let config = load_config()?;
+    let repo = open_repo(&config)?;
+    let provider = crate::mcp::server::DefaultMemoryProvider::new(repo, config);
+    use crate::mcp::server::MemoryToolProvider as _;
+    let value = provider.distill_backlog(serde_json::from_value(serde_json::json!({
+        "project_id": project_id,
+        "limit": limit,
+    }))?)?;
+    print_json(&value);
+    Ok(())
+}
+
 pub fn timeline(args: &[String]) -> Result<()> {
     let project_id = require_str(args, "project")?;
     let days = optional_num(args, "days").unwrap_or(7.0) as i64;
+    let memory_type = optional_str(args, "type");
+    let until = optional_num(args, "until").map(|n| n as i64);
 
-    let config = load_config()?;
-    let repo = open_repo(&config)?;
-
-    let since = now_ts() - days.saturating_mul(86400);
-    // Same repository accessor the MCP timeline tool uses — the old inline
-    // SQL here was a second implementation that could drift.
-    let events: Vec<serde_json::Value> = repo
-        .timeline(&project_id, since)?
-        .into_iter()
-        .map(|r| serde_json::json!({"date": r.day, "episodic_count": r.count}))
-        .collect();
-
-    print_json(&serde_json::json!({"events": events}));
-    Ok(())
+    // Provider path (same renderer as the MCP timeline tool): per-UTC-day
+    // counts across all four memory types — one shape for both entry points.
+    // days clamping and memory_type validation live in the provider.
+    cli_create!(
+        args,
+        serde_json::from_value(serde_json::json!({
+            "project_id": project_id,
+            "days": days,
+            "memory_type": memory_type,
+            "until": until,
+        }))?,
+        timeline,
+        crate::mcp::server::TimelineInput
+    )
 }
 
 /// `engram queries` — retrieval feedback: aggregate past search queries by
@@ -1817,7 +1900,7 @@ pub fn maintain(args: &[String]) -> Result<()> {
     // session_brief surfaces on the read side.
     let mut distill_backlog = 0i64;
     for p in &projects {
-        distill_backlog += repo.count_session_imports(p)?;
+        distill_backlog += repo.count_session_imports(p)?.0;
     }
 
     // 4. Staleness report (read-only).
@@ -2477,12 +2560,14 @@ struct SessionDigest {
     errors: Vec<String>,
 }
 
-/// Parse a Claude Code or Codex CLI session transcript (JSONL, one object
-/// per line). Format is sniffed per line: Claude Code lines carry `message`
-/// (role/content), Codex rollout lines carry `payload` (Responses-API items).
-/// Tolerant of schema drift: unknown line shapes are skipped, never fatal.
-/// Tool-result payloads are ignored (noise); only real user prompts, visible
-/// assistant text, and file-edit targets are kept.
+/// Parse a Claude Code, Codex CLI, or Gemini CLI session transcript (JSONL,
+/// one object per line). Format is sniffed per line: Claude Code lines carry
+/// `message` (role/content), Codex rollout lines carry `payload`
+/// (Responses-API items), Gemini chat-recording lines carry a top-level
+/// `type` of `user`/`gemini`/`info` with `content`. Tolerant of schema drift:
+/// unknown line shapes are skipped, never fatal. Tool-result payloads are
+/// ignored (noise); only real user prompts, visible assistant text, and
+/// file-edit targets are kept.
 fn parse_transcript(text: &str) -> SessionDigest {
     let mut digest = SessionDigest::default();
 
@@ -2511,6 +2596,14 @@ fn parse_transcript(text: &str) -> SessionDigest {
             // Codex CLI rollout shape: {"type": "...", "payload": {...}}.
             if v.get("payload").is_some() {
                 parse_codex_line(&v, &mut digest);
+            }
+            // Gemini CLI chat-recording shape: {"id","timestamp",
+            // "type":"user"|"gemini"|"info","content": …} (no message/payload
+            // key). The first metadata line ({sessionId,…,"kind"}) and the
+            // bookkeeping lines ({"$set":…}, {"$patch":…}, {"$rewindTo":…})
+            // carry none of these types and fall through untouched.
+            if matches!(ty, "user" | "gemini" | "info") {
+                parse_gemini_line(&v, &mut digest);
             }
             continue;
         };
@@ -2605,7 +2698,7 @@ fn parse_codex_line(v: &serde_json::Value, digest: &mut SessionDigest) {
     match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "message" => {
             let role = payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            let text = codex_content_text(payload.get("content"));
+            let text = content_text(payload.get("content"));
             let t = text.trim();
             if t.is_empty() || t.starts_with('<') {
                 // Codex injects <user_instructions>/<environment_context>
@@ -2625,27 +2718,7 @@ fn parse_codex_line(v: &serde_json::Value, digest: &mut SessionDigest) {
                 .get("arguments")
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
-            for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-                let mut rest = args;
-                while let Some(pos) = rest.find(marker) {
-                    let after = &rest[pos + marker.len()..];
-                    // Path runs to end of line. Also cut at a literal "\n"
-                    // two-char sequence — arguments are a JSON string, and
-                    // some emitters leave the newline escaped.
-                    let line_end = after
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .split("\\n")
-                        .next()
-                        .unwrap_or("");
-                    let path: String = line_end.trim().chars().take(400).collect();
-                    if !path.is_empty() {
-                        push_unique(&mut digest.files, &path);
-                    }
-                    rest = after;
-                }
-            }
+            extract_patch_file_markers(args, &mut digest.files);
         }
         "function_call_output" => {
             if digest.errors.len() >= 20 {
@@ -2672,9 +2745,126 @@ fn parse_codex_line(v: &serde_json::Value, digest: &mut SessionDigest) {
     }
 }
 
-/// Flatten a Responses-API `content` value (string, or array of
-/// `{type: input_text|output_text, text}` items) into one text blob.
-fn codex_content_text(content: Option<&serde_json::Value>) -> String {
+/// Extract `*** (Update|Add|Delete) File: <path>` markers from a tool-call
+/// argument or result string — Codex `apply_patch` and Gemini file-edit tool
+/// results share the convention. The path runs to end of line, also cut at a
+/// literal "\n" two-char sequence (the host string is a JSON string value,
+/// and some emitters leave the newline escaped).
+fn extract_patch_file_markers(text: &str, files: &mut Vec<String>) {
+    for marker in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+        let mut rest = text;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let line_end = after
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split("\\n")
+                .next()
+                .unwrap_or("");
+            let path: String = line_end.trim().chars().take(400).collect();
+            if !path.is_empty() {
+                push_unique(files, &path);
+            }
+            rest = after;
+        }
+    }
+}
+
+/// A token that looks like a filesystem path: contains a `/`, is not a URL,
+/// and ends in a short file extension (`.rs`, `.md`, …). Used on Gemini
+/// tool-call `displayName`/`description` text, which mentions paths in prose
+/// ("Writes /src/auth.rs") without any structured field.
+fn looks_like_file_path(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
+    });
+    if !token.contains('/')
+        || token.starts_with("http")
+        || token.contains(':')
+        || token.ends_with('/')
+    {
+        return false;
+    }
+    let name = token.rsplit('/').next().unwrap_or("");
+    match name.split_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty() && ext.len() <= 12 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Gemini CLI chat-recording line (`chatRecordingService.ts` shape):
+/// `{"id","timestamp","type":"user"|"gemini"|"info","content":
+/// <PartListUnion>}` where content is a string or an array of parts
+/// (`{"text": …}`; non-text parts carry no `text` key and are dropped).
+/// `gemini` lines may additionally carry `thoughts`, `tokens`, `model`, and
+/// `toolCalls[]` (`{id, result, displayName, description,
+/// renderOutputAsMarkdown}`). Files come from file-edit tool calls — either
+/// apply_patch-style markers in the result text or a path-looking token in
+/// `displayName`/`description` — heuristic and bounded, like the Codex path
+/// (宁缺毋滥: an ambiguous mention beats a wrong file attribution).
+/// Assistant text that starts with an error-marker phrase doubles as failure
+/// evidence, reusing the same marker table as the Codex tool-output scan.
+fn parse_gemini_line(v: &serde_json::Value, digest: &mut SessionDigest) {
+    match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "info" => {} // service notices (auth prompts, model switches) — no digest signal
+        "user" => {
+            let text = content_text(v.get("content"));
+            let t = text.trim();
+            // Same wrapper filter as Claude/Codex: injected <…> blocks are
+            // not user intent.
+            if !t.is_empty() && !t.starts_with('<') {
+                push_unique(&mut digest.user_prompts, t);
+            }
+        }
+        "gemini" => {
+            let text = content_text(v.get("content"));
+            let t = text.trim();
+            if !t.is_empty() {
+                push_unique(&mut digest.assistant_texts, t);
+            }
+            // Error-marker scan over the assistant text (same table and
+            // starts-with semantics as the Codex tool-output scan).
+            let error_marked = ["error:", "Error:", "ERROR:", "panic:", "failed:"]
+                .iter()
+                .any(|m| t.starts_with(m));
+            if error_marked && digest.errors.len() < 20 {
+                let bounded: String = t.chars().take(300).collect();
+                push_unique(&mut digest.errors, &bounded);
+            }
+            // File-touch evidence from tool calls.
+            if let Some(calls) = v.get("toolCalls").and_then(|c| c.as_array()) {
+                for call in calls {
+                    if let Some(result) = call.get("result").and_then(|r| r.as_str()) {
+                        extract_patch_file_markers(result, &mut digest.files);
+                    }
+                    for key in ["displayName", "description"] {
+                        if let Some(s) = call.get(key).and_then(|s| s.as_str()) {
+                            for token in s.split_whitespace() {
+                                if looks_like_file_path(token) {
+                                    push_unique(&mut digest.files, token);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Flatten a content value that is either a plain string or an array of
+/// `{text}` parts into one text blob. Covers both the Responses-API content
+/// items Codex emits (`{type: input_text|output_text, text}`) and Gemini's
+/// PartListUnion (`string | [{text}]`) — non-text parts carry no `text` key
+/// and contribute nothing.
+fn content_text(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(items)) => items
@@ -2888,6 +3078,161 @@ mod tests {
 
         // Uninstalling again is a clean no-op.
         assert_eq!(uninstall_hooks_impl(&settings).unwrap(), 0);
+    }
+
+    #[test]
+    fn hooks_target_resolves_client_settings_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let base = vec![
+            "--dir".to_string(),
+            d,
+            "--project".to_string(),
+            "p".to_string(),
+        ];
+
+        // Project level: each client targets its own settings file.
+        let (path, project) = hooks_target(&base, false, HookClient::Claude).unwrap();
+        assert_eq!(project, "p");
+        assert_eq!(path, dir.path().join(".claude").join("settings.json"));
+        let (path, _) = hooks_target(&base, false, HookClient::Gemini).unwrap();
+        assert_eq!(path, dir.path().join(".gemini").join("settings.json"));
+    }
+
+    #[test]
+    fn hook_client_from_args_defaults_to_claude_and_validates() {
+        // Absent --client stays Claude — zero breakage for existing callers.
+        assert_eq!(HookClient::from_args(&[]).unwrap(), HookClient::Claude);
+        assert_eq!(
+            HookClient::from_args(&["--client".to_string(), "gemini".to_string()]).unwrap(),
+            HookClient::Gemini
+        );
+        assert_eq!(
+            HookClient::from_args(&["--client".to_string(), "claude".to_string()]).unwrap(),
+            HookClient::Claude
+        );
+        // Unknown value, missing value, and flag-as-value are hard errors.
+        assert!(HookClient::from_args(&["--client".to_string(), "cursor".to_string()]).is_err());
+        assert!(HookClient::from_args(&["--client".to_string()]).is_err());
+        assert!(HookClient::from_args(&["--client".to_string(), "--dry-run".to_string()]).is_err());
+    }
+
+    #[test]
+    fn gemini_hooks_install_merge_and_uninstall_spare_other_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".gemini/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        // Gemini keeps EVERYTHING in one settings.json — an orca-style hook
+        // from another tool plus non-hook keys (theme, mcpServers) must all
+        // survive install and uninstall.
+        std::fs::write(
+            &settings,
+            r#"{"theme":"dark","mcpServers":{"context7":{"command":"npx","args":[]}},"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"orca session-end","timeout":10000}]}]}}"#,
+        )
+        .unwrap();
+
+        // SessionEnd + SessionStart merge in alongside the other tool's entry.
+        assert_eq!(
+            install_hooks_impl(&settings, "demo", false).unwrap(),
+            "installed"
+        );
+        assert_eq!(
+            install_brief_hook_impl(&settings, "demo", false).unwrap(),
+            "installed"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark", "non-hook keys must survive the merge");
+        assert_eq!(v["mcpServers"]["context7"]["command"], "npx");
+        let cmds: Vec<_> = v["hooks"]["SessionEnd"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(cmds, vec!["orca session-end", "engram hook --project demo"]);
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "engram brief --project demo"
+        );
+
+        // Re-install is a no-op (idempotent per event).
+        assert_eq!(
+            install_hooks_impl(&settings, "demo", false).unwrap(),
+            "already"
+        );
+
+        // Uninstall removes ONLY engram's entries; orca's stays.
+        assert_eq!(uninstall_hooks_impl(&settings).unwrap(), 2);
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v2["theme"], "dark");
+        assert_eq!(v2["mcpServers"]["context7"]["command"], "npx");
+        assert_eq!(
+            v2["hooks"]["SessionEnd"][0]["hooks"][0]["command"], "orca session-end",
+            "another tool's hook must survive the uninstall"
+        );
+        assert!(
+            v2["hooks"].get("SessionStart").is_none(),
+            "an engram-only event is removed entirely"
+        );
+        // Uninstalling again is a clean no-op.
+        assert_eq!(uninstall_hooks_impl(&settings).unwrap(), 0);
+    }
+
+    #[test]
+    fn install_hooks_cli_gemini_writes_settings_and_uninstall_spares_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".gemini/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"selected":{"auth":{"type":"oauth-personal"}},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"orca session-start"}]}]}}"#,
+        )
+        .unwrap();
+
+        let args = vec![
+            "install-hooks".to_string(),
+            "--client".to_string(),
+            "gemini".to_string(),
+            "--dir".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+            "--project".to_string(),
+            "demo".to_string(),
+        ];
+        crate::cli::run(&args).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["selected"]["auth"]["type"], "oauth-personal",
+            "pre-existing keys must survive the merge"
+        );
+        assert_eq!(
+            v["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "engram hook --project demo"
+        );
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "orca session-start"
+        );
+
+        let args = vec![
+            "uninstall-hooks".to_string(),
+            "--client".to_string(),
+            "gemini".to_string(),
+            "--dir".to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        ];
+        crate::cli::run(&args).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v2["selected"]["auth"]["type"], "oauth-personal");
+        assert_eq!(
+            v2["hooks"]["SessionStart"][0]["hooks"][0]["command"], "orca session-start",
+            "another tool's SessionStart hook must survive"
+        );
+        assert!(v2["hooks"].get("SessionEnd").is_none());
     }
 
     #[test]
@@ -3262,17 +3607,97 @@ fn parse_transcript_handles_codex_rollout_lines() {
 }
 
 #[test]
+fn parse_transcript_handles_gemini_chat_lines() {
+    // Gemini CLI chat-recording shape (chatRecordingService.ts): a first
+    // metadata line, then {id, timestamp, type:"user"|"gemini"|"info",
+    // content} with string-or-parts content; gemini lines may carry
+    // toolCalls; $set/$patch/$rewindTo bookkeeping lines interleave. Fixture
+    // built from the official field table, not a local sample.
+    let jsonl = concat!(
+        // Session metadata line: no message type — skipped.
+        r#"{"sessionId":"s-1","projectHash":"h","startTime":"2026-11-01T00:00:00Z","lastUpdated":"2026-11-01T01:00:00Z","kind":"main"}"#,
+        "\n",
+        // User prompt as a plain string.
+        r#"{"id":"m1","timestamp":"2026-11-01T00:01:00Z","type":"user","content":"migrate the config loader to serde"}"#,
+        "\n",
+        // User prompt as a parts array (non-text parts contribute nothing).
+        r#"{"id":"m2","timestamp":"2026-11-01T00:02:00Z","type":"user","content":[{"text":"then update the "},{"text":"docs"},{"inlineData":{"mimeType":"image/png"}}]}"#,
+        "\n",
+        // Assistant conclusion + file-edit tool call (marker in result text).
+        r#"{"id":"m3","timestamp":"2026-11-01T00:03:00Z","type":"gemini","content":[{"text":"Refactored the loader."}],"model":"gemini-2.5-pro","tokens":{"input":10,"output":20},"toolCalls":[{"id":"t1","displayName":"replace","description":"Replaces text in a file","result":"*** Update File: src/config/loader.rs\n@@ -1 +1 @@\n","renderOutputAsMarkdown":true}]}"#,
+        "\n",
+        // Path-looking token in the tool description (no marker in result).
+        r#"{"id":"m4","timestamp":"2026-11-01T00:04:00Z","type":"gemini","content":[{"text":"Wrote the schema."}],"toolCalls":[{"id":"t2","displayName":"write_file","description":"Successfully wrote /src/config/schema.rs","result":"OK"}]}"#,
+        "\n",
+        // Service info notice: no digest signal.
+        r#"{"id":"m5","timestamp":"2026-11-01T00:05:00Z","type":"info","content":"Model switched to gemini-2.5-flash"}"#,
+        "\n",
+        // Assistant text starting with an error marker → failure evidence.
+        r#"{"id":"m6","timestamp":"2026-11-01T00:06:00Z","type":"gemini","content":"error: missing field `name` at src/config/mod.rs:12"}"#,
+        "\n",
+        // Bookkeeping lines: must not pollute the digest.
+        r#"{"$set":{"lastUpdated":"2026-11-01T00:07:00Z"}}"#,
+        "\n",
+        r#"{"$patch":{"updates":[{"id":"m3","content":[{"text":"Refactored the loader."}]}]}}"#,
+        "\n",
+        r#"{"$rewindTo":"m1"}"#,
+        "\n",
+    );
+    let d = parse_transcript(jsonl);
+    assert_eq!(
+        d.user_prompts,
+        vec![
+            "migrate the config loader to serde".to_string(),
+            "then update the \ndocs".to_string(),
+        ],
+        "{:?}",
+        d.user_prompts
+    );
+    assert_eq!(d.assistant_texts.len(), 3, "{:?}", d.assistant_texts);
+    assert!(d
+        .assistant_texts
+        .contains(&"Refactored the loader.".to_string()));
+    assert!(d.assistant_texts.contains(&"Wrote the schema.".to_string()));
+    assert!(d
+        .assistant_texts
+        .contains(&"error: missing field `name` at src/config/mod.rs:12".to_string()));
+    // Marker extraction from the tool result + path token from description.
+    assert_eq!(
+        d.files,
+        vec![
+            "src/config/loader.rs".to_string(),
+            "/src/config/schema.rs".to_string(),
+        ],
+        "{:?}",
+        d.files
+    );
+    assert_eq!(
+        d.errors,
+        vec!["error: missing field `name` at src/config/mod.rs:12".to_string()],
+        "{:?}",
+        d.errors
+    );
+    // Info/bookkeeping text must not leak into any digest field.
+    let dump = format!("{d:?}");
+    assert!(!dump.contains("Model switched"), "{dump}");
+    assert!(!dump.contains("lastUpdated"), "{dump}");
+}
+
+#[test]
 fn parse_transcript_mixed_format_lines_do_not_interfere() {
-    // A single file should never contain both, but per-line sniffing must
-    // still leave unknown shapes alone.
+    // A single file should never contain all three, but per-line sniffing
+    // must still leave unknown shapes alone.
     let jsonl = concat!(
         r#"{"type":"user","message":{"role":"user","content":"claude prompt"}}"#,
         "\n",
         r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex prompt"}]}}"#,
         "\n",
+        // Gemini chat line: type + top-level content, no message/payload.
+        r#"{"id":"m1","timestamp":"2026-11-01T00:00:00Z","type":"user","content":"gemini prompt"}"#,
+        "\n",
         r#"{"type":"mystery","shape":{"no":"payload"}}"#,
         "\n",
     );
     let d = parse_transcript(jsonl);
-    assert_eq!(d.user_prompts.len(), 2);
+    assert_eq!(d.user_prompts.len(), 3);
 }

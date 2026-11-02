@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-03
+
+Iteration round 6 — "memory from auto-capture to auto-formation": the
+distillation loop's signal repaired and given a prioritized worklist (batch A),
+capture extended to Gemini CLI (batch B), and the timeline query face made
+cross-type (batch C).
+
+### Added - broader capture: Gemini CLI transcripts + hook/MCP presets (v0.8-B)
+- **Gemini CLI session transcripts are now parsed** by `session-import`/`engram hook` (`~/.gemini/tmp/<project>/chats/session-*.jsonl`, sniffed per line like Claude/Codex): `user`/`gemini` message lines with string-or-parts content are flattened into prompts/conclusions, file-edit evidence comes from `toolCalls[]` (apply_patch-style `*** Update File:` markers in tool results plus path-like tokens in `displayName`/`description` — heuristic and bounded), assistant text starting with the existing error-marker phrases doubles as failure evidence, and `type:"info"` notices plus the `$set`/`$patch`/`$rewindTo` bookkeeping lines are skipped without polluting the digest.
+- **`engram install-hooks`/`uninstall-hooks` gain `--client claude|gemini`** (default `claude`, zero breakage): Gemini's native hooks use the same `{hooks: {"<Event>": …}}` shape and the same `engram hook` stdin payload, so only the target differs — `~/.gemini/settings.json` for `--global`, `<dir>/.gemini/settings.json` for project-level. The merge/backup/idempotent/uninstall machinery is reused as-is, which matters extra on Gemini because that one file also holds theme, auth, `mcpServers`, and other tools' hooks — uninstalls remove only entries carrying the `engram hook`/`engram brief` markers.
+- **The install script (`scripts/engram-common.sh`) registers the engram MCP server into `~/.gemini/settings.json`** when `~/.gemini` exists (or via `ENGRAM_CLIENTS=gemini`): same `mcpServers` shape, merged into the file without touching its other keys, still refusing to rewrite an unparseable config. `engram session-import --transcript <gemini jsonl> --dry-run` distills a Gemini transcript without writing.
+
+### Changed - timeline is cross-type with filtering (v0.8-C)
+- **The `timeline` MCP tool now counts all four memory types per day, not just episodic** — its description claimed "memory events" while the query silently counted `episodic_memories` only, so decisions/failures/procedures were invisible to "what changed in this project since last week". Each event row is now `{day, counts:{episodic, decision, failure, procedural, total}}` (the old `date`/`episodic_count` keys are gone), the response top level carries `{project_id, days, events}` plus `memory_type`/`until` when supplied, and two filters join the input schema (declared explicitly with `additionalProperties: false`): `memory_type` (validated like the other tools — an unknown value is a clear error; the non-matching columns stay 0 so the shape never changes) and `until` (window end as an absolute unix timestamp, exclusive; omitted means now). Archived memories remain excluded. `engram timeline` shares the exact MCP renderer via the provider (`--type`/`--until` flags added; its old `date`/`episodic_count` JSON keys are gone too) and `engram help` describes the new flags.
+
+### Added - distill quality loop (v0.8-A)
+- **`distill_backlog` MCP tool + `engram distill-backlog` CLI** — the prioritized worklist for the `engram.distill` prompt: raw session-import memories awaiting distillation, ordered oldest first (longest-rotting dumps at the top), each item carrying `age_days`, `error_count`/`file_count` (parsed from the session-import content template headers; `null` when the section is absent) and a one-line content `preview`, with the total backlog count at the top level. The prompt's step 1 now pulls its materials from this list (oldest-first + signal overview) instead of a blind `search_memory` tag scan, then fetches full text per item via `get_memory`. The agent guide's "When to READ" section gained the matching entry point.
+
+### Fixed - distill-loop backlog counting
+- **Distilling used to GROW the distillation backlog instead of draining it.** The backlog counters (`count_session_imports`, consumed by session_brief and `engram maintain`) and the stale-aging pass (`downgrade_stale_session_imports`) matched the `session-import` tag alone — but the distill prompt's step 3 tells the agent to KEEP that source tag on the typed memory it produces (plus `distilled`), so every distillation added a row that re-matched the same filter. User-visible effect: the "N raw session-import memories awaiting distillation" hint in every session brief could never reach zero, and the aging pass demoted distilled typed memories along with raw dumps. All three consumers now share one WHERE fragment that additionally excludes rows tagged `distilled`, so the backlog only clears through real distillation. `count_session_imports` returns `(count, oldest_created_at)` and session_brief's backlog line now shows "oldest N days ago"; the shared predicate is pinned by regression tests on the counting, aging, and worklist paths.
+
 ## [0.7.0] - 2026-11-02
 
 Iteration rounds 4+5 (two deep reviews): the feedback loop's causal chain

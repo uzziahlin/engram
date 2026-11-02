@@ -25,12 +25,17 @@ call `mark_relevance` on it — that is the signal future rankings learn from.
   type + summary — fetch more via get_memory)
 - Need design background → architectural_decisions
 - Avoid repeating past bugs → recent_failures
+- Distill raw sessions → distill_backlog (raw session-import memories oldest
+  first, with age/error/file signal per item — the material list that the
+  `engram.distill` prompt consumes)
 
 ## When to REFINE (turn raw into knowledge)
 - session_brief reports "N raw session-import memories awaiting distillation"
-  → fetch the `engram.distill` prompt and follow it: convert raw session dumps
+  (or `distill_backlog` reports total > 0) → run the `engram.distill` prompt:
+  it picks the oldest items via distill_backlog, converts raw session dumps
   into typed memories (decisions, failures with root cause, procedures), then
-  forget/merge the raw ones.
+  forgets/merges the raw ones. The backlog only reaches 0 after real
+  distillation — leaving the `distilled` tag off keeps raw dumps counted.
 - session_brief lists pending reflection suggestions → review via
   `list_suggestions`, then `confirm_suggestion` / `reject_suggestion`
   (quality bar: only confirm rules you would actually follow).

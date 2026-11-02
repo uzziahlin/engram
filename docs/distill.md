@@ -5,8 +5,11 @@
 
 你在为项目 {{PROJECT_ID}} 精馏记忆库。步骤：
 
-1. **取材**：`search_memory` 查询 tag `session-import`（可加 `before` 限定时间窗），
-   拿到 hook 自动落库的原始会话记忆。它们的特征是：content 含
+1. **取材**：先调用 `distill_backlog` 工具（参数 `{ "project_id": "{{PROJECT_ID}}" }`）
+   拿到待精馏清单——hook 自动落库的原始会话记忆，按 created_at 最老优先排序（放最久
+   的最先精馏），每条带 `age_days` / `error_count` / `file_count` / `preview` 信号概览，
+   顶层 `total` 是积压总数（0 即闭环完成）。对选中的条目再用 `get_memory`
+   （memory_type="episodic"）取全文。它们的特征是：content 含
    "User prompts / Assistant conclusions / Files touched / Errors encountered" 段落。
 
 2. **逐条判断**，按下面的质量门槛提炼成恰当时型的记忆（宁缺毋滥）：

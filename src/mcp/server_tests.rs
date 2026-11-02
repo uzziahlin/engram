@@ -185,7 +185,7 @@ fn reindex_backfills_then_recalls() {
 #[test]
 fn test_list_tools() {
     let tools = McpServer::list_tools();
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 26);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"search_memory"));
@@ -194,6 +194,7 @@ fn test_list_tools() {
     assert!(names.contains(&"timeline"));
     assert!(names.contains(&"recent_failures"));
     assert!(names.contains(&"architectural_decisions"));
+    assert!(names.contains(&"distill_backlog"));
     assert!(names.contains(&"query_stats"));
     assert!(names.contains(&"create_episodic"));
     assert!(names.contains(&"create_decision"));
@@ -282,6 +283,7 @@ fn test_handle_tools_list() {
         "query_stats",
         "session_brief",
         "architectural_decisions",
+        "distill_backlog",
         "create_episodic",
         "create_decision",
         "create_failure",
@@ -1439,7 +1441,7 @@ fn test_jsonrpc_recent_failures_list_without_query() {
 fn test_jsonrpc_timeline() {
     let server = setup_server();
 
-    // Create an episodic memory
+    // Create an episodic memory and a decision on the same day.
     server.handle_request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(1)),
@@ -1454,10 +1456,25 @@ fn test_jsonrpc_timeline() {
             }
         })),
     });
+    server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(2)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "create_decision",
+            "arguments": {
+                "project_id": "timeline-test",
+                "title": "Use SQLite",
+                "context": "single-file storage",
+                "rationale": "zero ops",
+                "tradeoffs": "no concurrent writers"
+            }
+        })),
+    });
 
     let timeline_resp = server.handle_request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
-        id: Some(serde_json::json!(2)),
+        id: Some(serde_json::json!(3)),
         method: "tools/call".into(),
         params: Some(serde_json::json!({
             "name": "timeline",
@@ -1471,8 +1488,274 @@ fn test_jsonrpc_timeline() {
     let timeline_result = timeline_resp.result.unwrap();
     let timeline_text: &str = timeline_result["content"][0]["text"].as_str().unwrap();
     let timeline_parsed: serde_json::Value = serde_json::from_str(timeline_text).unwrap();
+    assert_eq!(timeline_parsed["project_id"], "timeline-test");
     let events = timeline_parsed["events"].as_array().unwrap();
     assert!(!events.is_empty());
+    // Cross-type counts: every row carries the full four-type shape.
+    let counts = &events[0]["counts"];
+    assert!(counts["episodic"].as_i64().unwrap() >= 1);
+    assert!(counts["decision"].as_i64().unwrap() >= 1);
+    assert_eq!(
+        counts["total"].as_i64().unwrap(),
+        counts["episodic"].as_i64().unwrap()
+            + counts["decision"].as_i64().unwrap()
+            + counts["failure"].as_i64().unwrap()
+            + counts["procedural"].as_i64().unwrap()
+    );
+}
+
+// ─── timeline: cross-type grouping, filters, until ─────────────────
+
+/// Seed one memory of the given kind at an exact timestamp (direct storage
+/// writes so the tests control the day bucketing precisely).
+fn seed_timeline_memory(
+    repo: &MemoryRepository,
+    kind: MemoryKind,
+    id: &str,
+    project: &str,
+    created_at: i64,
+) {
+    match kind {
+        MemoryKind::Episodic => repo
+            .create_episodic(&EpisodicMemory {
+                id: id.into(),
+                project_id: project.into(),
+                session_id: "s".into(),
+                summary: format!("episodic {id}"),
+                content: format!("content {id}"),
+                files_touched: vec![],
+                related_commits: vec![],
+                importance: 0.5,
+                tags: vec![],
+                created_at,
+                updated_at: created_at,
+            })
+            .unwrap(),
+        MemoryKind::Decision => repo
+            .create_decision(&DecisionMemory {
+                id: id.into(),
+                project_id: project.into(),
+                title: format!("decision {id}"),
+                context: "ctx".into(),
+                rationale: "rationale".into(),
+                tradeoffs: "tradeoffs".into(),
+                related_files: vec![],
+                tags: vec![],
+                importance: 0.5,
+                superseded_by: None,
+                created_at,
+                updated_at: created_at,
+            })
+            .unwrap(),
+        MemoryKind::Failure => repo
+            .create_failure(&FailureMemory {
+                id: id.into(),
+                project_id: project.into(),
+                incident: format!("incident {id}"),
+                root_cause: "root cause".into(),
+                fix: "fix".into(),
+                prevention: "prevention".into(),
+                severity: 3,
+                tags: vec![],
+                created_at,
+                updated_at: created_at,
+            })
+            .unwrap(),
+        MemoryKind::Procedural => repo
+            .create_procedural(&ProceduralMemory {
+                id: id.into(),
+                project_id: project.into(),
+                workflow_name: format!("workflow {id}"),
+                steps: vec!["step".into()],
+                related_tools: vec![],
+                tags: vec![],
+                importance: 0.5,
+                created_at,
+                updated_at: created_at,
+            })
+            .unwrap(),
+    }
+}
+
+fn timeline_output(
+    provider: &DefaultMemoryProvider,
+    project: &str,
+    days: i64,
+    memory_type: Option<&str>,
+    until: Option<i64>,
+) -> serde_json::Value {
+    provider
+        .timeline(TimelineInput {
+            project_id: project.into(),
+            days,
+            memory_type: memory_type.map(|s| s.into()),
+            until,
+        })
+        .unwrap()
+}
+
+#[test]
+fn timeline_groups_all_types_per_day_most_recent_first() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    let today = now - 60;
+    let yesterday = now - 86_400 - 60;
+
+    // Today: 2 episodic, 1 decision, 1 failure, 1 procedural.
+    for (kind, id) in [
+        (MemoryKind::Episodic, "e1"),
+        (MemoryKind::Episodic, "e2"),
+        (MemoryKind::Decision, "d1"),
+        (MemoryKind::Failure, "f1"),
+        (MemoryKind::Procedural, "p1"),
+    ] {
+        seed_timeline_memory(provider.repo_for_test(), kind, id, "tl", today);
+    }
+    // Yesterday: 1 episodic only.
+    seed_timeline_memory(
+        provider.repo_for_test(),
+        MemoryKind::Episodic,
+        "e0",
+        "tl",
+        yesterday,
+    );
+
+    let out = timeline_output(&provider, "tl", 7, None, None);
+    assert_eq!(out["project_id"], "tl");
+    assert_eq!(out["days"], 7);
+    assert!(out.get("memory_type").is_none());
+
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "one row per active day");
+    // Most recent day first.
+    let today_str = chrono::DateTime::from_timestamp(today, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    let yesterday_str = chrono::DateTime::from_timestamp(yesterday, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(events[0]["day"], today_str.as_str());
+    assert_eq!(events[1]["day"], yesterday_str.as_str());
+
+    let counts = &events[0]["counts"];
+    assert_eq!(counts["episodic"], 2);
+    assert_eq!(counts["decision"], 1);
+    assert_eq!(counts["failure"], 1);
+    assert_eq!(counts["procedural"], 1);
+    assert_eq!(counts["total"], 5);
+
+    let counts = &events[1]["counts"];
+    assert_eq!(counts["episodic"], 1);
+    assert_eq!(counts["decision"], 0);
+    assert_eq!(counts["failure"], 0);
+    assert_eq!(counts["procedural"], 0);
+    assert_eq!(counts["total"], 1);
+}
+
+#[test]
+fn timeline_memory_type_filter_keeps_shape_zeroes_others() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    let today = now - 60;
+    for (kind, id) in [
+        (MemoryKind::Episodic, "e1"),
+        (MemoryKind::Decision, "d1"),
+        (MemoryKind::Failure, "f1"),
+    ] {
+        seed_timeline_memory(provider.repo_for_test(), kind, id, "tl", today);
+    }
+
+    let out = timeline_output(&provider, "tl", 7, Some("decision"), None);
+    assert_eq!(out["memory_type"], "decision");
+    let events = out["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "days without a decision disappear");
+    let counts = &events[0]["counts"];
+    assert_eq!(counts["decision"], 1);
+    assert_eq!(counts["episodic"], 0);
+    assert_eq!(counts["failure"], 0);
+    assert_eq!(counts["procedural"], 0);
+    assert_eq!(counts["total"], 1);
+}
+
+#[test]
+fn timeline_until_bounds_the_window_end() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    let inside = now - 3_600;
+    let far = now + 5 * 86_400; // 5 days out — always a different UTC day.
+    seed_timeline_memory(
+        provider.repo_for_test(),
+        MemoryKind::Episodic,
+        "in",
+        "tl",
+        inside,
+    );
+    seed_timeline_memory(
+        provider.repo_for_test(),
+        MemoryKind::Episodic,
+        "out",
+        "tl",
+        far,
+    );
+
+    // No until: unbounded window also surfaces the future-dated day.
+    let events = timeline_output(&provider, "tl", 7, None, None)["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 2);
+
+    // until = far (exclusive): the far event sits exactly on the boundary —
+    // excluded.
+    let events = timeline_output(&provider, "tl", 7, None, Some(far))["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["counts"]["episodic"], 1);
+
+    // One second past the boundary lets it back in.
+    let events = timeline_output(&provider, "tl", 7, None, Some(far + 1))["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 2);
+}
+
+#[test]
+fn timeline_excludes_archived_memories() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    seed_timeline_memory(
+        provider.repo_for_test(),
+        MemoryKind::Episodic,
+        "gone",
+        "tl",
+        now - 60,
+    );
+    provider
+        .repo_for_test()
+        .archive(MemoryKind::Episodic, "gone", "tl", now)
+        .unwrap();
+
+    let out = timeline_output(&provider, "tl", 7, None, None);
+    assert_eq!(out["events"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn timeline_invalid_memory_type_is_a_clear_error() {
+    let provider = make_provider();
+    let err = provider
+        .timeline(TimelineInput {
+            project_id: "tl".into(),
+            days: 7,
+            memory_type: Some("bogus".into()),
+            until: None,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid memory_type"));
 }
 
 // ─── collect_sources + prompts Integration Tests ────────────────
@@ -2110,6 +2393,202 @@ fn session_brief_empty_project_returns_frame_only() {
     assert!(brief.ends_with("=== End Brief ==="));
     assert_eq!(out["decisions"].as_array().unwrap().len(), 0);
     assert!(out["focused"].is_null());
+}
+
+// ─── distill_backlog ─────────────────────────────────────────────────
+
+/// Build session-import shaped content the same way
+/// `cli::commands::session_import_content` stitches it: fixed template
+/// headers, and the Files/Errors sections only when something was recorded.
+fn session_import_content_for(id: &str, files: Option<usize>, errors: Option<usize>) -> String {
+    let mut content = format!(
+        "User prompts:\n- prompt {id}\n\n\
+         Assistant conclusions (latest last):\n- conclusion {id}.\n"
+    );
+    if let Some(n) = files {
+        content.push_str(&format!("\nFiles touched ({n}):\nsrc/{id}.rs\n"));
+    }
+    if let Some(n) = errors {
+        content.push_str(&format!(
+            "\nErrors encountered ({n} — failure-memory candidates):\n- error {id}\n"
+        ));
+    }
+    content
+}
+
+fn seed_session_import(
+    repo: &MemoryRepository,
+    id: &str,
+    tags: &[&str],
+    created_at: i64,
+    files: Option<usize>,
+    errors: Option<usize>,
+) {
+    repo.create_episodic(&EpisodicMemory {
+        id: id.into(),
+        project_id: "p".into(),
+        session_id: "s".into(),
+        summary: format!("session {id}"),
+        content: session_import_content_for(id, files, errors),
+        files_touched: vec![],
+        related_commits: vec![],
+        importance: 0.5,
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        created_at,
+        updated_at: created_at,
+    })
+    .unwrap();
+}
+
+#[test]
+fn distill_backlog_lists_raw_oldest_first_and_excludes_distilled() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    seed_session_import(
+        provider.repo_for_test(),
+        "raw-old",
+        &["session-import"],
+        now - 3 * 86_400,
+        Some(2),
+        Some(1),
+    );
+    seed_session_import(
+        provider.repo_for_test(),
+        "raw-new",
+        &["session-import"],
+        now,
+        None,
+        None,
+    );
+    // The typed memory a distillation leaves behind: source tag kept +
+    // distilled marker — must NOT appear in the backlog.
+    seed_session_import(
+        provider.repo_for_test(),
+        "typed",
+        &["session-import", "distilled"],
+        now,
+        Some(9),
+        Some(9),
+    );
+    seed_session_import(
+        provider.repo_for_test(),
+        "plain",
+        &[],
+        now,
+        Some(9),
+        Some(9),
+    );
+
+    let out = provider
+        .distill_backlog(DistillBacklogInput {
+            project_id: "p".into(),
+            limit: None,
+        })
+        .unwrap();
+    assert_eq!(out["total"], 2, "only raw un-distilled imports count");
+    let items = out["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "raw-old", "oldest first");
+    assert_eq!(items[1]["id"], "raw-new");
+    assert_eq!(items[0]["memory_type"], "episodic");
+    assert_eq!(items[0]["age_days"], 3);
+    assert_eq!(items[0]["file_count"], 2, "parsed from the template header");
+    assert_eq!(
+        items[0]["error_count"], 1,
+        "parsed from the template header"
+    );
+    // Sections absent (nothing recorded) → null, not 0.
+    assert!(items[1]["file_count"].is_null());
+    assert!(items[1]["error_count"].is_null());
+    assert!(
+        items[0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("prompt raw-old"),
+        "preview must quote the raw content: {items:?}"
+    );
+}
+
+#[test]
+fn distill_backlog_respects_limit() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        seed_session_import(
+            provider.repo_for_test(),
+            id,
+            &["session-import"],
+            now - 86_400 * (3 - i as i64),
+            None,
+            None,
+        );
+    }
+
+    let out = provider
+        .distill_backlog(DistillBacklogInput {
+            project_id: "p".into(),
+            limit: Some(2),
+        })
+        .unwrap();
+    assert_eq!(out["total"], 3, "total counts the backlog beyond the page");
+    let items = out["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "a", "oldest first");
+    assert_eq!(items[1]["id"], "b");
+}
+
+#[test]
+fn distill_backlog_empty_returns_zero_total() {
+    let provider = make_provider();
+    let out = provider
+        .distill_backlog(DistillBacklogInput {
+            project_id: "ghost".into(),
+            limit: None,
+        })
+        .unwrap();
+    assert_eq!(out["total"], 0);
+    assert_eq!(out["items"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn test_jsonrpc_distill_backlog_roundtrip() {
+    let provider = make_provider();
+    let now = chrono::Utc::now().timestamp();
+    seed_session_import(
+        provider.repo_for_test(),
+        "raw",
+        &["session-import"],
+        now,
+        Some(1),
+        None,
+    );
+    seed_session_import(
+        provider.repo_for_test(),
+        "typed",
+        &["session-import", "distilled"],
+        now,
+        None,
+        None,
+    );
+    let server = McpServer::with_provider(Arc::new(provider));
+
+    let response = server.handle_request(JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(7)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "distill_backlog",
+            "arguments": { "project_id": "p" },
+        })),
+    });
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["total"], 1, "typed+distilled must not appear");
+    assert_eq!(payload["items"][0]["id"], "raw");
+    assert_eq!(payload["items"][0]["file_count"], 1);
+    assert!(payload["items"][0]["error_count"].is_null());
 }
 
 // ─── write-time dedup + decision supersede ──────────────────────────

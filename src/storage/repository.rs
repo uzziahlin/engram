@@ -109,11 +109,16 @@ pub struct StatsSnapshot {
     pub reflections: ReflectionCounts,
 }
 
-/// One day bucket of episodic memory counts (for `timeline`).
+/// One day bucket of per-type memory counts (for `timeline`). A `kind`
+/// filter keeps the four-column shape — the non-matching columns stay 0 —
+/// so clients consume one structure regardless of filtering.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct TimelineRow {
+pub struct TimelineRowMulti {
     pub day: String,
-    pub count: i64,
+    pub episodic: i64,
+    pub decision: i64,
+    pub failure: i64,
+    pub procedural: i64,
 }
 
 /// One reflection proposal awaiting human confirmation (for `list_pending_suggestions`).
@@ -1887,23 +1892,58 @@ impl MemoryRepository {
         Ok(exists)
     }
 
-    /// Group non-archived episodic memories by UTC day over a time window,
-    /// most-recent day first. `since` is an absolute unix timestamp computed
-    /// by the caller.
-    pub fn timeline(&self, project_id: &str, since: i64) -> Result<Vec<TimelineRow>> {
+    /// Group non-archived memories of all four types by UTC day over a time
+    /// window, most-recent day first. `since`/`until` are absolute unix
+    /// timestamps computed by the caller; `until = None` puts no upper bound
+    /// on the window. `kind = None` counts every type; a specific kind keeps
+    /// the full four-column shape with the other columns at 0.
+    pub fn timeline(
+        &self,
+        project_id: &str,
+        since: i64,
+        until: Option<i64>,
+        kind: Option<MemoryKind>,
+    ) -> Result<Vec<TimelineRowMulti>> {
         let conn = self.conn()?;
+        // One tagged row per memory (union over the four tables), then a
+        // single aggregation — per-type counts in one query instead of four
+        // correlated subqueries, and one shape for callers. The table names
+        // come from this fixed statement, never from input; the optional
+        // filters bind as parameters (?3/i64::MAX and ?4/NULL mean unbounded
+        // and unfiltered respectively).
         let mut stmt = conn.prepare(
-            "SELECT date(created_at, 'unixepoch') as day, COUNT(*) as cnt
-             FROM episodic_memories
-             WHERE project_id = ?1 AND created_at >= ?2 AND archived_at IS NULL
+            "SELECT date(created_at, 'unixepoch') as day, \
+                    SUM(kind = 'episodic') as episodic, \
+                    SUM(kind = 'decision') as decision, \
+                    SUM(kind = 'failure') as failure, \
+                    SUM(kind = 'procedural') as procedural \
+             FROM (\
+                 SELECT project_id, created_at, 'episodic' as kind FROM episodic_memories WHERE archived_at IS NULL UNION ALL \
+                 SELECT project_id, created_at, 'decision' as kind FROM decision_memories WHERE archived_at IS NULL UNION ALL \
+                 SELECT project_id, created_at, 'failure' as kind FROM failure_memories WHERE archived_at IS NULL UNION ALL \
+                 SELECT project_id, created_at, 'procedural' as kind FROM procedural_memories WHERE archived_at IS NULL\
+             ) \
+             WHERE project_id = ?1 AND created_at >= ?2 \
+               AND created_at < ?3 AND (?4 IS NULL OR kind = ?4) \
              GROUP BY day ORDER BY day DESC",
         )?;
-        let rows = stmt.query_map(params![project_id, since], |row| {
-            Ok(TimelineRow {
-                day: row.get(0)?,
-                count: row.get(1)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![
+                project_id,
+                since,
+                until.unwrap_or(i64::MAX),
+                kind.map(|k| k.as_str().to_string()),
+            ],
+            |row| {
+                Ok(TimelineRowMulti {
+                    day: row.get(0)?,
+                    episodic: row.get(1)?,
+                    decision: row.get(2)?,
+                    failure: row.get(3)?,
+                    procedural: row.get(4)?,
+                })
+            },
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -2644,28 +2684,102 @@ impl MemoryRepository {
         })
     }
 
-    /// Active episodic memories tagged `session-import` — the raw hook dumps
-    /// awaiting distillation (prompt `engram.distill`). Powers the session
-    /// brief's distillation hint and `engram maintain`'s aging report.
-    /// The LIKE match on the fixed tag inside the JSON array is exact enough
-    /// (the tag has no delimiters that could substring-match another tag).
-    pub fn count_session_imports(&self, project_id: &str) -> Result<i64> {
+    /// WHERE fragment shared by every raw-backlog consumer (count / stale
+    /// downgrade / distill worklist): active episodic rows tagged
+    /// `session-import` that do NOT yet carry the `distilled` marker. The
+    /// exclusion is the distill loop's signal fix — a distilled typed memory
+    /// KEEPS the `session-import` source tag (see `docs/distill.md` step 3),
+    /// so without it the typed memory re-matched the same filter and the
+    /// backlog GREW on every distillation instead of reaching zero.
+    const RAW_SESSION_IMPORT_WHERE: &'static str = "archived_at IS NULL \
+         AND tags LIKE '%\"session-import\"%' \
+         AND NOT (tags LIKE '%\"distilled\"%')";
+
+    /// Active, NOT-yet-distilled episodic memories tagged `session-import` —
+    /// the raw hook dumps awaiting distillation (prompt `engram.distill`).
+    /// Powers the session brief's distillation hint and `engram maintain`'s
+    /// aging report. Returns `(count, oldest_created_at)`; the oldest
+    /// timestamp is `None` when the backlog is empty and feeds the brief's
+    /// "oldest N days ago" hint. The LIKE match on the fixed tag inside the
+    /// JSON array is exact enough (the tag has no delimiters that could
+    /// substring-match another tag).
+    pub fn count_session_imports(&self, project_id: &str) -> Result<(i64, Option<i64>)> {
         let conn = self.conn()?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM episodic_memories \
-             WHERE project_id = ?1 AND archived_at IS NULL \
-               AND tags LIKE '%\"session-import\"%'",
+        Ok(conn.query_row(
+            &format!(
+                "SELECT COUNT(*), MIN(created_at) FROM episodic_memories \
+                 WHERE project_id = ?1 AND {}",
+                Self::RAW_SESSION_IMPORT_WHERE
+            ),
+            params![project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// The distill loop's prioritized worklist (`distill_backlog` tool, the
+    /// material-picking step of prompt `engram.distill`): raw = active +
+    /// tagged `session-import` + NOT `distilled`, oldest first (longest
+    /// rotting dumps are the most urgent to refine), plus the total backlog
+    /// count beyond the returned page.
+    pub fn list_distill_backlog(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<EpisodicMemory>, i64)> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, project_id, session_id, summary, content, files_touched, \
+             related_commits, importance, tags, created_at, updated_at \
+             FROM episodic_memories \
+             WHERE project_id = ?1 AND {} \
+             ORDER BY created_at ASC \
+             LIMIT ?2",
+            Self::RAW_SESSION_IMPORT_WHERE
+        ))?;
+        let rows = stmt.query_map(params![project_id, limit], |row| {
+            Ok(EpisodicMemory {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                session_id: row.get(2)?,
+                summary: row.get(3)?,
+                content: row.get(4)?,
+                files_touched: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                related_commits: serde_json::from_str(&row.get::<_, String>(6)?)
+                    .unwrap_or_default(),
+                importance: row.get(7)?,
+                tags: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        drop(stmt);
+
+        // Total on the SAME pooled connection: the in-memory pool is
+        // max_size(1), so a nested checkout here would deadlock the pool.
+        let total: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM episodic_memories \
+                 WHERE project_id = ?1 AND {}",
+                Self::RAW_SESSION_IMPORT_WHERE
+            ),
             params![project_id],
             |r| r.get(0),
         )?;
-        Ok(n)
+        Ok((results, total))
     }
 
-    /// Lifecycle for raw session imports: session-import memories whose
-    /// `updated_at` is older than `older_than_seconds` get their importance
-    /// lowered to `floor` (default path: 0.5 → 0.2) — raw prompt dumps age
-    /// out of prime ranking unless distilled into typed memories, which
-    /// become the durable knowledge. `apply=false` only reports candidates.
+    /// Lifecycle for raw session imports: UN-distilled session-import
+    /// memories whose `updated_at` is older than `older_than_seconds` get
+    /// their importance lowered to `floor` (default path: 0.5 → 0.2) — raw
+    /// prompt dumps age out of prime ranking unless distilled into typed
+    /// memories, which become the durable knowledge. Typed memories distilled
+    /// from a raw dump keep the `session-import` source tag, so the
+    /// `distilled` exclusion here is what stops the aging pass from demoting
+    /// them. `apply=false` only reports candidates.
     /// Returns `(id, current_importance)` pairs.
     pub fn downgrade_stale_session_imports(
         &self,
@@ -2677,12 +2791,12 @@ impl MemoryRepository {
     ) -> Result<Vec<(String, f32)>> {
         let cutoff = now.checked_sub(older_than_seconds).unwrap_or(0);
         let mut conn = self.conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, importance FROM episodic_memories \
-             WHERE project_id = ?1 AND archived_at IS NULL \
-               AND tags LIKE '%\"session-import\"%' \
+             WHERE project_id = ?1 AND {} \
                AND updated_at < ?2 AND importance > ?3",
-        )?;
+            Self::RAW_SESSION_IMPORT_WHERE
+        ))?;
         let rows = stmt.query_map(params![project_id, cutoff, floor], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
         })?;
@@ -4918,6 +5032,132 @@ mod tests {
         assert_eq!(
             repo.list_projects().unwrap(),
             vec!["other".to_string(), "p".to_string()]
+        );
+    }
+
+    // ─── Distill-loop backlog (raw session-import counting) ────────────
+
+    /// A session-import shaped episodic memory. The typed memory a
+    /// distillation produces keeps the `session-import` SOURCE tag
+    /// (docs/distill.md step 3) and adds `distilled` — the fixtures below
+    /// pin that only the un-marked raw dumps count as backlog.
+    fn session_import_fixture(id: &str, tags: &[&str], created_at: i64) -> EpisodicMemory {
+        EpisodicMemory {
+            id: id.into(),
+            project_id: "p".into(),
+            session_id: "s".into(),
+            summary: format!("session {id}"),
+            content: format!(
+                "User prompts:\n- prompt for {id}\n\n\
+                 Assistant conclusions (latest last):\n- conclusion for {id}.\n"
+            ),
+            files_touched: vec![],
+            related_commits: vec![],
+            importance: 0.5,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn session_import_backlog_counts_raw_only_and_reports_oldest() {
+        let repo = setup_repo();
+        let now = now();
+        repo.create_episodic(&session_import_fixture(
+            "raw-old",
+            &["session-import"],
+            now - 3 * 86_400,
+        ))
+        .unwrap();
+        repo.create_episodic(&session_import_fixture("raw-new", &["session-import"], now))
+            .unwrap();
+        // Distilled typed memory: same source tag + the distilled marker.
+        repo.create_episodic(&session_import_fixture(
+            "typed",
+            &["session-import", "distilled"],
+            now,
+        ))
+        .unwrap();
+        // An unrelated memory without the tag must not match either.
+        repo.create_episodic(&session_import_fixture("plain", &[], now))
+            .unwrap();
+
+        let (count, oldest) = repo.count_session_imports("p").unwrap();
+        assert_eq!(count, 2, "typed+distilled must not count into the backlog");
+        assert_eq!(
+            oldest,
+            Some(now - 3 * 86_400),
+            "oldest must be the oldest RAW import"
+        );
+        assert_eq!(repo.count_session_imports("q").unwrap(), (0, None));
+    }
+
+    #[test]
+    fn stale_downgrade_skips_distilled_session_imports() {
+        let repo = setup_repo();
+        let now = now();
+        let stale = |id: &str, tags: &[&str]| {
+            let mut m = session_import_fixture(id, tags, now - 91 * 86_400);
+            m.updated_at = now - 91 * 86_400;
+            m
+        };
+        repo.create_episodic(&stale("raw-stale", &["session-import"]))
+            .unwrap();
+        repo.create_episodic(&stale("typed-stale", &["session-import", "distilled"]))
+            .unwrap();
+
+        let downgraded = repo
+            .downgrade_stale_session_imports("p", 90 * 86_400, 0.2, true, now)
+            .unwrap();
+        assert_eq!(
+            downgraded
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["raw-stale"],
+            "aging must only demote UN-distilled raw imports"
+        );
+        // The distilled typed memory keeps its importance.
+        let typed = repo.get_episodic("typed-stale", "p").unwrap().unwrap();
+        assert_eq!(typed.importance, 0.5);
+    }
+
+    #[test]
+    fn list_distill_backlog_orders_oldest_first_and_counts_total() {
+        let repo = setup_repo();
+        let now = now();
+        repo.create_episodic(&session_import_fixture(
+            "raw-1d",
+            &["session-import"],
+            now - 86_400,
+        ))
+        .unwrap();
+        repo.create_episodic(&session_import_fixture(
+            "raw-3d",
+            &["session-import"],
+            now - 3 * 86_400,
+        ))
+        .unwrap();
+        repo.create_episodic(&session_import_fixture(
+            "raw-2d",
+            &["session-import"],
+            now - 2 * 86_400,
+        ))
+        .unwrap();
+        repo.create_episodic(&session_import_fixture(
+            "typed-4d",
+            &["session-import", "distilled"],
+            now - 4 * 86_400,
+        ))
+        .unwrap();
+
+        let (items, total) = repo.list_distill_backlog("p", 2).unwrap();
+        assert_eq!(total, 3, "total counts the whole backlog, not the page");
+        assert_eq!(
+            items.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["raw-3d", "raw-2d"],
+            "oldest first, page-limited"
         );
     }
 }

@@ -81,7 +81,7 @@ Useful targets (run `make help` for the full list):
 | `make uninstall` | Remove the binary and engram entries from MCP configs (`PURGE=1` also deletes `~/.engram`) |
 | `make clean` | Remove cargo build artifacts |
 
-Overridable variables: `INSTALL_DIR` (default `~/.engram/bin`), `CLIENTS` (`auto`, or a space-separated subset of `claude cursor windsurf codex`), `DATA_DIR`, `PURGE`. The Makefile shares its install/configure logic with `install.sh` through `scripts/engram-common.sh`, so both paths behave identically.
+Overridable variables: `INSTALL_DIR` (default `~/.engram/bin`), `CLIENTS` (`auto`, or a space-separated subset of `claude cursor windsurf codex gemini`), `DATA_DIR`, `PURGE`. The Makefile shares its install/configure logic with `install.sh` through `scripts/engram-common.sh`, so both paths behave identically.
 
 Prefer raw cargo? It still works:
 
@@ -185,7 +185,8 @@ recommended wiring. `Stop` (every agent turn) also works: imports are
 **idempotent per session** — re-importing refreshes the existing memory in
 place instead of stacking near-duplicates, so the memory tracks the session
 as it grows. Transcripts from Codex CLI (`~/.codex/sessions/**/rollout-*.jsonl`)
-are parsed too — the format is sniffed per line.
+and Gemini CLI (`~/.gemini/tmp/<project>/chats/session-*.jsonl`) are parsed
+too — the format is sniffed per line.
 
 **Read-side automation (`--brief`)**: `engram install-hooks --brief` additionally
 wires a `SessionStart` entry running `engram brief --project <id>`, so every
@@ -195,6 +196,37 @@ procedures already in context — no searching required:
 ```bash
 engram install-hooks --brief   # SessionEnd (write) + SessionStart (read) in one go
 ```
+
+#### Gemini CLI
+
+Gemini CLI has native hooks with the same entry shape in
+`~/.gemini/settings.json` (project-level: `<dir>/.gemini/settings.json`), and
+its `SessionEnd` payload feeds `engram hook` unchanged. One command wires it —
+the installer merges into the existing file (which also holds your theme,
+auth, `mcpServers`, and other tools' hooks — only engram's own entries are
+touched, and a backup is written first):
+
+```bash
+engram install-hooks --client gemini --project myproj --brief
+```
+
+which is equivalent to adding to `settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "engram hook --project myproj" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "engram brief --project myproj" } ] }
+    ]
+  }
+}
+```
+
+`engram uninstall-hooks --client gemini` removes exactly the engram entries
+and leaves every other tool's hooks alone.
 
 ### Cursor
 
@@ -214,6 +246,23 @@ Add to your Cursor MCP settings (`Settings → MCP`):
 ### Codex CLI (OpenAI)
 
 Add to `~/.codex/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram",
+      "args": []
+    }
+  }
+}
+```
+
+### Gemini CLI
+
+`~/.gemini/settings.json` uses the same `mcpServers` shape (and also carries
+your hooks/theme/auth — the Quick Install script merges without overwriting
+when `~/.gemini` exists):
 
 ```json
 {
